@@ -632,6 +632,51 @@ func FuzzJobScheduler(f *testing.F) {
 	})
 }
 
+// TestJobSchedulerWithQueuePrefixIsolatesQueues verifies that WithQueuePrefix
+// prefixes the queue name (not the job id), so that two prefixed schedulers
+// submitting to a same-named queue don't serialize against each other. If the
+// prefix were (incorrectly) applied to the job id, both submissions would
+// land on the same underlying "gc" queue and only one would run at a time.
+func TestJobSchedulerWithQueuePrefixIsolatesQueues(t *testing.T) {
+	_, ctx := logging.Configure(context.Background(), logging.Config{Level: slog.LevelError})
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	scheduler := newTestScheduler(ctx, t, jobscheduler.Config{Concurrency: 4})
+	schedulerA := scheduler.WithQueuePrefix("a")
+	schedulerB := scheduler.WithQueuePrefix("b")
+
+	started := make(chan string, 2)
+	release := make(chan struct{})
+
+	schedulerA.Submit("gc", "job1", func(_ context.Context) error {
+		started <- "a"
+		<-release
+		return nil
+	})
+	schedulerB.Submit("gc", "job2", func(_ context.Context) error {
+		started <- "b"
+		<-release
+		return nil
+	})
+
+	var gotA, gotB bool
+	for range 2 {
+		select {
+		case who := <-started:
+			if who == "a" {
+				gotA = true
+			} else {
+				gotB = true
+			}
+		case <-time.After(time.Second):
+			t.Fatal("both jobs should start concurrently on distinct prefixed queues")
+		}
+	}
+	assert.True(t, gotA && gotB, "both prefixed schedulers' jobs should have started")
+	close(release)
+}
+
 func TestJobSchedulerCloneConcurrencyLimit(t *testing.T) {
 	_, ctx := logging.Configure(context.Background(), logging.Config{Level: slog.LevelError})
 	ctx, cancel := context.WithCancel(ctx)

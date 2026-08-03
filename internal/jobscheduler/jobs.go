@@ -60,11 +60,11 @@ type prefixedScheduler struct {
 }
 
 func (p *prefixedScheduler) Submit(queue, id string, run func(ctx context.Context) error) {
-	p.scheduler.Submit(queue, p.prefix+id, run)
+	p.scheduler.Submit(p.prefix+queue, id, run)
 }
 
 func (p *prefixedScheduler) SubmitPeriodicJob(queue, id string, interval time.Duration, run func(ctx context.Context) error) {
-	p.scheduler.SubmitPeriodicJob(queue, p.prefix+id, interval, run)
+	p.scheduler.SubmitPeriodicJob(p.prefix+queue, id, interval, run)
 }
 
 func (p *prefixedScheduler) WithQueuePrefix(prefix string) Scheduler {
