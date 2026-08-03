@@ -7,7 +7,10 @@ import (
 	"net/url"
 	"strings"
 
+	"github.com/alecthomas/errors"
+
 	"github.com/block/cachew/internal/cache"
+	"github.com/block/cachew/internal/httputil"
 	"github.com/block/cachew/internal/logging"
 	"github.com/block/cachew/internal/strategy/handler"
 )
@@ -76,11 +79,23 @@ func NewHTTPProxy(ctx context.Context, c cache.Cache, _ Mux) (*HTTPProxy, error)
 			p.logger.ErrorContext(r.Context(), "Proxy request failed",
 				slog.String("url", target.String()),
 				slog.String("error", err.Error()))
-			http.Error(w, "proxy error: "+err.Error(), http.StatusBadGateway)
+			writeProxyError(err, w, r)
 		})
 
 	logger.InfoContext(ctx, "HTTP proxy strategy initialized")
 	return p, nil
+}
+
+// writeProxyError writes err as the HTTP response, preferring the status code
+// carried by an httputil.HTTPResponder (e.g. a wrapped cache open/create
+// failure) over always collapsing to 502, which discards genuine 4xx/5xx
+// status codes the shared handler already computed.
+func writeProxyError(err error, w http.ResponseWriter, r *http.Request) {
+	if h, ok := errors.AsType[httputil.HTTPResponder](err); ok {
+		h.WriteHTTP(w, r)
+		return
+	}
+	http.Error(w, "proxy error: "+err.Error(), http.StatusBadGateway)
 }
 
 func (p *HTTPProxy) String() string { return "proxy" }

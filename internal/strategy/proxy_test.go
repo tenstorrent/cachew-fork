@@ -2,6 +2,7 @@ package strategy_test
 
 import (
 	"context"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/alecthomas/assert/v2"
+	"github.com/alecthomas/errors"
 
 	"github.com/block/cachew/internal/cache"
 	"github.com/block/cachew/internal/logging"
@@ -287,4 +289,52 @@ func TestHTTPProxyQueryStringInCacheKey(t *testing.T) {
 	handler.ServeHTTP(httptest.NewRecorder(), req2)
 
 	assert.Equal(t, 2, callCount, "different query strings should result in separate upstream fetches")
+}
+
+// failingOpenCache wraps a cache.Cache and forces Open to fail with a
+// non-os.ErrNotExist error, simulating a cache backend failure (e.g. a disk
+// read error) rather than a plain cache miss.
+type failingOpenCache struct {
+	cache.Cache
+}
+
+func (f failingOpenCache) Open(context.Context, cache.Key, ...cache.Option) (io.ReadCloser, http.Header, error) {
+	return nil, nil, errors.New("simulated cache open failure")
+}
+
+// TestHTTPProxyCacheOpenFailureReturns500 verifies that a cache-open failure
+// (distinct from a plain cache miss) surfaces as 500 Internal Server Error,
+// not the previous unconditional 502 Bad Gateway, matching defaultErrorHandler's
+// handling of httputil.HTTPResponder-wrapped errors.
+func TestHTTPProxyCacheOpenFailureReturns500(t *testing.T) {
+	_, ctx := logging.Configure(context.Background(), logging.Config{Level: slog.LevelError})
+	memCache, err := cache.NewMemory(ctx, cache.MemoryConfig{MaxTTL: time.Hour})
+	assert.NoError(t, err)
+	defer memCache.Close()
+
+	mux := http.NewServeMux()
+	p, err := strategy.NewHTTPProxy(ctx, failingOpenCache{Cache: memCache}, mux)
+	assert.NoError(t, err)
+	handler := p.Intercept(mux)
+
+	req := httptest.NewRequestWithContext(ctx, http.MethodGet, "http://dl.google.com/android/repository/addons_list-5.xml", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusInternalServerError, w.Code)
+}
+
+// TestHTTPProxyUpstreamFetchFailureReturns502 verifies that a genuine
+// upstream-fetch failure (unreachable server) still surfaces as 502 Bad
+// Gateway, unchanged by the httputil.HTTPResponder status-preserving fix.
+func TestHTTPProxyUpstreamFetchFailureReturns502(t *testing.T) {
+	handler, ctx, _ := setupProxyTest(t)
+
+	// Port 1 is a privileged port nothing listens on; the connection is
+	// refused immediately without needing a real unreachable-host timeout.
+	req := httptest.NewRequestWithContext(ctx, http.MethodGet, "http://127.0.0.1:1/some/path", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusBadGateway, w.Code)
 }
