@@ -54,7 +54,10 @@ func Register[Config any, S Strategy](r *Registry, id, description string, facto
 			transformer := func(defaultValue string) string {
 				return os.Expand(defaultValue, func(key string) string { return vars[key] })
 			}
-			if err := hcl.UnmarshalBlock(config, &cfg, hcl.AllowExtra(false), hcl.WithDefaultTransformer(transformer)); err != nil {
+			// hcl.AllowExtra ignores its argument and unconditionally allows extra fields
+			// (github.com/alecthomas/hcl/v2@v2.6.0 marshal.go:75-79), so it must be omitted
+			// entirely to reject unrecognized attributes.
+			if err := hcl.UnmarshalBlock(config, &cfg, hcl.WithDefaultTransformer(transformer)); err != nil {
 				return nil, errors.WithStack(err)
 			}
 			return factory(ctx, cfg, cache, mux)
