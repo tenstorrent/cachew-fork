@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/url"
+	"strings"
 
 	"github.com/alecthomas/errors"
 
@@ -45,7 +46,7 @@ func NewHost(_ context.Context, config HostConfig, cache cache.Cache, mux Mux) (
 	if err != nil {
 		return nil, errors.Errorf("invalid target URL: %w", err)
 	}
-	prefix := "/" + u.Host + u.EscapedPath()
+	prefix := "/" + u.Host + strings.TrimSuffix(u.EscapedPath(), "/")
 	h := &Host{
 		target:  u,
 		cache:   cache,
@@ -79,16 +80,19 @@ func (d *Host) String() string { return "host:" + d.target.Host + d.target.Path 
 // buildTargetURL constructs the target URL from the incoming request.
 func (d *Host) buildTargetURL(r *http.Request) *url.URL {
 	// Strip the prefix from the request path
-	path := r.URL.Path
-	if len(path) >= len(d.prefix) {
-		path = path[len(d.prefix):]
+	reqPath := r.URL.Path
+	if len(reqPath) >= len(d.prefix) {
+		reqPath = reqPath[len(d.prefix):]
 	}
-	if path == "" {
-		path = "/"
+	if reqPath == "" {
+		reqPath = "/"
 	}
 
 	targetURL := *d.target
-	targetURL.Path = path
+	// d.target.Path is the configured target's own path prefix (e.g. "/a"), which must be
+	// preserved and joined with reqPath, not overwritten by it.
+	targetURL.Path = strings.TrimSuffix(d.target.Path, "/") + reqPath
+	targetURL.RawPath = ""
 	targetURL.RawQuery = r.URL.RawQuery
 	return &targetURL
 }
