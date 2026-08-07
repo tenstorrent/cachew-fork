@@ -307,15 +307,21 @@ func (w *memoryWriter) Close() error {
 		oldSize = int64(len(oldEntry.data))
 	}
 
-	// Evict entries if needed to make room
+	// Evict entries if needed to make room. evictOldest may itself evict the entry we're about to
+	// overwrite (it's still present in nsEntries with its old size); if so, its size was already
+	// subtracted from currentSize there, so we must not subtract oldSize again below.
+	selfStillPresent := true
 	if limitBytes > 0 {
 		neededSpace := w.cache.currentSize.Load() - oldSize + newSize - limitBytes
 		if neededSpace > 0 {
 			w.cache.evictOldest(neededSpace)
+			_, selfStillPresent = nsEntries[w.key]
 		}
 	}
 
-	w.cache.currentSize.Add(-oldSize)
+	if selfStillPresent {
+		w.cache.currentSize.Add(-oldSize)
+	}
 	// Copy the buffer data to avoid holding a reference to the buffer's internal slice
 	data := make([]byte, w.buf.Len())
 	copy(data, w.buf.Bytes())
