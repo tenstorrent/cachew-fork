@@ -3,7 +3,6 @@ package cache_test
 import (
 	"context"
 	"io"
-	"log/slog"
 	"net/http"
 	"testing"
 	"time"
@@ -18,7 +17,7 @@ import (
 // the in-memory backend (unlike S3) can store. Any range is unsatisfiable and
 // the Content-Range reports the total size.
 func TestRangeEmptyObject(t *testing.T) {
-	_, ctx := logging.Configure(context.Background(), logging.Config{Level: slog.LevelError})
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{Level: "error"})
 	c, err := cache.NewMemory(ctx, cache.MemoryConfig{MaxTTL: time.Hour})
 	assert.NoError(t, err)
 	defer c.Close()
@@ -38,7 +37,7 @@ func TestRangeEmptyObject(t *testing.T) {
 // APIV1 PUT filter) is dropped on a full, non-range Open, so it can't be
 // mistaken for a 206 partial response.
 func TestRangeStaleContentRangeStripped(t *testing.T) {
-	_, ctx := logging.Configure(context.Background(), logging.Config{Level: slog.LevelError})
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{Level: "error"})
 	c, err := cache.NewMemory(ctx, cache.MemoryConfig{MaxTTL: time.Hour})
 	assert.NoError(t, err)
 	defer c.Close()

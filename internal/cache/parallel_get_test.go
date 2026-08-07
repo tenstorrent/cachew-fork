@@ -3,7 +3,6 @@ package cache_test
 import (
 	"context"
 	"io"
-	"log/slog"
 	"os"
 	"sync"
 	"testing"
@@ -33,7 +32,7 @@ func (b *bufferAt) WriteAt(p []byte, off int64) (int, error) {
 }
 
 func TestParallelGet(t *testing.T) {
-	_, ctx := logging.Configure(context.Background(), logging.Config{Level: slog.LevelError})
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{Level: "error"})
 	c, err := cache.NewMemory(ctx, cache.MemoryConfig{MaxTTL: time.Hour})
 	assert.NoError(t, err)
 	defer c.Close()
@@ -70,7 +69,7 @@ func TestParallelGet(t *testing.T) {
 }
 
 func TestParallelGetEmptyObject(t *testing.T) {
-	_, ctx := logging.Configure(context.Background(), logging.Config{Level: slog.LevelError})
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{Level: "error"})
 	c, err := cache.NewMemory(ctx, cache.MemoryConfig{MaxTTL: time.Hour})
 	assert.NoError(t, err)
 	defer c.Close()
@@ -90,7 +89,7 @@ func TestParallelGetEmptyObject(t *testing.T) {
 }
 
 func TestParallelGetNotFound(t *testing.T) {
-	_, ctx := logging.Configure(context.Background(), logging.Config{Level: slog.LevelError})
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{Level: "error"})
 	c, err := cache.NewMemory(ctx, cache.MemoryConfig{MaxTTL: time.Hour})
 	assert.NoError(t, err)
 	defer c.Close()

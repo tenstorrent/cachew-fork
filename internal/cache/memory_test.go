@@ -1,7 +1,6 @@
 package cache_test
 
 import (
-	"log/slog"
 	"os"
 	"testing"
 	"time"
@@ -15,7 +14,7 @@ import (
 
 func TestMemoryCache(t *testing.T) {
 	cachetest.Suite(t, func(t *testing.T) cache.Cache {
-		_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelError})
+		_, ctx, _ := logging.Configure(t.Context(), logging.Config{Level: "error"})
 		c, err := cache.NewMemory(ctx, cache.MemoryConfig{MaxTTL: 3 * time.Second})
 		assert.NoError(t, err)
 		return c
@@ -27,7 +26,7 @@ func TestMemoryCacheSoak(t *testing.T) {
 		t.Skip("Skipping soak test; set SOAK_TEST=1 to run")
 	}
 
-	_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelError})
+	_, ctx, _ := logging.Configure(t.Context(), logging.Config{Level: "error"})
 	c, err := cache.NewMemory(ctx, cache.MemoryConfig{
 		LimitMB: 50,
 		MaxTTL:  10 * time.Minute,

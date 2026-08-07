@@ -2,7 +2,6 @@ package strategy_test
 
 import (
 	"context"
-	"log/slog"
 	"net/http"
 	"strings"
 	"testing"
@@ -39,7 +38,7 @@ func TestRegisterRejectsUnrecognizedAttribute(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, ctx := logging.Configure(context.Background(), logging.Config{Level: slog.LevelError})
+			_, ctx, _ := logging.Configure(context.Background(), logging.Config{Level: "error"})
 			memCache, err := cache.NewMemory(ctx, cache.MemoryConfig{MaxTTL: time.Hour})
 			assert.NoError(t, err)
 			defer memCache.Close()

@@ -3,7 +3,6 @@ package strategy_test
 import (
 	"context"
 	"encoding/json"
-	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -121,7 +120,7 @@ func setupTest(t *testing.T, config strategy.GitHubReleasesConfig) (*mockGitHubS
 		originalTransport: originalTransport,
 	}
 
-	_, ctx := logging.Configure(context.Background(), logging.Config{Level: slog.LevelError})
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{Level: "error"})
 	memCache, err := cache.NewMemory(ctx, cache.MemoryConfig{MaxTTL: time.Hour})
 	assert.NoError(t, err)
 	t.Cleanup(func() { memCache.Close() })
@@ -239,7 +238,7 @@ func TestGitHubReleasesPublicRepoNotFound(t *testing.T) {
 	assert.Equal(t, 1, mock.publicCallCount)
 
 	key := cache.NewKey("https://github.com/publicorg/repo/releases/download/v1.0.0/missing.tar.gz")
-	_, ctx2 := logging.Configure(context.Background(), logging.Config{Level: slog.LevelError})
+	_, ctx2, _ := logging.Configure(context.Background(), logging.Config{Level: "error"})
 	memCache, err := cache.NewMemory(ctx2, cache.MemoryConfig{MaxTTL: time.Hour})
 	assert.NoError(t, err)
 	defer memCache.Close()
@@ -249,7 +248,7 @@ func TestGitHubReleasesPublicRepoNotFound(t *testing.T) {
 }
 
 func TestGitHubReleasesNoToken(t *testing.T) {
-	_, ctx := logging.Configure(context.Background(), logging.Config{Level: slog.LevelError})
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{Level: "error"})
 	memCache, err := cache.NewMemory(ctx, cache.MemoryConfig{MaxTTL: time.Hour})
 	assert.NoError(t, err)
 	defer memCache.Close()
@@ -261,7 +260,7 @@ func TestGitHubReleasesNoToken(t *testing.T) {
 }
 
 func TestGitHubReleasesString(t *testing.T) {
-	_, ctx := logging.Configure(context.Background(), logging.Config{Level: slog.LevelError})
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{Level: "error"})
 	memCache, err := cache.NewMemory(ctx, cache.MemoryConfig{MaxTTL: time.Hour})
 	assert.NoError(t, err)
 	defer memCache.Close()

@@ -96,7 +96,7 @@ func main() {
 
 	ctx, stopSignals := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stopSignals()
-	logger, ctx := logging.Configure(ctx, globalConfig.LoggingConfig)
+	logger, ctx := setupLogging(ctx, kctx, globalConfig.LoggingConfig)
 
 	// Flipped on SIGTERM so /_readiness fails before the listener closes.
 	var shuttingDown atomic.Bool
@@ -352,6 +352,15 @@ func runOPATests(ctx context.Context, logger *slog.Logger, cfg opa.Config) {
 	if passed > 0 {
 		logger.InfoContext(ctx, "OPA tests passed", "count", passed)
 	}
+}
+
+// setupLogging configures logging, exiting via kong if the configured level is
+// invalid. Logging is not yet available at this point, so failures must be
+// reported through kong rather than the logger being constructed.
+func setupLogging(ctx context.Context, kctx *kong.Context, cfg logging.Config) (*slog.Logger, context.Context) {
+	logger, ctx, err := logging.Configure(ctx, cfg)
+	kctx.FatalIfErrorf(err)
+	return logger, ctx
 }
 
 func fatalIfError(ctx context.Context, logger *slog.Logger, err error, msg string) {

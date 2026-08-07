@@ -2,7 +2,6 @@ package jobscheduler_test
 
 import (
 	"context"
-	"log/slog"
 	"path/filepath"
 	"sync/atomic"
 	"testing"
@@ -81,7 +80,7 @@ func TestScheduleStoreInvalidPath(t *testing.T) {
 }
 
 func TestPeriodicJobDelaysWhenRecentlyRun(t *testing.T) {
-	_, ctx := logging.Configure(context.Background(), logging.Config{Level: slog.LevelError})
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{Level: "error"})
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -109,7 +108,7 @@ func TestPeriodicJobDelaysWhenRecentlyRun(t *testing.T) {
 }
 
 func TestPeriodicJobRunsImmediatelyWhenNeverRun(t *testing.T) {
-	_, ctx := logging.Configure(context.Background(), logging.Config{Level: slog.LevelError})
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{Level: "error"})
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -128,7 +127,7 @@ func TestPeriodicJobRunsImmediatelyWhenNeverRun(t *testing.T) {
 }
 
 func TestPeriodicJobRunsImmediatelyWhenIntervalElapsed(t *testing.T) {
-	_, ctx := logging.Configure(context.Background(), logging.Config{Level: slog.LevelError})
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{Level: "error"})
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -154,7 +153,7 @@ func TestPeriodicJobRunsImmediatelyWhenIntervalElapsed(t *testing.T) {
 }
 
 func TestPeriodicJobRecordsLastRun(t *testing.T) {
-	_, ctx := logging.Configure(context.Background(), logging.Config{Level: slog.LevelError})
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{Level: "error"})
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 

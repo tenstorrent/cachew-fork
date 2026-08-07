@@ -6,7 +6,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -105,7 +104,7 @@ func TestIntegrationGitCloneViaProxy(t *testing.T) {
 		t.Skip("git not found in PATH")
 	}
 
-	_, ctx := logging.Configure(context.Background(), logging.Config{})
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{})
 	tmpDir := t.TempDir()
 	clonesDir := filepath.Join(tmpDir, "clones")
 	workDir := filepath.Join(tmpDir, "work")
@@ -189,7 +188,7 @@ func TestIntegrationGitFetchViaProxy(t *testing.T) {
 		t.Skip("git not found in PATH")
 	}
 
-	_, ctx := logging.Configure(context.Background(), logging.Config{})
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{})
 	tmpDir := t.TempDir()
 	clonesDir := filepath.Join(tmpDir, "clones")
 	workDir := filepath.Join(tmpDir, "work")
@@ -246,7 +245,7 @@ func TestIntegrationPushForwardsToUpstream(t *testing.T) {
 		t.Skip("git not found in PATH")
 	}
 
-	_, ctx := logging.Configure(context.Background(), logging.Config{})
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{})
 	tmpDir := t.TempDir()
 	clonesDir := filepath.Join(tmpDir, "clones")
 	upstreamDir := filepath.Join(tmpDir, "upstream")
@@ -366,7 +365,7 @@ func TestIntegrationSpoolReusesDuringClone(t *testing.T) {
 		t.Skip("git not found in PATH")
 	}
 
-	_, ctx := logging.Configure(context.Background(), logging.Config{Level: slog.LevelDebug})
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{Level: "debug"})
 	tmpDir := t.TempDir()
 	clonesDir := filepath.Join(tmpDir, "clones")
 	workDir := filepath.Join(tmpDir, "work")
@@ -462,7 +461,7 @@ func TestIntegrationNotOurRefFallsBackToUpstream(t *testing.T) {
 		t.Skip("git not found in PATH")
 	}
 
-	_, ctx := logging.Configure(context.Background(), logging.Config{Level: slog.LevelDebug})
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{Level: "debug"})
 	tmpDir := t.TempDir()
 
 	upstreamDir := filepath.Join(tmpDir, "upstream.git")

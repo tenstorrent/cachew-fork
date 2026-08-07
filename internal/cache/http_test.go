@@ -3,7 +3,6 @@ package cache_test
 import (
 	"context"
 	"io"
-	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -17,7 +16,7 @@ import (
 )
 
 func TestCachedFetch(t *testing.T) {
-	_, ctx := logging.Configure(context.Background(), logging.Config{Level: slog.LevelError})
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{Level: "error"})
 	memCache, err := cache.NewMemory(ctx, cache.MemoryConfig{MaxTTL: time.Hour})
 	assert.NoError(t, err)
 	defer memCache.Close()
@@ -61,7 +60,7 @@ func TestCachedFetch(t *testing.T) {
 }
 
 func TestCachedFetchNonOKStatus(t *testing.T) {
-	_, ctx := logging.Configure(context.Background(), logging.Config{Level: slog.LevelError})
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{Level: "error"})
 	memCache, err := cache.NewMemory(ctx, cache.MemoryConfig{MaxTTL: time.Hour})
 	assert.NoError(t, err)
 	defer memCache.Close()
@@ -86,7 +85,7 @@ func TestCachedFetchNonOKStatus(t *testing.T) {
 }
 
 func TestFetchDirectAbortsOnPartialResponse(t *testing.T) {
-	_, ctx := logging.Configure(context.Background(), logging.Config{Level: slog.LevelError})
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{Level: "error"})
 	memCache, err := cache.NewMemory(ctx, cache.MemoryConfig{MaxTTL: time.Hour})
 	assert.NoError(t, err)
 	defer memCache.Close()

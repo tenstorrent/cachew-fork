@@ -2,7 +2,6 @@ package strategy_test
 
 import (
 	"context"
-	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -24,7 +23,7 @@ var httpTransportMutexHermit sync.Mutex //nolint:gochecknoglobals
 func setupHermitTest(t *testing.T) (*http.ServeMux, context.Context, cache.Cache) {
 	t.Helper()
 
-	_, ctx := logging.Configure(context.Background(), logging.Config{Level: slog.LevelError})
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{Level: "error"})
 	memCache, err := cache.NewMemory(ctx, cache.MemoryConfig{MaxTTL: time.Hour})
 	assert.NoError(t, err)
 	t.Cleanup(func() { memCache.Close() })
@@ -52,7 +51,7 @@ func TestHermitBinaryShortTTL(t *testing.T) {
 	defer func() { http.DefaultTransport = originalTransport }()                                   //nolint:reassign
 	http.DefaultTransport = &mockTransport{backend: backend, originalTransport: originalTransport} //nolint:reassign
 
-	_, ctx := logging.Configure(context.Background(), logging.Config{Level: slog.LevelError})
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{Level: "error"})
 	memCache, err := cache.NewMemory(ctx, cache.MemoryConfig{MaxTTL: 100 * time.Millisecond})
 	assert.NoError(t, err)
 	t.Cleanup(func() { memCache.Close() })

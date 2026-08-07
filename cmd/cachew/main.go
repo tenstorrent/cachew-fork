@@ -56,7 +56,8 @@ func run() int {
 	kctx := kong.Parse(&cli, kong.UsageOnError(), kong.HelpOptions{Compact: true}, kong.DefaultEnvars("CACHEW"), kong.Bind(&cli),
 		kong.Vars{"version": fmt.Sprintf("%s (%s)", version, gitCommit)})
 	ctx := context.Background()
-	_, ctx = logging.Configure(ctx, cli.LoggingConfig)
+	_, ctx, err := logging.Configure(ctx, cli.LoggingConfig)
+	kctx.FatalIfErrorf(err)
 
 	// Wire up tracing for the short-lived CLI. tracing.New is env-driven:
 	// it only installs an exporter when OTEL_EXPORTER_OTLP_ENDPOINT is set,

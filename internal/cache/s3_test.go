@@ -2,7 +2,6 @@ package cache_test
 
 import (
 	"context"
-	"log/slog"
 	"os"
 	"testing"
 	"time"
@@ -20,7 +19,7 @@ import (
 func newS3Cache(t *testing.T, bucket string) cache.Cache {
 	t.Helper()
 	s3clienttest.CleanBucket(t, bucket)
-	_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelDebug})
+	_, ctx, _ := logging.Configure(t.Context(), logging.Config{Level: "debug"})
 
 	clientProvider := s3client.NewClientProvider(ctx, s3client.Config{
 		Endpoint: s3clienttest.Addr,
@@ -78,7 +77,7 @@ func TestS3CacheSoak(t *testing.T) {
 
 	bucket := s3clienttest.Start(t)
 	s3clienttest.CleanBucket(t, bucket)
-	_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelDebug})
+	_, ctx, _ := logging.Configure(t.Context(), logging.Config{Level: "debug"})
 
 	clientProvider := s3client.NewClientProvider(ctx, s3client.Config{
 		Endpoint: s3clienttest.Addr,

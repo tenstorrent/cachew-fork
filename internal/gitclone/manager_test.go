@@ -3,7 +3,6 @@ package gitclone //nolint:testpackage // white-box testing required for unexport
 import (
 	"context"
 	"fmt"
-	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -67,7 +66,7 @@ func createBareRepo(t *testing.T, dir string) string {
 }
 
 func TestNewManager(t *testing.T) {
-	_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelError})
+	_, ctx, _ := logging.Configure(t.Context(), logging.Config{Level: "error"})
 	tmpDir := t.TempDir()
 
 	config := Config{
@@ -83,7 +82,7 @@ func TestNewManager(t *testing.T) {
 }
 
 func TestNewManager_RequiresRootDir(t *testing.T) {
-	_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelError})
+	_, ctx, _ := logging.Configure(t.Context(), logging.Config{Level: "error"})
 	config := Config{
 		FetchInterval:    15 * time.Minute,
 		RefCheckInterval: 10 * time.Second,
@@ -95,7 +94,7 @@ func TestNewManager_RequiresRootDir(t *testing.T) {
 }
 
 func TestManager_GetOrCreate(t *testing.T) {
-	_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelError})
+	_, ctx, _ := logging.Configure(t.Context(), logging.Config{Level: "error"})
 	tmpDir := t.TempDir()
 	config := Config{
 		MirrorRoot:       tmpDir,
@@ -121,7 +120,7 @@ func TestManager_GetOrCreate(t *testing.T) {
 }
 
 func TestManager_GetOrCreate_ExistingClone(t *testing.T) {
-	_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelError})
+	_, ctx, _ := logging.Configure(t.Context(), logging.Config{Level: "error"})
 	tmpDir := t.TempDir()
 	config := Config{
 		MirrorRoot:       tmpDir,
@@ -145,7 +144,7 @@ func TestManager_GetOrCreate_ExistingClone(t *testing.T) {
 }
 
 func TestManager_Get(t *testing.T) {
-	_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelError})
+	_, ctx, _ := logging.Configure(t.Context(), logging.Config{Level: "error"})
 	tmpDir := t.TempDir()
 	config := Config{
 		MirrorRoot:       tmpDir,
@@ -170,7 +169,7 @@ func TestManager_Get(t *testing.T) {
 }
 
 func TestManager_DiscoverExisting(t *testing.T) {
-	_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelError})
+	_, ctx, _ := logging.Configure(t.Context(), logging.Config{Level: "error"})
 	tmpDir := t.TempDir()
 	config := Config{
 		MirrorRoot:       tmpDir,
@@ -223,7 +222,7 @@ func TestManager_DiscoverExisting(t *testing.T) {
 }
 
 func TestManager_DiscoverExisting_SkipsAndRemovesLeftoverCloneTempDirs(t *testing.T) {
-	_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelError})
+	_, ctx, _ := logging.Configure(t.Context(), logging.Config{Level: "error"})
 	tmpDir := t.TempDir()
 	config := Config{
 		MirrorRoot:       tmpDir,
@@ -812,7 +811,7 @@ func TestRepository_CloneDoesNotClobberSiblings(t *testing.T) {
 }
 
 func TestRepository_Repack(t *testing.T) {
-	_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelError})
+	_, ctx, _ := logging.Configure(t.Context(), logging.Config{Level: "error"})
 	tmpDir := t.TempDir()
 	upstreamPath := createBareRepo(t, tmpDir)
 
@@ -842,7 +841,7 @@ func TestRepository_Repack(t *testing.T) {
 }
 
 func TestRepository_Repack_CleansUpStaleLockOnFailure(t *testing.T) {
-	_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelError})
+	_, ctx, _ := logging.Configure(t.Context(), logging.Config{Level: "error"})
 	tmpDir := t.TempDir()
 	upstreamPath := createBareRepo(t, tmpDir)
 

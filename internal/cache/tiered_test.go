@@ -5,7 +5,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"log/slog"
 	"net/http"
 	"os"
 	"sync"
@@ -108,7 +107,7 @@ func tieredPermutations(t *testing.T) []struct {
 
 	newMemory := cacheFactory{"Memory", func(t *testing.T) cache.Cache {
 		t.Helper()
-		_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelDebug})
+		_, ctx, _ := logging.Configure(t.Context(), logging.Config{Level: "debug"})
 		c, err := cache.NewMemory(ctx, cache.MemoryConfig{LimitMB: 1024, MaxTTL: time.Hour})
 		assert.NoError(t, err)
 		return c
@@ -116,7 +115,7 @@ func tieredPermutations(t *testing.T) []struct {
 
 	newDisk := cacheFactory{"Disk", func(t *testing.T) cache.Cache {
 		t.Helper()
-		_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelDebug})
+		_, ctx, _ := logging.Configure(t.Context(), logging.Config{Level: "debug"})
 		c, err := cache.NewDisk(ctx, cache.DiskConfig{Root: t.TempDir(), LimitMB: 1024, MaxTTL: time.Hour})
 		assert.NoError(t, err)
 		return c
@@ -125,7 +124,7 @@ func tieredPermutations(t *testing.T) []struct {
 	newS3 := cacheFactory{"S3", func(t *testing.T) cache.Cache {
 		t.Helper()
 		s3clienttest.CleanBucket(t, bucket)
-		_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelDebug})
+		_, ctx, _ := logging.Configure(t.Context(), logging.Config{Level: "debug"})
 		clientProvider := s3client.NewClientProvider(ctx, s3client.Config{
 			Endpoint: s3clienttest.Addr,
 			UseSSL:   false,
@@ -173,7 +172,7 @@ func tieredMemoryDiskPermutations() []struct {
 } {
 	newMemory := cacheFactory{"Memory", func(t *testing.T) cache.Cache {
 		t.Helper()
-		_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelDebug})
+		_, ctx, _ := logging.Configure(t.Context(), logging.Config{Level: "debug"})
 		c, err := cache.NewMemory(ctx, cache.MemoryConfig{LimitMB: 1024, MaxTTL: time.Hour})
 		assert.NoError(t, err)
 		return c
@@ -181,7 +180,7 @@ func tieredMemoryDiskPermutations() []struct {
 
 	newDisk := cacheFactory{"Disk", func(t *testing.T) cache.Cache {
 		t.Helper()
-		_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelDebug})
+		_, ctx, _ := logging.Configure(t.Context(), logging.Config{Level: "debug"})
 		c, err := cache.NewDisk(ctx, cache.DiskConfig{Root: t.TempDir(), LimitMB: 1024, MaxTTL: time.Hour})
 		assert.NoError(t, err)
 		return c
@@ -201,7 +200,7 @@ func TestTieredCachePermutations(t *testing.T) {
 	for _, perm := range tieredMemoryDiskPermutations() {
 		t.Run(perm.name, func(t *testing.T) {
 			cachetest.Suite(t, func(t *testing.T) cache.Cache {
-				_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelDebug})
+				_, ctx, _ := logging.Configure(t.Context(), logging.Config{Level: "debug"})
 				lower := perm.lower.new(t)
 				upper := perm.upper.new(t)
 				return newTiered(ctx, lower, upper)
@@ -213,7 +212,7 @@ func TestTieredCachePermutations(t *testing.T) {
 func TestTieredBackfillPermutations(t *testing.T) {
 	for _, perm := range tieredMemoryDiskPermutations() {
 		t.Run(perm.name, func(t *testing.T) {
-			_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelDebug})
+			_, ctx, _ := logging.Configure(t.Context(), logging.Config{Level: "debug"})
 			lower := perm.lower.new(t)
 			upper := perm.upper.new(t)
 			tiered := newTiered(ctx, lower, upper)
@@ -249,7 +248,7 @@ func TestTieredBackfillDiscardsIncompleteStreams(t *testing.T) {
 	errMidStream := errors.New("mid-stream failure")
 	newTieredWithFailingUpper := func(t *testing.T, key cache.Key, content []byte, failAfter int) (tiered, lower cache.Cache) {
 		t.Helper()
-		_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelDebug})
+		_, ctx, _ := logging.Configure(t.Context(), logging.Config{Level: "debug"})
 		lower, err := cache.NewMemory(ctx, cache.MemoryConfig{LimitMB: 1024, MaxTTL: time.Hour})
 		assert.NoError(t, err)
 		upper, err := cache.NewMemory(ctx, cache.MemoryConfig{LimitMB: 1024, MaxTTL: time.Hour})
@@ -264,7 +263,7 @@ func TestTieredBackfillDiscardsIncompleteStreams(t *testing.T) {
 	content := bytes.Repeat([]byte("0123456789abcdef"), 64)
 
 	t.Run("MidStreamReadError", func(t *testing.T) {
-		_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelDebug})
+		_, ctx, _ := logging.Configure(t.Context(), logging.Config{Level: "debug"})
 		tiered, lower := newTieredWithFailingUpper(t, key, content, len(content)/2)
 
 		r, _, err := tiered.Open(ctx, key)
@@ -278,7 +277,7 @@ func TestTieredBackfillDiscardsIncompleteStreams(t *testing.T) {
 	})
 
 	t.Run("CloseBeforeEOF", func(t *testing.T) {
-		_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelDebug})
+		_, ctx, _ := logging.Configure(t.Context(), logging.Config{Level: "debug"})
 		tiered, lower := newTieredWithFailingUpper(t, key, content, len(content))
 
 		r, _, err := tiered.Open(ctx, key)
@@ -332,7 +331,7 @@ func (r *midStreamFailingReader) Close() error {
 }
 
 func TestTieredCreateUsesSameETagInEveryTier(t *testing.T) {
-	_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelDebug})
+	_, ctx, _ := logging.Configure(t.Context(), logging.Config{Level: "debug"})
 	lower, err := cache.NewMemory(ctx, cache.MemoryConfig{LimitMB: 1024, MaxTTL: time.Hour})
 	assert.NoError(t, err)
 	upper, err := cache.NewMemory(ctx, cache.MemoryConfig{LimitMB: 1024, MaxTTL: time.Hour})
@@ -353,7 +352,7 @@ func TestTieredCreateUsesSameETagInEveryTier(t *testing.T) {
 }
 
 func TestTieredRequiresMetadataStore(t *testing.T) {
-	_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelDebug})
+	_, ctx, _ := logging.Configure(t.Context(), logging.Config{Level: "debug"})
 	lower, err := cache.NewMemory(ctx, cache.MemoryConfig{LimitMB: 1024, MaxTTL: time.Hour})
 	assert.NoError(t, err)
 	upper, err := cache.NewMemory(ctx, cache.MemoryConfig{LimitMB: 1024, MaxTTL: time.Hour})
@@ -365,7 +364,7 @@ func TestTieredRequiresMetadataStore(t *testing.T) {
 }
 
 func TestStatAuthoritativeBypassesLocalTiers(t *testing.T) {
-	_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelDebug})
+	_, ctx, _ := logging.Configure(t.Context(), logging.Config{Level: "debug"})
 	local, err := cache.NewMemory(ctx, cache.MemoryConfig{LimitMB: 1024, MaxTTL: time.Hour})
 	assert.NoError(t, err)
 	shared, err := cache.NewMemory(ctx, cache.MemoryConfig{LimitMB: 1024, MaxTTL: time.Hour})
@@ -396,7 +395,7 @@ func TestStatAuthoritativeBypassesLocalTiers(t *testing.T) {
 }
 
 func TestTieredCreateDoesNotPublishMetadataETagForNewKey(t *testing.T) {
-	_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelDebug})
+	_, ctx, _ := logging.Configure(t.Context(), logging.Config{Level: "debug"})
 	store := newMetadataStore(ctx)
 	lower, err := cache.NewMemory(ctx, cache.MemoryConfig{LimitMB: 1024, MaxTTL: time.Hour})
 	assert.NoError(t, err)
@@ -417,7 +416,7 @@ func TestTieredCreateDoesNotPublishMetadataETagForNewKey(t *testing.T) {
 }
 
 func TestTieredCreatePublishesMetadataETagForReplacement(t *testing.T) {
-	_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelDebug})
+	_, ctx, _ := logging.Configure(t.Context(), logging.Config{Level: "debug"})
 	store := newMetadataStore(ctx)
 	lower, err := cache.NewMemory(ctx, cache.MemoryConfig{LimitMB: 1024, MaxTTL: time.Hour})
 	assert.NoError(t, err)
@@ -441,7 +440,7 @@ func TestTieredCreatePublishesMetadataETagForReplacement(t *testing.T) {
 }
 
 func TestTieredCreateDoesNotPublishMetadataETagForSameETagReplacement(t *testing.T) {
-	_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelDebug})
+	_, ctx, _ := logging.Configure(t.Context(), logging.Config{Level: "debug"})
 	store := newMetadataStore(ctx)
 	lower, err := cache.NewMemory(ctx, cache.MemoryConfig{LimitMB: 1024, MaxTTL: time.Hour})
 	assert.NoError(t, err)
@@ -464,7 +463,7 @@ func TestTieredCreateDoesNotPublishMetadataETagForSameETagReplacement(t *testing
 }
 
 func TestTieredAbortDoesNotPublishMetadataETag(t *testing.T) {
-	_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelDebug})
+	_, ctx, _ := logging.Configure(t.Context(), logging.Config{Level: "debug"})
 	store := newMetadataStore(ctx)
 	lower, err := cache.NewMemory(ctx, cache.MemoryConfig{LimitMB: 1024, MaxTTL: time.Hour})
 	assert.NoError(t, err)
@@ -485,7 +484,7 @@ func TestTieredAbortDoesNotPublishMetadataETag(t *testing.T) {
 }
 
 func TestTieredMetadataInvalidatesStaleLowerOnStat(t *testing.T) {
-	_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelDebug})
+	_, ctx, _ := logging.Configure(t.Context(), logging.Config{Level: "debug"})
 	store := newMetadataStore(ctx)
 	lower, err := cache.NewMemory(ctx, cache.MemoryConfig{LimitMB: 1024, MaxTTL: time.Hour})
 	assert.NoError(t, err)
@@ -507,7 +506,7 @@ func TestTieredMetadataInvalidatesStaleLowerOnStat(t *testing.T) {
 }
 
 func TestTieredMetadataInvalidatesStaleLowerBeforeNotModified(t *testing.T) {
-	_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelDebug})
+	_, ctx, _ := logging.Configure(t.Context(), logging.Config{Level: "debug"})
 	store := newMetadataStore(ctx)
 	lower, err := cache.NewMemory(ctx, cache.MemoryConfig{LimitMB: 1024, MaxTTL: time.Hour})
 	assert.NoError(t, err)
@@ -532,7 +531,7 @@ func TestTieredMetadataInvalidatesStaleLowerBeforeNotModified(t *testing.T) {
 }
 
 func TestTieredMetadataReturnsHardStatErrorBeforeInvalidating(t *testing.T) {
-	_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelDebug})
+	_, ctx, _ := logging.Configure(t.Context(), logging.Config{Level: "debug"})
 	store := newMetadataStore(ctx)
 	statErr := errors.New("stat unavailable")
 	lower, err := cache.NewMemory(ctx, cache.MemoryConfig{LimitMB: 1024, MaxTTL: time.Hour})
@@ -556,7 +555,7 @@ func TestTieredMetadataReturnsHardStatErrorBeforeInvalidating(t *testing.T) {
 }
 
 func TestTieredMetadataClearsDiscardedConditionalError(t *testing.T) {
-	_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelDebug})
+	_, ctx, _ := logging.Configure(t.Context(), logging.Config{Level: "debug"})
 	store := newMetadataStore(ctx)
 	lower, err := cache.NewMemory(ctx, cache.MemoryConfig{LimitMB: 1024, MaxTTL: time.Hour})
 	assert.NoError(t, err)
@@ -575,7 +574,7 @@ func TestTieredMetadataClearsDiscardedConditionalError(t *testing.T) {
 }
 
 func TestTieredMetadataAllowsMatchingLower(t *testing.T) {
-	_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelDebug})
+	_, ctx, _ := logging.Configure(t.Context(), logging.Config{Level: "debug"})
 	store := newMetadataStore(ctx)
 	lower, err := cache.NewMemory(ctx, cache.MemoryConfig{LimitMB: 1024, MaxTTL: time.Hour})
 	assert.NoError(t, err)
@@ -596,7 +595,7 @@ func TestTieredMetadataAllowsMatchingLower(t *testing.T) {
 }
 
 func TestTieredMissingMetadataPreservesExistingBehavior(t *testing.T) {
-	_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelDebug})
+	_, ctx, _ := logging.Configure(t.Context(), logging.Config{Level: "debug"})
 	store := newMetadataStore(ctx)
 	lower, err := cache.NewMemory(ctx, cache.MemoryConfig{LimitMB: 1024, MaxTTL: time.Hour})
 	assert.NoError(t, err)
@@ -616,7 +615,7 @@ func TestTieredMissingMetadataPreservesExistingBehavior(t *testing.T) {
 }
 
 func TestTieredMetadataIsNamespaced(t *testing.T) {
-	_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelDebug})
+	_, ctx, _ := logging.Configure(t.Context(), logging.Config{Level: "debug"})
 	store := newMetadataStore(ctx)
 	lower, err := cache.NewMemory(ctx, cache.MemoryConfig{LimitMB: 1024, MaxTTL: time.Hour})
 	assert.NoError(t, err)
@@ -654,7 +653,7 @@ func TestTieredDivergentValidatorPermutations(t *testing.T) {
 
 	for _, perm := range tieredPermutations(t) {
 		t.Run(perm.name, func(t *testing.T) {
-			_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelDebug})
+			_, ctx, _ := logging.Configure(t.Context(), logging.Config{Level: "debug"})
 			lower := perm.lower.new(t)
 			upper := perm.upper.new(t)
 			tiered := newTiered(ctx, lower, upper)
@@ -788,7 +787,7 @@ func TestTieredRangedReadHealsDivergentTier0(t *testing.T) {
 		{"IfMatch", []cache.Option{cache.Range(2, 6), cache.IfMatch(`"pinned-etag"`)}},
 	} {
 		t.Run(validator.name, func(t *testing.T) {
-			_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelDebug})
+			_, ctx, _ := logging.Configure(t.Context(), logging.Config{Level: "debug"})
 			store := newMetadataStore(ctx)
 			lower, err := cache.NewMemory(ctx, cache.MemoryConfig{LimitMB: 1024, MaxTTL: time.Hour})
 			assert.NoError(t, err)
@@ -822,7 +821,7 @@ func TestTieredRangedReadKeepsNewerTier0(t *testing.T) {
 	newer := []byte("abcdefghij")
 	lagging := []byte("0123456789")
 
-	_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelDebug})
+	_, ctx, _ := logging.Configure(t.Context(), logging.Config{Level: "debug"})
 	store := newMetadataStore(ctx)
 	lower, err := cache.NewMemory(ctx, cache.MemoryConfig{LimitMB: 1024, MaxTTL: time.Hour})
 	assert.NoError(t, err)
@@ -912,7 +911,7 @@ func TestTieredRangedReadHealAbortsAfterConcurrentDelete(t *testing.T) {
 	pinned := []byte("abcdefghij")
 	stale := []byte("0123456789")
 
-	_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelDebug})
+	_, ctx, _ := logging.Configure(t.Context(), logging.Config{Level: "debug"})
 	store := newMetadataStore(ctx)
 	lowerMem, err := cache.NewMemory(ctx, cache.MemoryConfig{LimitMB: 1024, MaxTTL: time.Hour})
 	assert.NoError(t, err)
@@ -952,7 +951,7 @@ func TestTieredRangedReadHealAbortsAfterConcurrentDelete(t *testing.T) {
 }
 
 func TestTieredDivergentValidatorProbeErrors(t *testing.T) {
-	_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelDebug})
+	_, ctx, _ := logging.Configure(t.Context(), logging.Config{Level: "debug"})
 	lower, err := cache.NewMemory(ctx, cache.MemoryConfig{LimitMB: 1024, MaxTTL: time.Hour})
 	assert.NoError(t, err)
 	outage := errors.New("backend unavailable")
@@ -998,7 +997,7 @@ func TestTieredDivergentValidatorProbeErrors(t *testing.T) {
 func TestTieredDeletePermutations(t *testing.T) {
 	for _, perm := range tieredPermutations(t) {
 		t.Run(perm.name, func(t *testing.T) {
-			_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelDebug})
+			_, ctx, _ := logging.Configure(t.Context(), logging.Config{Level: "debug"})
 			lower := perm.lower.new(t)
 			upper := perm.upper.new(t)
 			tiered := newTiered(ctx, lower, upper)
@@ -1034,7 +1033,7 @@ func TestTieredDeletePermutations(t *testing.T) {
 func TestTieredInvalidateSkipsAuthoritativeTier(t *testing.T) {
 	for _, perm := range tieredPermutations(t) {
 		t.Run(perm.name, func(t *testing.T) {
-			_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelDebug})
+			_, ctx, _ := logging.Configure(t.Context(), logging.Config{Level: "debug"})
 			lower := perm.lower.new(t)
 			authoritative := perm.upper.new(t)
 			tiered := newTiered(ctx, lower, authoritative)
@@ -1058,7 +1057,7 @@ func TestTieredInvalidateSkipsAuthoritativeTier(t *testing.T) {
 }
 
 func TestSingleTierInvalidateIsNoop(t *testing.T) {
-	_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelDebug})
+	_, ctx, _ := logging.Configure(t.Context(), logging.Config{Level: "debug"})
 	authoritative, err := cache.NewMemory(ctx, cache.MemoryConfig{LimitMB: 1024, MaxTTL: time.Hour})
 	assert.NoError(t, err)
 	tiered := newTiered(ctx, authoritative)
@@ -1076,7 +1075,7 @@ func TestSingleTierInvalidateIsNoop(t *testing.T) {
 }
 
 func TestSingleTierDelegatesUnsupportedOperations(t *testing.T) {
-	_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelDebug})
+	_, ctx, _ := logging.Configure(t.Context(), logging.Config{Level: "debug"})
 	tiered := newTiered(ctx, cache.NoOpCache())
 	defer tiered.Close()
 
@@ -1093,7 +1092,7 @@ func TestTieredCacheSoak(t *testing.T) {
 		t.Skip("Skipping soak test; set SOAK_TEST=1 to run")
 	}
 
-	_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelError})
+	_, ctx, _ := logging.Configure(t.Context(), logging.Config{Level: "error"})
 	memory, err := cache.NewMemory(ctx, cache.MemoryConfig{
 		LimitMB: 25,
 		MaxTTL:  10 * time.Minute,

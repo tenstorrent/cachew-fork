@@ -30,7 +30,7 @@ func TestSnapshotHTTPEndpoint(t *testing.T) {
 		t.Skip("git not found in PATH")
 	}
 
-	_, ctx := logging.Configure(context.Background(), logging.Config{})
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{})
 	tmpDir := t.TempDir()
 	mirrorRoot := filepath.Join(tmpDir, "mirrors")
 	mirrorPath := filepath.Join(mirrorRoot, "github.com", "org", "repo")
@@ -104,7 +104,7 @@ func TestSnapshotOnDemandGenerationViaHTTP(t *testing.T) {
 		t.Skip("git not found in PATH")
 	}
 
-	_, ctx := logging.Configure(context.Background(), logging.Config{})
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{})
 	tmpDir := t.TempDir()
 	mirrorRoot := filepath.Join(tmpDir, "mirrors")
 	mirrorPath := filepath.Join(mirrorRoot, "github.com", "org", "repo")
@@ -200,7 +200,7 @@ func TestSnapshotUnchangedSkipsRegeneration(t *testing.T) {
 		t.Skip("git not found in PATH")
 	}
 
-	_, ctx := logging.Configure(context.Background(), logging.Config{})
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{})
 	tmpDir := t.TempDir()
 	mirrorRoot := filepath.Join(tmpDir, "mirrors")
 	upstreamURL := "https://github.com/org/repo"
@@ -257,7 +257,7 @@ func TestSnapshotGenerationViaLocalClone(t *testing.T) {
 		t.Skip("git not found in PATH")
 	}
 
-	_, ctx := logging.Configure(context.Background(), logging.Config{})
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{})
 	tmpDir := t.TempDir()
 	mirrorRoot := filepath.Join(tmpDir, "mirrors")
 	upstreamURL := "https://github.com/org/repo"
@@ -323,7 +323,7 @@ func TestSnapshotGenerationWithFilter(t *testing.T) {
 		t.Skip("git not found in PATH")
 	}
 
-	_, ctx := logging.Configure(context.Background(), logging.Config{})
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{})
 	tmpDir := t.TempDir()
 	mirrorRoot := filepath.Join(tmpDir, "mirrors")
 	upstreamURL := "https://github.com/org/repo"
@@ -379,7 +379,7 @@ func TestSnapshotGenerationWithFilterFailsWhenMirrorIgnoresFilter(t *testing.T) 
 		t.Skip("git not found in PATH")
 	}
 
-	_, ctx := logging.Configure(context.Background(), logging.Config{})
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{})
 	tmpDir := t.TempDir()
 	mirrorRoot := filepath.Join(tmpDir, "mirrors")
 	upstreamURL := "https://github.com/org/repo"
@@ -454,7 +454,7 @@ func TestSnapshotGenerationIncludesTrackedLockFiles(t *testing.T) {
 		t.Skip("git not found in PATH")
 	}
 
-	_, ctx := logging.Configure(context.Background(), logging.Config{})
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{})
 	tmpDir := t.TempDir()
 	mirrorRoot := filepath.Join(tmpDir, "mirrors")
 	upstreamURL := "https://github.com/org/repo"
@@ -503,7 +503,7 @@ func TestMirrorSnapshotRestoreDirectly(t *testing.T) {
 		t.Skip("git not found in PATH")
 	}
 
-	_, ctx := logging.Configure(context.Background(), logging.Config{})
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{})
 	tmpDir := t.TempDir()
 	mirrorRoot := filepath.Join(tmpDir, "mirrors")
 	upstreamURL := "https://github.com/org/repo"
@@ -580,7 +580,7 @@ func TestMirrorSnapshotWithMultipleBranches(t *testing.T) {
 		t.Skip("git not found in PATH")
 	}
 
-	_, ctx := logging.Configure(context.Background(), logging.Config{})
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{})
 	tmpDir := t.TempDir()
 	mirrorRoot := filepath.Join(tmpDir, "mirrors")
 	upstreamURL := "https://github.com/org/repo"
@@ -672,7 +672,7 @@ func TestSnapshotServesFreshSnapshotWithCommitHeader(t *testing.T) {
 		t.Skip("git not found in PATH")
 	}
 
-	_, ctx := logging.Configure(context.Background(), logging.Config{})
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{})
 	tmpDir := t.TempDir()
 	mirrorRoot := filepath.Join(tmpDir, "mirrors")
 	upstreamURL := "https://github.com/org/repo"
@@ -727,7 +727,7 @@ func TestSnapshotHeadServesMetadataWithoutBody(t *testing.T) {
 		t.Skip("git not found in PATH")
 	}
 
-	_, ctx := logging.Configure(context.Background(), logging.Config{})
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{})
 	tmpDir := t.TempDir()
 	mirrorRoot := filepath.Join(tmpDir, "mirrors")
 	upstreamURL := "https://github.com/org/repo"
@@ -798,7 +798,7 @@ func TestSnapshotGetHonorsIfNoneMatch(t *testing.T) {
 		t.Skip("git not found in PATH")
 	}
 
-	_, ctx := logging.Configure(context.Background(), logging.Config{})
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{})
 	tmpDir := t.TempDir()
 	mirrorRoot := filepath.Join(tmpDir, "mirrors")
 	upstreamURL := "https://github.com/org/repo"
@@ -857,7 +857,7 @@ func TestSnapshotServesBundleURLWhenStale(t *testing.T) {
 		t.Skip("git not found in PATH")
 	}
 
-	_, ctx := logging.Configure(context.Background(), logging.Config{})
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{})
 	tmpDir := t.TempDir()
 	mirrorRoot := filepath.Join(tmpDir, "mirrors")
 	upstreamURL := "https://github.com/org/repo"
@@ -930,7 +930,7 @@ func TestColdSnapshotServesWithoutCommitHeader(t *testing.T) {
 		t.Skip("git not found in PATH")
 	}
 
-	_, ctx := logging.Configure(context.Background(), logging.Config{})
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{})
 	tmpDir := t.TempDir()
 	mirrorRoot := filepath.Join(tmpDir, "mirrors")
 
@@ -985,7 +985,7 @@ func TestDeferredRestoreOnlyScheduledOnce(t *testing.T) {
 		t.Skip("git not found in PATH")
 	}
 
-	_, ctx := logging.Configure(context.Background(), logging.Config{})
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{})
 	tmpDir := t.TempDir()
 	mirrorRoot := filepath.Join(tmpDir, "mirrors")
 
@@ -1037,7 +1037,7 @@ func TestCacheBundleAbortsOnWriteFailure(t *testing.T) {
 		t.Skip("git not found in PATH")
 	}
 
-	_, ctx := logging.Configure(context.Background(), logging.Config{})
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{})
 	tmpDir := t.TempDir()
 	mirrorRoot := filepath.Join(tmpDir, "mirrors")
 
@@ -1103,7 +1103,7 @@ func TestSnapshotRemoteURLUsesUpstreamURL(t *testing.T) {
 		t.Skip("git not found in PATH")
 	}
 
-	_, ctx := logging.Configure(context.Background(), logging.Config{})
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{})
 	tmpDir := t.TempDir()
 	mirrorRoot := filepath.Join(tmpDir, "mirrors")
 	upstreamURL := "https://github.com/org/repo"
@@ -1144,7 +1144,7 @@ func TestSnapshotGetHonorsRange(t *testing.T) {
 		t.Skip("git not found in PATH")
 	}
 
-	_, ctx := logging.Configure(context.Background(), logging.Config{})
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{})
 	tmpDir := t.TempDir()
 	mirrorRoot := filepath.Join(tmpDir, "mirrors")
 	upstreamURL := "https://github.com/org/repo"
@@ -1302,7 +1302,7 @@ func TestBundleRequestUpToDateReturnsNoContent(t *testing.T) {
 		t.Skip("git not found in PATH")
 	}
 
-	_, ctx := logging.Configure(context.Background(), logging.Config{})
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{})
 	mirrorRoot := filepath.Join(t.TempDir(), "mirrors")
 	mirrorPath := filepath.Join(mirrorRoot, "github.com", "org", "repo")
 	createUpstreamAndMirror(t, mirrorPath)
@@ -1321,7 +1321,7 @@ func TestBundleRequestFreshensStaleMirror(t *testing.T) {
 		t.Skip("git not found in PATH")
 	}
 
-	_, ctx := logging.Configure(context.Background(), logging.Config{})
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{})
 	mirrorRoot := filepath.Join(t.TempDir(), "mirrors")
 	mirrorPath := filepath.Join(mirrorRoot, "github.com", "org", "repo")
 	upstream := createUpstreamAndMirror(t, mirrorPath)
@@ -1344,7 +1344,7 @@ func TestBundleRequestUpToDateFetchesDespiteRecentRefCheck(t *testing.T) {
 		t.Skip("git not found in PATH")
 	}
 
-	_, ctx := logging.Configure(context.Background(), logging.Config{})
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{})
 	mirrorRoot := filepath.Join(t.TempDir(), "mirrors")
 	mirrorPath := filepath.Join(mirrorRoot, "github.com", "org", "repo")
 	upstream := createUpstreamAndMirror(t, mirrorPath)
@@ -1372,7 +1372,7 @@ func TestBundleRequestFreshenFailureIsNotUpToDate(t *testing.T) {
 		t.Skip("git not found in PATH")
 	}
 
-	_, ctx := logging.Configure(context.Background(), logging.Config{})
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{})
 	mirrorRoot := filepath.Join(t.TempDir(), "mirrors")
 	mirrorPath := filepath.Join(mirrorRoot, "github.com", "org", "repo")
 	upstream := createUpstreamAndMirror(t, mirrorPath)
@@ -1395,7 +1395,7 @@ func TestBundleRequestUnknownBase(t *testing.T) {
 		t.Skip("git not found in PATH")
 	}
 
-	_, ctx := logging.Configure(context.Background(), logging.Config{})
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{})
 	mirrorRoot := filepath.Join(t.TempDir(), "mirrors")
 	mirrorPath := filepath.Join(mirrorRoot, "github.com", "org", "repo")
 	createUpstreamAndMirror(t, mirrorPath)

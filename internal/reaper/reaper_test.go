@@ -2,7 +2,6 @@ package reaper_test
 
 import (
 	"context"
-	"log/slog"
 	"os"
 	"os/exec"
 	"runtime"
@@ -18,7 +17,7 @@ import (
 
 func testContext(t *testing.T) context.Context {
 	t.Helper()
-	_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelDebug})
+	_, ctx, _ := logging.Configure(t.Context(), logging.Config{Level: "debug"})
 	return ctx
 }
 

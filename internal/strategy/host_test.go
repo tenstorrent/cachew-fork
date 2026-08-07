@@ -2,7 +2,6 @@ package strategy_test
 
 import (
 	"context"
-	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -28,7 +27,7 @@ func TestHostCaching(t *testing.T) {
 	}))
 	defer backend.Close()
 
-	_, ctx := logging.Configure(context.Background(), logging.Config{Level: slog.LevelError})
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{Level: "error"})
 	memCache, err := cache.NewMemory(ctx, cache.MemoryConfig{MaxTTL: time.Hour})
 	assert.NoError(t, err)
 	defer memCache.Close()
@@ -65,7 +64,7 @@ func TestHostNonOKStatus(t *testing.T) {
 	}))
 	defer backend.Close()
 
-	_, ctx := logging.Configure(context.Background(), logging.Config{Level: slog.LevelError})
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{Level: "error"})
 	memCache, err := cache.NewMemory(ctx, cache.MemoryConfig{MaxTTL: time.Hour})
 	assert.NoError(t, err)
 	defer memCache.Close()
@@ -91,7 +90,7 @@ func TestHostNonOKStatus(t *testing.T) {
 }
 
 func TestHostInvalidTargetURL(t *testing.T) {
-	_, ctx := logging.Configure(context.Background(), logging.Config{Level: slog.LevelError})
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{Level: "error"})
 	memCache, err := cache.NewMemory(ctx, cache.MemoryConfig{MaxTTL: time.Hour})
 	assert.NoError(t, err)
 	defer memCache.Close()
@@ -110,7 +109,7 @@ func TestHostHeaders(t *testing.T) {
 	}))
 	defer backend.Close()
 
-	_, ctx := logging.Configure(context.Background(), logging.Config{Level: slog.LevelError})
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{Level: "error"})
 	memCache, err := cache.NewMemory(ctx, cache.MemoryConfig{MaxTTL: time.Hour})
 	assert.NoError(t, err)
 	defer memCache.Close()
@@ -171,7 +170,7 @@ func TestHostBuildTargetURLJoinsTargetPathAndRequestPath(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			backend, recordedPaths := upstreamPathRecorder(t)
 
-			_, ctx := logging.Configure(context.Background(), logging.Config{Level: slog.LevelError})
+			_, ctx, _ := logging.Configure(context.Background(), logging.Config{Level: "error"})
 			memCache, err := cache.NewMemory(ctx, cache.MemoryConfig{MaxTTL: time.Hour})
 			assert.NoError(t, err)
 			defer memCache.Close()
@@ -200,7 +199,7 @@ func TestHostBuildTargetURLJoinsTargetPathAndRequestPath(t *testing.T) {
 func TestHostDistinctTargetPathsProduceDistinctUpstreamURLs(t *testing.T) {
 	backend, recordedPaths := upstreamPathRecorder(t)
 
-	_, ctx := logging.Configure(context.Background(), logging.Config{Level: slog.LevelError})
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{Level: "error"})
 	memCache, err := cache.NewMemory(ctx, cache.MemoryConfig{MaxTTL: time.Hour})
 	assert.NoError(t, err)
 	defer memCache.Close()
@@ -232,7 +231,7 @@ func TestHostDistinctTargetPathsProduceDistinctUpstreamURLs(t *testing.T) {
 }
 
 func TestHostString(t *testing.T) {
-	_, ctx := logging.Configure(context.Background(), logging.Config{Level: slog.LevelError})
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{Level: "error"})
 	memCache, err := cache.NewMemory(ctx, cache.MemoryConfig{MaxTTL: time.Hour})
 	assert.NoError(t, err)
 	defer memCache.Close()

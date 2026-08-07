@@ -3,7 +3,6 @@ package strategy_test
 import (
 	"context"
 	"io"
-	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -19,7 +18,7 @@ import (
 )
 
 func TestPutObjectAbortsOnReadError(t *testing.T) {
-	_, ctx := logging.Configure(context.Background(), logging.Config{Level: slog.LevelError})
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{Level: "error"})
 	memCache, err := cache.NewMemory(ctx, cache.MemoryConfig{MaxTTL: time.Hour})
 	assert.NoError(t, err)
 	defer memCache.Close()
@@ -47,7 +46,7 @@ func TestPutObjectAbortsOnReadError(t *testing.T) {
 
 func testAPISetup(t *testing.T) (http.Handler, context.Context) {
 	t.Helper()
-	_, ctx := logging.Configure(context.Background(), logging.Config{Level: slog.LevelError})
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{Level: "error"})
 	memCache, err := cache.NewMemory(ctx, cache.MemoryConfig{MaxTTL: time.Hour})
 	assert.NoError(t, err)
 	t.Cleanup(func() { memCache.Close() })

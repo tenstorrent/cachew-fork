@@ -2,7 +2,6 @@ package cache_test
 
 import (
 	"io"
-	"log/slog"
 	"testing"
 	"time"
 
@@ -45,7 +44,7 @@ func TestValidateNamespace(t *testing.T) {
 }
 
 func TestDefaultETagsAreUUIDsAndUnique(t *testing.T) {
-	_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelError})
+	_, ctx, _ := logging.Configure(t.Context(), logging.Config{Level: "error"})
 	c, err := cache.NewMemory(ctx, cache.MemoryConfig{MaxTTL: time.Hour})
 	assert.NoError(t, err)
 	defer c.Close()
@@ -75,7 +74,7 @@ func TestDefaultETagsAreUUIDsAndUnique(t *testing.T) {
 }
 
 func TestCreateWithExplicitETag(t *testing.T) {
-	_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelError})
+	_, ctx, _ := logging.Configure(t.Context(), logging.Config{Level: "error"})
 	c, err := cache.NewMemory(ctx, cache.MemoryConfig{MaxTTL: time.Hour})
 	assert.NoError(t, err)
 	defer c.Close()
@@ -94,7 +93,7 @@ func TestCreateWithExplicitETag(t *testing.T) {
 }
 
 func TestCreateRejectsInvalidETag(t *testing.T) {
-	_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelError})
+	_, ctx, _ := logging.Configure(t.Context(), logging.Config{Level: "error"})
 	c, err := cache.NewMemory(ctx, cache.MemoryConfig{MaxTTL: time.Hour})
 	assert.NoError(t, err)
 	defer c.Close()

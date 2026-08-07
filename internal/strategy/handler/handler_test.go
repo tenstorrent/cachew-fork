@@ -439,7 +439,7 @@ func TestStreamAndCacheAbortsOnUpstreamError(t *testing.T) {
 }
 
 func mustNewMemoryCache() cache.Cache {
-	_, ctx := logging.Configure(context.Background(), logging.Config{Level: slog.LevelError})
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{Level: "error"})
 	c, err := cache.NewMemory(ctx, cache.MemoryConfig{
 		MaxTTL: time.Hour,
 	})

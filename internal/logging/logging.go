@@ -8,14 +8,34 @@ import (
 	"os"
 	"time"
 
+	"github.com/alecthomas/errors"
 	"github.com/lmittmann/tint"
 )
 
 type Config struct {
-	JSON    bool              `hcl:"json,optional" help:"Enable JSON logging."`
-	Level   slog.Level        `hcl:"level" help:"Set the logging level." default:"info"`
+	JSON bool `hcl:"json,optional" help:"Enable JSON logging."`
+	// Decoded as a string rather than slog.Level: alecthomas/hcl v2.6.0 has no
+	// TextUnmarshaler branch in its default-value decode path, so a typed
+	// slog.Level field can never receive its "info" default (and non-string
+	// HCL values panic in the library's JSON-unmarshal fallback). Parsed and
+	// validated ourselves in parseLevel.
+	Level   string            `hcl:"level,optional" help:"Set the logging level." default:"info"`
 	Remap   map[string]string `hcl:"remap,optional" help:"Remap field names from old to new (e.g., msg=message, time=timestamp)."`
 	Headers map[string]string `hcl:"headers,optional" help:"Propagate these inbound request headers to the given log attribute."`
+}
+
+// parseLevel parses s (e.g. "debug", "info", "warn+4") into an slog.Level,
+// reusing slog.Level's own text format rather than hand-rolling one. An empty
+// string, as constructed by a zero-value Config, means "use the default".
+func parseLevel(s string) (slog.Level, error) {
+	if s == "" {
+		return slog.LevelInfo, nil
+	}
+	var level slog.Level
+	if err := level.UnmarshalText([]byte(s)); err != nil {
+		return 0, errors.Wrapf(err, "invalid log level %q", s)
+	}
+	return level, nil
 }
 
 // Middleware returns an HTTP middleware that logs incoming requests and attaches
@@ -53,8 +73,12 @@ func SetLevel(level slog.Level) { levelVar.Set(level) }
 func GetLevel() slog.Level { return levelVar.Level() }
 
 // Configure sets up logging with the given config and returns the logger and updated context.
-func Configure(ctx context.Context, config Config) (*slog.Logger, context.Context) {
-	levelVar.Set(config.Level)
+func Configure(ctx context.Context, config Config) (*slog.Logger, context.Context, error) {
+	level, err := parseLevel(config.Level)
+	if err != nil {
+		return nil, ctx, errors.Errorf("configure logging: %w", err)
+	}
+	levelVar.Set(level)
 
 	var handler slog.Handler
 	if config.JSON {
@@ -83,7 +107,7 @@ func Configure(ctx context.Context, config Config) (*slog.Logger, context.Contex
 		})
 	}
 	logger := slog.New(handler)
-	return logger, context.WithValue(ctx, logKey{}, logger)
+	return logger, context.WithValue(ctx, logKey{}, logger), nil
 }
 
 func FromContext(ctx context.Context) *slog.Logger {

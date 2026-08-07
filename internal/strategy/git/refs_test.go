@@ -27,7 +27,7 @@ func TestEnsureRefsHandler(t *testing.T) {
 		t.Skip("git not found in PATH")
 	}
 
-	_, ctx := logging.Configure(context.Background(), logging.Config{})
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{})
 	tmpDir := t.TempDir()
 	mirrorRoot := filepath.Join(tmpDir, "mirrors")
 

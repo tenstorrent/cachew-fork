@@ -3,7 +3,6 @@ package cache
 import (
 	"bytes"
 	"io"
-	"log/slog"
 	"os"
 	"testing"
 	"time"
@@ -20,7 +19,7 @@ import (
 func newS3(t *testing.T) *S3 {
 	t.Helper()
 	bucket := s3clienttest.Start(t)
-	_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelDebug})
+	_, ctx, _ := logging.Configure(t.Context(), logging.Config{Level: "debug"})
 
 	clientProvider := s3client.NewClientProvider(ctx, s3client.Config{
 		Endpoint: s3clienttest.Addr,

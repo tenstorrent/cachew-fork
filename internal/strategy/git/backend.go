@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/alecthomas/errors"
+
 	"github.com/block/cachew/internal/gitclone"
 	"github.com/block/cachew/internal/httputil"
 	"github.com/block/cachew/internal/logging"
@@ -182,5 +184,9 @@ func (s *Strategy) serveFromBackend(w http.ResponseWriter, r *http.Request, repo
 // Returns true if a fetch is needed. The caller decides whether to fetch
 // synchronously or fall back to upstream.
 func (s *Strategy) checkRefsStale(ctx context.Context, repo *gitclone.Repository) (bool, error) {
-	return repo.EnsureRefsUpToDate(ctx)
+	needsFetch, err := repo.EnsureRefsUpToDate(ctx)
+	if err != nil {
+		return false, errors.Wrap(err, "check refs up to date")
+	}
+	return needsFetch, nil
 }

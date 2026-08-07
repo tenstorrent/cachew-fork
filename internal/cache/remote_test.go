@@ -2,7 +2,6 @@ package cache_test
 
 import (
 	"io"
-	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -21,7 +20,7 @@ import (
 func TestRemoteCache(t *testing.T) {
 	cachetest.Suite(t, func(t *testing.T) cache.Cache {
 		ctx := t.Context()
-		_, ctx = logging.Configure(ctx, logging.Config{Level: slog.LevelError})
+		_, ctx, _ = logging.Configure(ctx, logging.Config{Level: "error"})
 		memCache, err := cache.NewMemory(ctx, cache.MemoryConfig{
 			MaxTTL: 3 * time.Second,
 		})
@@ -41,7 +40,7 @@ func TestRemoteCache(t *testing.T) {
 
 func TestRemoteInvalidateSkipsRemoteAuthoritativeTier(t *testing.T) {
 	ctx := t.Context()
-	_, ctx = logging.Configure(ctx, logging.Config{Level: slog.LevelError})
+	_, ctx, _ = logging.Configure(ctx, logging.Config{Level: "error"})
 
 	lower, err := cache.NewMemory(ctx, cache.MemoryConfig{MaxTTL: time.Hour})
 	assert.NoError(t, err)
@@ -88,7 +87,7 @@ func TestRemoteCacheSoak(t *testing.T) {
 	}
 
 	ctx := t.Context()
-	_, ctx = logging.Configure(ctx, logging.Config{Level: slog.LevelError})
+	_, ctx, _ = logging.Configure(ctx, logging.Config{Level: "error"})
 	memCache, err := cache.NewMemory(ctx, cache.MemoryConfig{
 		LimitMB: 50,
 		MaxTTL:  10 * time.Minute,

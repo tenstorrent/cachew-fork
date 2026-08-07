@@ -3,7 +3,6 @@ package strategy_test
 import (
 	"context"
 	"io"
-	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -28,7 +27,7 @@ var httpTransportMutexProxy sync.Mutex //nolint:gochecknoglobals
 func setupProxyTest(t *testing.T) (http.Handler, context.Context, cache.Cache) {
 	t.Helper()
 
-	_, ctx := logging.Configure(context.Background(), logging.Config{Level: slog.LevelError})
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{Level: "error"})
 	memCache, err := cache.NewMemory(ctx, cache.MemoryConfig{MaxTTL: time.Hour})
 	assert.NoError(t, err)
 	t.Cleanup(func() { memCache.Close() })
@@ -110,7 +109,7 @@ func TestHTTPProxyNonGETNotIntercepted(t *testing.T) {
 // TestHTTPProxyDoesNotShadowSpecificRoutes verifies that more-specific mux
 // routes still win for relative-path requests even when the proxy intercepts.
 func TestHTTPProxyDoesNotShadowSpecificRoutes(t *testing.T) {
-	_, ctx := logging.Configure(context.Background(), logging.Config{Level: slog.LevelError})
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{Level: "error"})
 	memCache, err := cache.NewMemory(ctx, cache.MemoryConfig{MaxTTL: time.Hour})
 	assert.NoError(t, err)
 	defer memCache.Close()
@@ -251,7 +250,7 @@ func TestHTTPProxyDifferentURLs(t *testing.T) {
 
 // TestHTTPProxyString verifies the strategy identifier is "proxy".
 func TestHTTPProxyString(t *testing.T) {
-	_, ctx := logging.Configure(context.Background(), logging.Config{Level: slog.LevelError})
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{Level: "error"})
 	memCache, err := cache.NewMemory(ctx, cache.MemoryConfig{MaxTTL: time.Hour})
 	assert.NoError(t, err)
 	defer memCache.Close()
@@ -307,7 +306,7 @@ func (f failingOpenCache) Open(context.Context, cache.Key, ...cache.Option) (io.
 // not the previous unconditional 502 Bad Gateway, matching defaultErrorHandler's
 // handling of httputil.HTTPResponder-wrapped errors.
 func TestHTTPProxyCacheOpenFailureReturns500(t *testing.T) {
-	_, ctx := logging.Configure(context.Background(), logging.Config{Level: slog.LevelError})
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{Level: "error"})
 	memCache, err := cache.NewMemory(ctx, cache.MemoryConfig{MaxTTL: time.Hour})
 	assert.NoError(t, err)
 	defer memCache.Close()

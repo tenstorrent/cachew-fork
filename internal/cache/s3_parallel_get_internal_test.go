@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"io"
-	"log/slog"
 	"math/rand"
 	"net/http"
 	"sync/atomic"
@@ -45,7 +44,7 @@ func newCountingS3(t *testing.T, cfg S3Config) (*S3, context.Context, *rangeGetC
 	cfg.MaxTTL = time.Hour
 	cfg.UploadConcurrency = 1
 	cfg.UploadPartSizeMB = 16
-	_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelDebug})
+	_, ctx, _ := logging.Configure(t.Context(), logging.Config{Level: "debug"})
 
 	counters := &rangeGetCounters{}
 	base, err := minio.DefaultTransport(false)

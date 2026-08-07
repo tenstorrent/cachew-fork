@@ -281,7 +281,7 @@ func assertIncrementalEligible(t *testing.T, rm metricdata.ResourceMetrics, repo
 }
 
 func TestIncrementalParse(t *testing.T) {
-	_, ctx := logging.Configure(context.Background(), logging.Config{})
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{})
 
 	oid1 := sha1OID("aabbcc")
 	oid2 := sha1OID("ddeeff")
@@ -574,7 +574,7 @@ func TestEnsureWantsAvailable(t *testing.T) {
 		t.Skip("git not found in PATH")
 	}
 
-	_, ctx := logging.Configure(context.Background(), logging.Config{})
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{})
 
 	// The fake upstream URL must be one the Manager's RepoPathFromURL can parse
 	// as a host+path, which means it must be an http/https URL. We create the
@@ -1265,7 +1265,7 @@ func TestIncrementalUploadPackServedLocally(t *testing.T) {
 		t.Skip("git not found in PATH")
 	}
 
-	_, ctx := logging.Configure(context.Background(), logging.Config{})
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{})
 	tmpDir := t.TempDir()
 
 	// Mirror at <mirrorRoot>/127.0.0.1/org/repo matches the upstream URL
@@ -1314,7 +1314,7 @@ func TestIncrementalUploadPackServedLocallyV0NULCaps(t *testing.T) {
 		t.Skip("git not found in PATH")
 	}
 
-	_, ctx := logging.Configure(context.Background(), logging.Config{})
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{})
 	tmpDir := t.TempDir()
 
 	const host = "127.0.0.1"
@@ -1363,7 +1363,7 @@ func TestIncrementalUploadPackFetchesMissingDelta(t *testing.T) {
 		t.Skip("git not found in PATH")
 	}
 
-	_, ctx := logging.Configure(context.Background(), logging.Config{})
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{})
 	tmpDir := t.TempDir()
 
 	const host = "127.0.0.1"
@@ -1427,7 +1427,7 @@ func TestIncrementalUploadPackFallsBackOnMissingWant(t *testing.T) {
 		t.Skip("git not found in PATH")
 	}
 
-	_, ctx := logging.Configure(context.Background(), logging.Config{})
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{})
 	tmpDir := t.TempDir()
 
 	const host = "127.0.0.1"
@@ -1474,7 +1474,7 @@ func TestIncrementalUploadPackFallsBackOnFetchFailed(t *testing.T) {
 		t.Skip("git not found in PATH")
 	}
 
-	_, ctx := logging.Configure(context.Background(), logging.Config{})
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{})
 	tmpDir := t.TempDir()
 
 	const host = "127.0.0.1"
@@ -1531,7 +1531,7 @@ func TestIncrementalUploadPackConcurrentRequestsCoalesce(t *testing.T) {
 		t.Skip("git not found in PATH")
 	}
 
-	_, ctx := logging.Configure(context.Background(), logging.Config{})
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{})
 	tmpDir := t.TempDir()
 
 	const host = "127.0.0.1"
@@ -1637,7 +1637,7 @@ func TestIncrementalUploadPackServedLocallyGzipBody(t *testing.T) {
 		t.Skip("git not found in PATH")
 	}
 
-	_, ctx := logging.Configure(context.Background(), logging.Config{})
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{})
 	tmpDir := t.TempDir()
 
 	const host = "127.0.0.1"
@@ -1691,7 +1691,7 @@ func TestIncrementalUploadPackServedLocallyV2FetchBody(t *testing.T) {
 		t.Skip("git not found in PATH")
 	}
 
-	_, ctx := logging.Configure(context.Background(), logging.Config{})
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{})
 	tmpDir := t.TempDir()
 
 	const host = "127.0.0.1"
@@ -1751,7 +1751,7 @@ func TestIncrementalLsRefsRecordsNotEngaged(t *testing.T) {
 		t.Skip("git not found in PATH")
 	}
 
-	_, ctx := logging.Configure(context.Background(), logging.Config{})
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{})
 	tmpDir := t.TempDir()
 
 	const host = "127.0.0.1"
@@ -1797,7 +1797,7 @@ func TestIncrementalWantRefForwardedToUpstream(t *testing.T) {
 		t.Skip("git not found in PATH")
 	}
 
-	_, ctx := logging.Configure(context.Background(), logging.Config{})
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{})
 	tmpDir := t.TempDir()
 
 	const host = "127.0.0.1"
@@ -1850,7 +1850,7 @@ func TestIncrementalWantRefUnknownRefServedFromUpstream(t *testing.T) {
 	}
 	t.Setenv("GIT_SSL_NO_VERIFY", "1")
 
-	_, ctx := logging.Configure(context.Background(), logging.Config{})
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{})
 	tmpDir := t.TempDir()
 
 	run := func(args ...string) {
@@ -1924,7 +1924,7 @@ func TestIncrementalDisabledFallsBackViaNotOurRef(t *testing.T) {
 		t.Skip("git not found in PATH")
 	}
 
-	_, ctx := logging.Configure(context.Background(), logging.Config{})
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{})
 	tmpDir := t.TempDir()
 
 	const host = "127.0.0.1"
@@ -2028,7 +2028,7 @@ func TestIncrementalStaleInfoRefsForwardedThenBackgroundFetch(t *testing.T) {
 	// (clone, ls-remote, background fetch) inherit this from the test process.
 	t.Setenv("GIT_SSL_NO_VERIFY", "1")
 
-	_, ctx := logging.Configure(context.Background(), logging.Config{})
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{})
 	tmpDir := t.TempDir()
 
 	run := func(args ...string) {
@@ -2139,7 +2139,7 @@ func TestIncrementalUploadPackRejectsOversizedBody(t *testing.T) {
 		t.Skip("git not found in PATH")
 	}
 
-	_, ctx := logging.Configure(context.Background(), logging.Config{})
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{})
 	tmpDir := t.TempDir()
 
 	const host = "127.0.0.1"
@@ -2174,7 +2174,7 @@ func TestUploadPackOversizedBodyAcceptedWhenIncrementalDisabled(t *testing.T) {
 		t.Skip("git not found in PATH")
 	}
 
-	_, ctx := logging.Configure(context.Background(), logging.Config{})
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{})
 	tmpDir := t.TempDir()
 
 	const host = "127.0.0.1"
@@ -2212,7 +2212,7 @@ func TestWantRefForwardedIncrementalDisabled(t *testing.T) {
 		t.Skip("git not found in PATH")
 	}
 
-	_, ctx := logging.Configure(context.Background(), logging.Config{})
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{})
 	tmpDir := t.TempDir()
 
 	const host = "127.0.0.1"
@@ -2258,7 +2258,7 @@ func TestSubmitFetchForceBypassesFetchCooldown(t *testing.T) {
 		t.Skip("git not found in PATH")
 	}
 
-	_, ctx := logging.Configure(context.Background(), logging.Config{})
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{})
 	tmpDir := t.TempDir()
 
 	const upstreamURL = "https://example.com/org/repo"
@@ -2306,7 +2306,7 @@ func TestSubmitFetchForceFetchesPastSemaphoreHolder(t *testing.T) {
 		t.Skip("git not found in PATH")
 	}
 
-	_, ctx := logging.Configure(context.Background(), logging.Config{})
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{})
 	tmpDir := t.TempDir()
 
 	const upstreamURL = "https://example.com/org/repo"
@@ -2369,7 +2369,7 @@ func TestShallowCloneDefaultProtocolSucceeds(t *testing.T) {
 	for _, incremental := range []bool{true, false} {
 		t.Run(fmt.Sprintf("IncrementalPullthrough=%v", incremental), func(t *testing.T) {
 			t.Setenv("GIT_SSL_NO_VERIFY", "1")
-			_, ctx := logging.Configure(context.Background(), logging.Config{})
+			_, ctx, _ := logging.Configure(context.Background(), logging.Config{})
 			tmpDir := t.TempDir()
 
 			run := func(args ...string) {

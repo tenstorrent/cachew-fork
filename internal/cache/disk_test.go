@@ -5,7 +5,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"io"
-	"log/slog"
 	"net/http"
 	"os"
 	"sync"
@@ -23,7 +22,7 @@ import (
 func TestDiskCache(t *testing.T) {
 	cachetest.Suite(t, func(t *testing.T) cache.Cache {
 		dir := t.TempDir()
-		_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelDebug})
+		_, ctx, _ := logging.Configure(t.Context(), logging.Config{Level: "debug"})
 		c, err := cache.NewDisk(ctx, cache.DiskConfig{
 			Root:   dir,
 			MaxTTL: 3 * time.Second,
@@ -39,7 +38,7 @@ func TestDiskCacheSoak(t *testing.T) {
 	}
 
 	dir := t.TempDir()
-	_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelError})
+	_, ctx, _ := logging.Configure(t.Context(), logging.Config{Level: "error"})
 	c, err := cache.NewDisk(ctx, cache.DiskConfig{
 		Root:          dir,
 		LimitMB:       50,
@@ -62,7 +61,7 @@ func TestDiskCacheSoak(t *testing.T) {
 
 func TestDiskOpenRevisionAtomic(t *testing.T) {
 	dir := t.TempDir()
-	_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelError})
+	_, ctx, _ := logging.Configure(t.Context(), logging.Config{Level: "error"})
 	c, err := cache.NewDisk(ctx, cache.DiskConfig{Root: dir, MaxTTL: time.Hour})
 	assert.NoError(t, err)
 	defer c.Close()

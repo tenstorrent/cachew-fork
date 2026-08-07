@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"log/slog"
 	"strings"
 	"sync"
 	"testing"
@@ -23,7 +22,7 @@ import (
 
 func newBackend(t *testing.T, bucket string) *Backend {
 	t.Helper()
-	_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelError})
+	_, ctx, _ := logging.Configure(t.Context(), logging.Config{Level: "error"})
 	b, err := New(ctx, s3client.ClientProvider(func() (*minio.Client, error) { return s3clienttest.Client(t), nil }), Config{
 		Bucket:       bucket,
 		SyncInterval: time.Hour, // ticks are driven by Flush (or directly) in tests
@@ -60,7 +59,7 @@ func TestS3BackendSoakReplicas(t *testing.T) {
 	bucket := s3clienttest.Start(t)
 	backends := make([]metadatadb.Backend, 3)
 	for i := range backends {
-		_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelError})
+		_, ctx, _ := logging.Configure(t.Context(), logging.Config{Level: "error"})
 		b, err := New(ctx, s3client.ClientProvider(func() (*minio.Client, error) { return s3clienttest.Client(t), nil }), Config{
 			Bucket:       bucket,
 			SyncInterval: 500 * time.Millisecond, // real background ticks

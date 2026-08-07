@@ -2,7 +2,6 @@ package cache_test
 
 import (
 	"context"
-	"log/slog"
 	"testing"
 	"time"
 
@@ -34,7 +33,7 @@ func TestMemoryEvictionKeepsRecentlyRead(t *testing.T) {
 		}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelDebug})
+			_, ctx, _ := logging.Configure(t.Context(), logging.Config{Level: "debug"})
 
 			c, err := cache.NewMemory(ctx, cache.MemoryConfig{LimitMB: 1, MaxTTL: time.Hour})
 			assert.NoError(t, err)
@@ -66,7 +65,7 @@ func TestMemoryEvictionKeepsRecentlyRead(t *testing.T) {
 }
 
 func TestMemoryEvictionAcrossNamespaces(t *testing.T) {
-	_, ctx := logging.Configure(t.Context(), logging.Config{Level: slog.LevelDebug})
+	_, ctx, _ := logging.Configure(t.Context(), logging.Config{Level: "debug"})
 
 	c, err := cache.NewMemory(ctx, cache.MemoryConfig{LimitMB: 1, MaxTTL: time.Hour})
 	assert.NoError(t, err)

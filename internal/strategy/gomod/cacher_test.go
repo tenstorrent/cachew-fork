@@ -3,7 +3,6 @@ package gomod_test
 import (
 	"context"
 	"io"
-	"log/slog"
 	"os"
 	"testing"
 	"time"
@@ -16,7 +15,7 @@ import (
 )
 
 func TestGoproxyCacherPutAbortsOnReadError(t *testing.T) {
-	_, ctx := logging.Configure(context.Background(), logging.Config{Level: slog.LevelError})
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{Level: "error"})
 	memCache, err := cache.NewMemory(ctx, cache.MemoryConfig{MaxTTL: time.Hour})
 	assert.NoError(t, err)
 	defer memCache.Close()
