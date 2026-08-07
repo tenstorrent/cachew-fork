@@ -75,7 +75,7 @@ func (t Tiered) Close() error {
 	return errors.Join(errs...)
 }
 
-// Create a new object. All underlying caches will be written to in sequence.
+// Create a new object. All underlying caches are written to concurrently; the first error cancels the rest.
 func (t Tiered) Create(ctx context.Context, key Key, headers http.Header, ttl time.Duration, opts ...Option) (Writer, error) {
 	rawETag, quotedETag, err := createETag(opts...)
 	if err != nil {

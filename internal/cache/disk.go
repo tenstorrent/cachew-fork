@@ -59,8 +59,9 @@ var _ Cache = (*Disk)(nil)
 // config.Root MUST be set.
 //
 // This [Cache] implementation stores cache entries under a directory. If total usage exceeds the limit, entries are
-// evicted based on their last access time. TTLs are stored in a bbolt database. If an entry exceeds its
-// TTL or the default, it is evicted. The implementation is safe for concurrent use within a single Go process.
+// evicted least recently accessed first. TTLs and last access times are tracked in a bbolt database rather than
+// derived from filesystem timestamps, which are unreliable on noatime mounts. If an entry exceeds its TTL or the
+// default, it is evicted. The implementation is safe for concurrent use within a single Go process.
 func NewDisk(ctx context.Context, config DiskConfig) (*Disk, error) {
 	logging.FromContext(ctx).InfoContext(ctx, "Constructing disk cache", "limit-mb", config.LimitMB, "evict-interval", config.EvictInterval, "root", config.Root, "max-ttl", config.MaxTTL)
 	// Validate config
@@ -306,8 +307,8 @@ func (d *Disk) openLocked(key Key, fullPath string, now time.Time) (f *os.File, 
 		return nil, nil, false, errors.Join(errors.Errorf("failed to get headers: %w", err), f.Close())
 	}
 	ttl := min(expiresAt.Sub(now), d.config.MaxTTL)
-	if err := d.db.setTTL(d.namespace, key, now.Add(ttl)); err != nil {
-		return nil, nil, false, errors.Join(errors.Errorf("failed to update expiration time: %w", err), f.Close())
+	if err := d.db.recordAccess(d.namespace, key, now.Add(ttl), now); err != nil {
+		return nil, nil, false, errors.Join(errors.Errorf("failed to record access: %w", err), f.Close())
 	}
 	return f, headers, false, nil
 }
@@ -399,7 +400,7 @@ func (d *Disk) evict() error {
 	var expiredEntries []evictEntryKey
 	now := time.Now()
 
-	err := d.db.walk(func(key Key, namespace Namespace, expiresAt time.Time) error {
+	err := d.db.walk(func(key Key, namespace Namespace, expiresAt, lastAccessedAt time.Time) error {
 		path := d.keyToPath(namespace, key)
 		fullPath := filepath.Join(d.config.Root, path)
 
@@ -424,7 +425,7 @@ func (d *Disk) evict() error {
 				path:       path,
 				size:       info.Size(),
 				expiresAt:  expiresAt,
-				accessedAt: info.ModTime(),
+				accessedAt: lastAccessedAt,
 			})
 		}
 		return nil
@@ -551,7 +552,7 @@ func (w *diskWriter) commitLocked() error {
 	if err := os.Rename(w.tempPath, w.path); err != nil {
 		return errors.Errorf("failed to rename temp file: %w", err)
 	}
-	if err := w.disk.db.set(w.key, w.namespace, w.expiresAt, w.headers); err != nil {
+	if err := w.disk.db.set(w.key, w.namespace, w.expiresAt, time.Now(), w.headers); err != nil {
 		return errors.Join(errors.Errorf("failed to set metadata: %w", err), os.Remove(w.path))
 	}
 	return nil

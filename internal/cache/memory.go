@@ -8,6 +8,7 @@ import (
 	"maps"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -29,15 +30,20 @@ func RegisterMemory(r *Registry) {
 }
 
 type MemoryConfig struct {
-	LimitMB int           `hcl:"limit-mb,optional" help:"Maximum size of the disk cache in megabytes (defaults to 1GB)." default:"1024"`
-	MaxTTL  time.Duration `hcl:"max-ttl,optional" help:"Maximum time-to-live for entries in the disk cache (defaults to 1 hour)." default:"1h"`
+	LimitMB int           `hcl:"limit-mb,optional" help:"Maximum size of the memory cache in megabytes (defaults to 1GB)." default:"1024"`
+	MaxTTL  time.Duration `hcl:"max-ttl,optional" help:"Maximum time-to-live for entries in the memory cache (defaults to 1 hour)." default:"1h"`
 }
 
 type memoryEntry struct {
 	data      []byte
 	expiresAt time.Time
 	headers   http.Header
+	// UnixNano. Atomic so the read paths can record a hit while holding only Memory.mu's read lock, rather than
+	// serialising every reader on the write lock.
+	lastAccessedAt atomic.Int64
 }
+
+func (e *memoryEntry) recordAccess(now time.Time) { e.lastAccessedAt.Store(now.UnixNano()) }
 
 type Memory struct {
 	config      MemoryConfig
@@ -47,6 +53,12 @@ type Memory struct {
 	currentSize *atomic.Int64
 }
 
+// NewMemory creates a new in-memory [Cache].
+//
+// This [Cache] implementation holds cache entries in process memory. If total usage would exceed the limit, entries
+// are evicted least recently accessed first, where reads via Stat and Open count as accesses. Expired entries are not
+// reclaimed eagerly; they are reported as missing and evicted once space is needed. The implementation is safe for
+// concurrent use within a single Go process, but entries do not survive a restart.
 func NewMemory(ctx context.Context, config MemoryConfig) (*Memory, error) {
 	logging.FromContext(ctx).InfoContext(ctx, "Constructing in-memory Cache", "limit-mb", config.LimitMB, "max-ttl", config.MaxTTL)
 	return &Memory{
@@ -73,9 +85,11 @@ func (m *Memory) Stat(_ context.Context, key Key, opts ...Option) (http.Header, 
 		return nil, os.ErrNotExist
 	}
 
-	if time.Now().After(entry.expiresAt) {
+	now := time.Now()
+	if now.After(entry.expiresAt) {
 		return nil, os.ErrNotExist
 	}
+	entry.recordAccess(now)
 
 	headers := maps.Clone(entry.headers)
 	headers.Set("Content-Length", strconv.Itoa(len(entry.data)))
@@ -99,9 +113,11 @@ func (m *Memory) Open(_ context.Context, key Key, opts ...Option) (io.ReadCloser
 		return nil, nil, os.ErrNotExist
 	}
 
-	if time.Now().After(entry.expiresAt) {
+	now := time.Now()
+	if now.After(entry.expiresAt) {
 		return nil, nil, os.ErrNotExist
 	}
+	entry.recordAccess(now)
 
 	headers := maps.Clone(entry.headers)
 	headers.Set("Content-Length", strconv.Itoa(len(entry.data)))
@@ -203,32 +219,28 @@ func (m *Memory) Stats(_ context.Context) (Stats, error) {
 
 func (m *Memory) evictOldest(neededSpace int64) {
 	type entryInfo struct {
-		namespace Namespace
-		key       Key
-		size      int64
-		expiresAt time.Time
+		namespace      Namespace
+		key            Key
+		size           int64
+		lastAccessedAt int64
 	}
 
 	var entries []entryInfo
 	for ns, nsEntries := range m.entries {
 		for k, e := range nsEntries {
 			entries = append(entries, entryInfo{
-				namespace: ns,
-				key:       k,
-				size:      int64(len(e.data)),
-				expiresAt: e.expiresAt,
+				namespace:      ns,
+				key:            k,
+				size:           int64(len(e.data)),
+				lastAccessedAt: e.lastAccessedAt.Load(),
 			})
 		}
 	}
 
-	// Sort by expiry time (earliest first)
-	for i := 0; i < len(entries); i++ {
-		for j := i + 1; j < len(entries); j++ {
-			if entries[i].expiresAt.After(entries[j].expiresAt) {
-				entries[i], entries[j] = entries[j], entries[i]
-			}
-		}
-	}
+	// Sort by last access time (least recently accessed first)
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].lastAccessedAt < entries[j].lastAccessedAt
+	})
 
 	freedSpace := int64(0)
 	for _, e := range entries {
@@ -308,11 +320,14 @@ func (w *memoryWriter) Close() error {
 	data := make([]byte, w.buf.Len())
 	copy(data, w.buf.Bytes())
 	w.buf.Reset()
-	nsEntries[w.key] = &memoryEntry{
+	entry := &memoryEntry{
 		data:      data,
 		expiresAt: w.expiresAt,
 		headers:   w.headers,
 	}
+	// A fresh write counts as an access, otherwise a new entry would sort first for eviction.
+	entry.recordAccess(time.Now())
+	nsEntries[w.key] = entry
 	w.cache.currentSize.Add(newSize)
 
 	return nil
