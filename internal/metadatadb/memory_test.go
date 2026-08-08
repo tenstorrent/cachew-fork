@@ -3,8 +3,8 @@ package metadatadb_test
 import (
 	"testing"
 
-	"github.com/block/cachew/internal/metadatadb"
-	"github.com/block/cachew/internal/metadatadb/metadatadbtest"
+	"github.com/tenstorrent/internal-cachew/internal/metadatadb"
+	"github.com/tenstorrent/internal-cachew/internal/metadatadb/metadatadbtest"
 )
 
 func TestMemoryBackend(t *testing.T) {

@@ -9,8 +9,8 @@ import (
 
 	"github.com/alecthomas/assert/v2"
 
-	"github.com/block/cachew/internal/jobscheduler"
-	"github.com/block/cachew/internal/logging"
+	"github.com/tenstorrent/internal-cachew/internal/jobscheduler"
+	"github.com/tenstorrent/internal-cachew/internal/logging"
 )
 
 func TestScheduleStoreRoundTrip(t *testing.T) {

@@ -8,8 +8,8 @@ import (
 
 	"github.com/alecthomas/assert/v2"
 
-	"github.com/block/cachew/internal/logging"
-	"github.com/block/cachew/internal/metadatadb"
+	"github.com/tenstorrent/internal-cachew/internal/logging"
+	"github.com/tenstorrent/internal-cachew/internal/metadatadb"
 )
 
 // Suite runs a comprehensive test suite against a metadatadb.Backend implementation.

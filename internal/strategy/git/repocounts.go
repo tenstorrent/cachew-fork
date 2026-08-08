@@ -11,7 +11,7 @@ import (
 
 	"github.com/alecthomas/errors"
 
-	"github.com/block/cachew/internal/metadatadb"
+	"github.com/tenstorrent/internal-cachew/internal/metadatadb"
 )
 
 const (

@@ -28,7 +28,7 @@ lint:
 # Format code
 fmt:
     just --unstable --fmt
-    git ls-files | grep '\.go$' | xargs gosimports -local github.com/block -w
+    git ls-files | grep '\.go$' | xargs gosimports -local github.com/tenstorrent/internal-cachew -w
     git ls-files | grep '\.go$' | xargs dirname | uniq | sed 's,^,./,' | xargs go fmt
     go mod tidy
 

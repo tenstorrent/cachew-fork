@@ -9,7 +9,7 @@ import (
 
 	"github.com/alecthomas/assert/v2"
 
-	"github.com/block/cachew/internal/strategy/git"
+	"github.com/tenstorrent/internal-cachew/internal/strategy/git"
 )
 
 // pkt formats a single pkt-line with the length prefix.

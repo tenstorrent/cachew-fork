@@ -9,7 +9,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/minio/minio-go/v7"
 
-	"github.com/block/cachew/internal/metadatadb"
+	"github.com/tenstorrent/internal-cachew/internal/metadatadb"
 )
 
 type applyReq struct {

@@ -4,9 +4,11 @@ package git_test
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/cgi"
 	"net/http/httptest"
 	"os"
 	"os/exec"
@@ -18,11 +20,11 @@ import (
 
 	"github.com/alecthomas/assert/v2"
 
-	"github.com/block/cachew/internal/cache"
-	"github.com/block/cachew/internal/gitclone"
-	"github.com/block/cachew/internal/githubapp"
-	"github.com/block/cachew/internal/logging"
-	"github.com/block/cachew/internal/strategy/git"
+	"github.com/tenstorrent/internal-cachew/internal/cache"
+	"github.com/tenstorrent/internal-cachew/internal/gitclone"
+	"github.com/tenstorrent/internal-cachew/internal/githubapp"
+	"github.com/tenstorrent/internal-cachew/internal/logging"
+	"github.com/tenstorrent/internal-cachew/internal/strategy/git"
 )
 
 // runGit runs a git command, failing the test on error.
@@ -66,13 +68,20 @@ type upstreamRedirectTransport struct {
 	targetBaseURL string
 	inner         http.RoundTripper
 	hits          *atomic.Int32
+	// hostRoutes optionally redirects specific upstream hosts elsewhere,
+	// preserving the distinction between hosts that targetBaseURL erases.
+	hostRoutes map[string]string
 }
 
 func (t *upstreamRedirectTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	t.hits.Add(1)
 	req = req.Clone(req.Context())
+	target := t.targetBaseURL
+	if routed, ok := t.hostRoutes[req.URL.Host]; ok {
+		target = routed
+	}
 	req.URL.Scheme = "http"
-	req.URL.Host = strings.TrimPrefix(t.targetBaseURL, "http://")
+	req.URL.Host = strings.TrimPrefix(target, "http://")
 	req.Host = req.URL.Host
 	return t.inner.RoundTrip(req)
 }
@@ -120,7 +129,7 @@ func TestIntegrationGitCloneViaProxy(t *testing.T) {
 	mux := http.NewServeMux()
 	memCache, err := cache.NewMemory(ctx, cache.MemoryConfig{MaxTTL: time.Hour})
 	assert.NoError(t, err)
-	_, err = git.New(ctx, git.Config{}, newTestScheduler(ctx, t), memCache, mux, gc, func() (*githubapp.TokenManager, error) { return nil, nil }) //nolint:nilnil
+	_, err = git.New(ctx, git.Config{}, newTestScheduler(ctx, t), memCache, mux, gc, func() (*githubapp.TokenManager, error) { return nil, nil }, nil) //nolint:nilnil
 	assert.NoError(t, err)
 
 	// Start a test server with logging middleware
@@ -204,7 +213,7 @@ func TestIntegrationGitFetchViaProxy(t *testing.T) {
 	mux := http.NewServeMux()
 	memCache, err := cache.NewMemory(ctx, cache.MemoryConfig{MaxTTL: time.Hour})
 	assert.NoError(t, err)
-	_, err = git.New(ctx, git.Config{}, newTestScheduler(ctx, t), memCache, mux, gc, func() (*githubapp.TokenManager, error) { return nil, nil }) //nolint:nilnil
+	_, err = git.New(ctx, git.Config{}, newTestScheduler(ctx, t), memCache, mux, gc, func() (*githubapp.TokenManager, error) { return nil, nil }, nil) //nolint:nilnil
 	assert.NoError(t, err)
 
 	server := testServerWithLogging(ctx, mux)
@@ -286,7 +295,7 @@ func TestIntegrationPushForwardsToUpstream(t *testing.T) {
 	}, nil)
 	memCache, err := cache.NewMemory(ctx, cache.MemoryConfig{MaxTTL: time.Hour})
 	assert.NoError(t, err)
-	_, err = git.New(ctx, git.Config{}, newTestScheduler(ctx, t), memCache, mux, gc, func() (*githubapp.TokenManager, error) { return nil, nil }) //nolint:nilnil
+	_, err = git.New(ctx, git.Config{}, newTestScheduler(ctx, t), memCache, mux, gc, func() (*githubapp.TokenManager, error) { return nil, nil }, nil) //nolint:nilnil
 	assert.NoError(t, err)
 
 	server := testServerWithLogging(ctx, mux)
@@ -382,7 +391,7 @@ func TestIntegrationSpoolReusesDuringClone(t *testing.T) {
 	}, nil)
 	memCache, err := cache.NewMemory(ctx, cache.MemoryConfig{MaxTTL: time.Hour})
 	assert.NoError(t, err)
-	strategy, err := git.New(ctx, git.Config{}, newTestScheduler(ctx, t), memCache, mux, gc, func() (*githubapp.TokenManager, error) { return nil, nil }) //nolint:nilnil
+	strategy, err := git.New(ctx, git.Config{}, newTestScheduler(ctx, t), memCache, mux, gc, func() (*githubapp.TokenManager, error) { return nil, nil }, nil) //nolint:nilnil
 	assert.NoError(t, err)
 
 	strategy.SetHTTPTransport(&countingTransport{
@@ -529,7 +538,7 @@ func TestIntegrationNotOurRefFallsBackToUpstream(t *testing.T) {
 	memCache, err := cache.NewMemory(ctx, cache.MemoryConfig{MaxTTL: time.Hour})
 	assert.NoError(t, err)
 	strategy, err := git.New(ctx, git.Config{}, newTestScheduler(ctx, t), memCache, mux, gc,
-		func() (*githubapp.TokenManager, error) { return nil, nil }) //nolint:nilnil
+		func() (*githubapp.TokenManager, error) { return nil, nil }, nil) //nolint:nilnil
 	assert.NoError(t, err)
 	// The warm-up goroutine uses context.WithoutCancel so it survives
 	// t.Context() cancellation. Wait for it before TempDir cleanup.
@@ -556,7 +565,10 @@ func TestIntegrationNotOurRefFallsBackToUpstream(t *testing.T) {
 	assert.NoError(t, err)
 	req.Header.Set("Content-Type", "application/x-git-upload-pack-request")
 
-	resp, err := http.DefaultClient.Do(req)
+	// A dedicated client keeps this request out of the strategy's redirect
+	// transport, so it reaches cachew rather than the mock upstream directly.
+	client := &http.Client{Transport: http.DefaultTransport}
+	resp, err := client.Do(req)
 	assert.NoError(t, err)
 	defer resp.Body.Close()
 	_, _ = io.Copy(io.Discard, resp.Body)
@@ -565,4 +577,637 @@ func TestIntegrationNotOurRefFallsBackToUpstream(t *testing.T) {
 	// Before the fix: upstreamHits == 0 and this assertion fails.
 	assert.True(t, upstreamHits.Load() > 0,
 		"cachew should fall back to upstream when git upload-pack returns 'not our ref'")
+}
+
+const (
+	authzUser     = "tester"
+	authzPassword = "s3cret"
+
+	// cachewServiceUser and cachewServiceToken stand in for the credentials a
+	// GitHub App installation hands cachew. Upstream accepts them for private
+	// repositories, including for writes, so a request that reaches upstream as
+	// cachew is rejected by cachew's own logic or not at all.
+	cachewServiceUser  = "x-access-token"
+	cachewServiceToken = "cachew-installation-token"
+)
+
+// authzUpstream serves bare repositories under root via `git http-backend`,
+// rejecting requests without valid basic auth for repository paths listed in
+// private.
+//
+// Requests for "<repo>.git/..." are rewritten to "<repo>/..." so a single
+// on-disk repository answers both the ".git" URLs cachew's authorization probes
+// use and the plain paths a git client (and cachew's reverse proxy) use. Probes
+// are counted separately from proxied client traffic on that same basis.
+type authzUpstream struct {
+	root    string
+	gitPath string
+	private []string
+	probes  atomic.Int32
+	denials atomic.Int32
+	// asCachew and asClient count requests by the identity they arrived with,
+	// which is what distinguishes a forwarded push from one cachew performed on
+	// the client's behalf.
+	asCachew atomic.Int32
+	asClient atomic.Int32
+}
+
+func newAuthzUpstream(t *testing.T, root string, private ...string) *authzUpstream {
+	t.Helper()
+	gitPath, err := exec.LookPath("git")
+	if err != nil {
+		t.Skip("git not found in PATH")
+	}
+	assert.NoError(t, os.MkdirAll(root, 0o750))
+	return &authzUpstream{root: root, gitPath: gitPath, private: private}
+}
+
+func (u *authzUpstream) requiresAuth(path string) bool {
+	for _, prefix := range u.private {
+		if strings.HasPrefix(path, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func (u *authzUpstream) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if strings.Contains(r.URL.Path, ".git/info/refs") {
+		u.probes.Add(1)
+	}
+
+	user, password, hasAuth := r.BasicAuth()
+	asCachew := hasAuth && user == cachewServiceUser && password == cachewServiceToken
+	asClient := hasAuth && user == authzUser && password == authzPassword
+	switch {
+	case asCachew:
+		u.asCachew.Add(1)
+	case asClient:
+		u.asClient.Add(1)
+	}
+
+	if u.requiresAuth(r.URL.Path) && !asCachew && !asClient {
+		u.denials.Add(1)
+		w.Header().Set("WWW-Authenticate", `Basic realm="upstream"`)
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	if strings.Contains(r.URL.Path, "/info/lfs/") {
+		w.Header().Set("Content-Type", "application/vnd.git-lfs+json")
+		_, _ = w.Write([]byte(`{"transfer":"basic","objects":[]}`))
+		return
+	}
+
+	r2 := r.Clone(r.Context())
+	r2.URL.Path = strings.Replace(r.URL.Path, ".git/", "/", 1)
+	// Go's cgi.Handler rejects chunked request bodies with a 400.
+	if r2.ContentLength < 0 {
+		body, err := io.ReadAll(r2.Body)
+		if err != nil {
+			http.Error(w, "read body", http.StatusInternalServerError)
+			return
+		}
+		r2.Body = io.NopCloser(strings.NewReader(string(body)))
+		r2.ContentLength = int64(len(body))
+		r2.TransferEncoding = nil
+	}
+
+	env := []string{
+		"GIT_PROJECT_ROOT=" + u.root,
+		"GIT_HTTP_EXPORT_ALL=1",
+		"PATH=" + os.Getenv("PATH"),
+	}
+	// git http-backend refuses receive-pack unless it knows who is pushing, so
+	// an authenticated identity is what makes a push possible at all here —
+	// exactly as on a real host.
+	if asCachew || asClient {
+		env = append(env, "REMOTE_USER="+user)
+	}
+
+	handler := &cgi.Handler{
+		Path: u.gitPath,
+		Args: []string{"http-backend"},
+		Dir:  u.root,
+		Env:  env,
+	}
+	handler.ServeHTTP(w, r2)
+}
+
+// seedUpstreamRepo creates a bare repository at root/name with one commit,
+// returning the work tree it was pushed from and the new HEAD SHA.
+func seedUpstreamRepo(t *testing.T, root, name string) (workDir, sha string) {
+	t.Helper()
+	bare := filepath.Join(root, name)
+	runGit(t, "", "init", "--bare", bare)
+	runGit(t, "", "-C", bare, "symbolic-ref", "HEAD", "refs/heads/main")
+	workDir = filepath.Join(t.TempDir(), strings.ReplaceAll(name, "/", "-"))
+	runGit(t, "", "clone", bare, workDir)
+	return workDir, commitToUpstream(t, workDir, "initial")
+}
+
+// commitToUpstream commits content in an upstream work tree, pushes it to main
+// and returns the new SHA.
+func commitToUpstream(t *testing.T, workDir, content string) string {
+	t.Helper()
+	assert.NoError(t, os.WriteFile(filepath.Join(workDir, "file.txt"), []byte(content), 0o644))
+	runGit(t, workDir, "add", ".")
+	runGit(t, workDir, "commit", "-m", content)
+	runGit(t, workDir, "push", "origin", "HEAD:main")
+	return gitRevParse(t, workDir, "HEAD")
+}
+
+// mirrorUpstream pre-seeds a warm cachew mirror for host/repoPath, matching the
+// layout cachew derives from /git/{host}/{path...}.
+func mirrorUpstream(t *testing.T, clonesDir, host, repoPath, upstreamDir string) string {
+	t.Helper()
+	mirrorPath := filepath.Join(clonesDir, host, filepath.FromSlash(repoPath))
+	runGit(t, "", "clone", "--mirror", upstreamDir, mirrorPath)
+	return mirrorPath
+}
+
+// startAuthzCachew boots a git strategy whose upstream requests are redirected
+// to mockURL. The redirect is passed to git.New rather than installed
+// afterwards because the startup warm-up (and its visibility probes) runs
+// immediately, and those requests must be redirected too.
+//
+// A non-empty serviceToken stands in for GitHub App credentials, so upstream
+// can tell a request cachew authenticated as itself from one it forwarded on
+// the client's behalf. It is installed before the server starts serving.
+func startAuthzCachew(ctx context.Context, t *testing.T, mockURL, clonesDir, serviceToken string) (*git.Strategy, string) {
+	t.Helper()
+	return startAuthzCachewRouted(ctx, t, mockURL, clonesDir, serviceToken, nil)
+}
+
+// startAuthzCachewRouted is startAuthzCachew with per-host routing overrides:
+// an upstream request whose URL host matches a key in hostRoutes is sent to
+// that base URL instead of mockURL. That distinction matters for tests where
+// the *host* cachew probes must differ from the host whose mirror it resolves,
+// which the blanket redirect would otherwise erase.
+func startAuthzCachewRouted(
+	ctx context.Context, t *testing.T, mockURL, clonesDir, serviceToken string, hostRoutes map[string]string,
+) (*git.Strategy, string) {
+	t.Helper()
+	var redirects atomic.Int32
+	redirect := &upstreamRedirectTransport{
+		targetBaseURL: mockURL,
+		inner:         http.DefaultTransport,
+		hits:          &redirects,
+		hostRoutes:    hostRoutes,
+	}
+
+	mux := http.NewServeMux()
+	gc := gitclone.NewManagerProvider(ctx, gitclone.Config{
+		MirrorRoot:    clonesDir,
+		FetchInterval: 24 * time.Hour,
+	}, nil)
+	memCache, err := cache.NewMemory(ctx, cache.MemoryConfig{MaxTTL: time.Hour})
+	assert.NoError(t, err)
+	strategy, err := git.New(ctx, git.Config{}, newTestScheduler(ctx, t), memCache, mux, gc,
+		func() (*githubapp.TokenManager, error) { return nil, nil }, nil, //nolint:nilnil
+		git.WithHTTPTransport(redirect))
+	assert.NoError(t, err)
+	t.Cleanup(func() { waitForReady(t, strategy) })
+	waitForReady(t, strategy)
+	if serviceToken != "" {
+		strategy.SetServiceToken(func(context.Context, string) (string, error) { return serviceToken, nil })
+	}
+
+	server := testServerWithLogging(ctx, mux)
+	t.Cleanup(server.Close)
+	return strategy, server.URL
+}
+
+// getRefs requests the upload-pack ref advertisement for repoPath through
+// cachew, optionally with client credentials, and returns the response status
+// and body.
+func getRefs(ctx context.Context, t *testing.T, cachewURL, repoPath string, withCredentials bool) (int, string) {
+	t.Helper()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		cachewURL+"/git/local/"+repoPath+"/info/refs?service=git-upload-pack", nil)
+	assert.NoError(t, err)
+	if withCredentials {
+		req.SetBasicAuth(authzUser, authzPassword)
+	}
+	resp, err := (&http.Client{}).Do(req)
+	assert.NoError(t, err)
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	assert.NoError(t, err)
+	return resp.StatusCode, string(body)
+}
+
+// ensureRefs asks cachew to make refs/heads/main match sha, which is the
+// on-demand refresh path an authorized client uses.
+func ensureRefs(
+	ctx context.Context, t *testing.T, cachewURL, repoPath, sha string, withCredentials bool,
+) (int, git.EnsureRefsResponse) {
+	t.Helper()
+	payload, err := json.Marshal(git.EnsureRefsRequest{Refs: map[string]string{"refs/heads/main": sha}})
+	assert.NoError(t, err)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		cachewURL+"/git/local/"+repoPath+git.EnsureRefsPath, strings.NewReader(string(payload)))
+	assert.NoError(t, err)
+	req.Header.Set("Content-Type", "application/json")
+	if withCredentials {
+		req.SetBasicAuth(authzUser, authzPassword)
+	}
+	resp, err := (&http.Client{}).Do(req)
+	assert.NoError(t, err)
+	defer resp.Body.Close()
+	var decoded git.EnsureRefsResponse
+	if resp.StatusCode == http.StatusOK {
+		assert.NoError(t, json.NewDecoder(resp.Body).Decode(&decoded))
+		return resp.StatusCode, decoded
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	return resp.StatusCode, decoded
+}
+
+func TestIntegrationAuthRequiredRepoChecksClientCredentials(t *testing.T) {
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{Level: "debug"})
+	tmpDir := t.TempDir()
+	upstreamRoot := filepath.Join(tmpDir, "upstream")
+	clonesDir := filepath.Join(tmpDir, "clones")
+
+	upstream := newAuthzUpstream(t, upstreamRoot, "/private/")
+	_, sha := seedUpstreamRepo(t, upstreamRoot, "private/repo")
+	mirrorUpstream(t, clonesDir, "local", "private/repo", filepath.Join(upstreamRoot, "private/repo"))
+
+	mock := testServerWithLogging(ctx, upstream)
+	defer mock.Close()
+	_, cachewURL := startAuthzCachew(ctx, t, mock.URL, clonesDir, "")
+
+	t.Run("AnonymousClientDenied", func(t *testing.T) {
+		status, body := getRefs(ctx, t, cachewURL, "private/repo", false)
+		assert.Equal(t, http.StatusUnauthorized, status)
+		assert.False(t, strings.Contains(body, sha), "mirrored refs must not leak to an unauthenticated client")
+	})
+
+	t.Run("AnonymousUploadPackDenied", func(t *testing.T) {
+		body := pktLine("want "+sha+"\n") + "0000" + pktLine("done\n")
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+			cachewURL+"/git/local/private/repo/git-upload-pack", strings.NewReader(body))
+		assert.NoError(t, err)
+		req.Header.Set("Content-Type", "application/x-git-upload-pack-request")
+		resp, err := (&http.Client{}).Do(req)
+		assert.NoError(t, err)
+		defer resp.Body.Close()
+		got, err := io.ReadAll(resp.Body)
+		assert.NoError(t, err)
+		assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
+		assert.False(t, strings.Contains(string(got), "PACK"), "no pack data may be served to an unauthenticated client")
+	})
+
+	t.Run("BadCredentialsDenied", func(t *testing.T) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+			cachewURL+"/git/local/private/repo/info/refs?service=git-upload-pack", nil)
+		assert.NoError(t, err)
+		req.SetBasicAuth(authzUser, "wrong-password")
+		resp, err := (&http.Client{}).Do(req)
+		assert.NoError(t, err)
+		defer resp.Body.Close()
+		body, err := io.ReadAll(resp.Body)
+		assert.NoError(t, err)
+		assert.Equal(t, http.StatusForbidden, resp.StatusCode)
+		assert.False(t, strings.Contains(string(body), sha), "mirrored refs must not leak to a rejected client")
+	})
+
+	t.Run("ValidCredentialsServed", func(t *testing.T) {
+		status, body := getRefs(ctx, t, cachewURL, "private/repo", true)
+		assert.Equal(t, http.StatusOK, status)
+		assert.True(t, strings.Contains(body, sha), "authorized client should receive the mirrored refs")
+	})
+
+	t.Run("ValidCredentialsCanClone", func(t *testing.T) {
+		repoURL := strings.Replace(cachewURL, "http://",
+			fmt.Sprintf("http://%s:%s@", authzUser, authzPassword), 1) + "/git/local/private/repo"
+		target := filepath.Join(t.TempDir(), "clone")
+		cmd := exec.Command("git", "clone", repoURL, target)
+		cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git clone: %v\n%s", err, out)
+		}
+		assert.Equal(t, sha, gitRevParse(t, target, "HEAD"))
+	})
+}
+
+func TestIntegrationPublicRepoServedWithoutClientCredentials(t *testing.T) {
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{Level: "debug"})
+	tmpDir := t.TempDir()
+	upstreamRoot := filepath.Join(tmpDir, "upstream")
+	clonesDir := filepath.Join(tmpDir, "clones")
+
+	upstream := newAuthzUpstream(t, upstreamRoot)
+	_, sha := seedUpstreamRepo(t, upstreamRoot, "public/repo")
+	mirrorUpstream(t, clonesDir, "local", "public/repo", filepath.Join(upstreamRoot, "public/repo"))
+
+	mock := testServerWithLogging(ctx, upstream)
+	defer mock.Close()
+	_, cachewURL := startAuthzCachew(ctx, t, mock.URL, clonesDir, "")
+
+	for range 3 {
+		status, body := getRefs(ctx, t, cachewURL, "public/repo", false)
+		assert.Equal(t, http.StatusOK, status)
+		assert.True(t, strings.Contains(body, sha), "public repo should be served from the mirror without credentials")
+	}
+
+	assert.Equal(t, int32(1), upstream.probes.Load(),
+		"the public verdict must be cached, so repeated requests add no upstream probes")
+	assert.Equal(t, int32(0), upstream.denials.Load())
+}
+
+func TestIntegrationAuthRequiredRepoNotProactivelyRefreshed(t *testing.T) {
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{Level: "debug"})
+	tmpDir := t.TempDir()
+	upstreamRoot := filepath.Join(tmpDir, "upstream")
+	clonesDir := filepath.Join(tmpDir, "clones")
+
+	upstream := newAuthzUpstream(t, upstreamRoot, "/private/")
+	privateWork, privateSHA := seedUpstreamRepo(t, upstreamRoot, "private/repo")
+	publicWork, publicSHA := seedUpstreamRepo(t, upstreamRoot, "public/repo")
+	privateMirror := mirrorUpstream(t, clonesDir, "local", "private/repo", filepath.Join(upstreamRoot, "private/repo"))
+	publicMirror := mirrorUpstream(t, clonesDir, "local", "public/repo", filepath.Join(upstreamRoot, "public/repo"))
+
+	// Advance both upstreams so a proactive refresh is observable as a change
+	// in the mirror's main ref.
+	newPrivateSHA := commitToUpstream(t, privateWork, "private update")
+	newPublicSHA := commitToUpstream(t, publicWork, "public update")
+	assert.NotEqual(t, privateSHA, newPrivateSHA)
+	assert.NotEqual(t, publicSHA, newPublicSHA)
+
+	mock := testServerWithLogging(ctx, upstream)
+	defer mock.Close()
+	_, cachewURL := startAuthzCachew(ctx, t, mock.URL, clonesDir, "")
+
+	assert.Equal(t, newPublicSHA, gitRevParse(t, publicMirror, "refs/heads/main"),
+		"public repo should still be refreshed proactively at startup")
+	assert.Equal(t, privateSHA, gitRevParse(t, privateMirror, "refs/heads/main"),
+		"auth-required repo must not be refreshed proactively with cachew's own credentials")
+
+	status, _ := getRefs(ctx, t, cachewURL, "private/repo", false)
+	assert.Equal(t, http.StatusUnauthorized, status)
+	assert.Equal(t, privateSHA, gitRevParse(t, privateMirror, "refs/heads/main"),
+		"a denied request must not trigger a refresh either")
+
+	status, _ = ensureRefs(ctx, t, cachewURL, "private/repo", newPrivateSHA, false)
+	assert.Equal(t, http.StatusUnauthorized, status)
+	assert.Equal(t, privateSHA, gitRevParse(t, privateMirror, "refs/heads/main"),
+		"a denied on-demand refresh must not fetch")
+
+	status, body := ensureRefs(ctx, t, cachewURL, "private/repo", newPrivateSHA, true)
+	assert.Equal(t, http.StatusOK, status)
+	assert.True(t, body.Fetched, "an authorized on-demand request should fetch")
+	assert.Equal(t, newPrivateSHA, body.Refs["refs/heads/main"])
+	assert.Equal(t, newPrivateSHA, gitRevParse(t, privateMirror, "refs/heads/main"),
+		"an authorized on-demand request should refresh the auth-required mirror")
+}
+
+// pushThroughCachew pushes workDir's HEAD to refs/heads/branch through cachew,
+// reporting the combined git output and whether the push succeeded.
+func pushThroughCachew(t *testing.T, workDir, cachewURL, repoPath, branch string, withCredentials bool) (string, bool) {
+	t.Helper()
+	base := cachewURL
+	if withCredentials {
+		base = strings.Replace(cachewURL, "http://", fmt.Sprintf("http://%s:%s@", authzUser, authzPassword), 1)
+	}
+	cmd := exec.Command("git", "-C", workDir, "push", base+"/git/github.com/"+repoPath, "HEAD:refs/heads/"+branch)
+	// A stray credential helper would silently supply the credentials this test
+	// is asserting the absence of.
+	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0", "GIT_CONFIG_NOSYSTEM=1", "HOME="+t.TempDir())
+	out, err := cmd.CombinedOutput()
+	return string(out), err == nil
+}
+
+func upstreamHasRef(t *testing.T, bare, ref string) bool {
+	t.Helper()
+	return exec.Command("git", "-C", bare, "rev-parse", "--verify", ref).Run() == nil
+}
+
+func TestIntegrationPushIsNotAuthenticatedAsCachew(t *testing.T) {
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{Level: "debug"})
+	tmpDir := t.TempDir()
+	upstreamRoot := filepath.Join(tmpDir, "upstream")
+	clonesDir := filepath.Join(tmpDir, "clones")
+
+	upstream := newAuthzUpstream(t, upstreamRoot, "/private/")
+	work, _ := seedUpstreamRepo(t, upstreamRoot, "private/repo")
+	bare := filepath.Join(upstreamRoot, "private/repo")
+
+	assert.NoError(t, os.WriteFile(filepath.Join(work, "pushed.txt"), []byte("pushed"), 0o644))
+	runGit(t, work, "add", ".")
+	runGit(t, work, "commit", "-m", "push through cachew")
+	pushedSHA := gitRevParse(t, work, "HEAD")
+
+	mock := testServerWithLogging(ctx, upstream)
+	defer mock.Close()
+	_, cachewURL := startAuthzCachew(ctx, t, mock.URL, clonesDir, cachewServiceToken)
+
+	t.Run("AnonymousPushRejected", func(t *testing.T) {
+		out, ok := pushThroughCachew(t, work, cachewURL, "private/repo", "anonymous", false)
+		assert.False(t, ok, "a push without client credentials must not be accepted:\n%s", out)
+		assert.Equal(t, int32(0), upstream.asCachew.Load(),
+			"cachew must not substitute its own credentials on a push")
+		assert.True(t, upstream.denials.Load() > 0, "upstream itself should have rejected the push")
+		assert.False(t, upstreamHasRef(t, bare, "refs/heads/anonymous"), "no ref may be created upstream")
+	})
+
+	t.Run("ClientCredentialsPushAccepted", func(t *testing.T) {
+		out, ok := pushThroughCachew(t, work, cachewURL, "private/repo", "authorized", true)
+		assert.True(t, ok, "a push with valid client credentials should succeed:\n%s", out)
+		assert.True(t, upstream.asClient.Load() > 0, "the push should be attributed to the client")
+		assert.Equal(t, int32(0), upstream.asCachew.Load())
+		assert.Equal(t, pushedSHA, gitRevParse(t, bare, "refs/heads/authorized"))
+	})
+}
+
+// lfsBatch posts an LFS upload batch request for repoPath through cachew.
+func lfsBatch(ctx context.Context, t *testing.T, cachewURL, repoPath string, withCredentials bool) (int, string) {
+	t.Helper()
+	payload := `{"operation":"upload","transfers":["basic"],"objects":[{"oid":"abc123","size":1}]}`
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		cachewURL+"/git/github.com/"+repoPath+"/info/lfs/objects/batch", strings.NewReader(payload))
+	assert.NoError(t, err)
+	req.Header.Set("Content-Type", "application/vnd.git-lfs+json")
+	if withCredentials {
+		req.SetBasicAuth(authzUser, authzPassword)
+	}
+	resp, err := (&http.Client{}).Do(req)
+	assert.NoError(t, err)
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	assert.NoError(t, err)
+	return resp.StatusCode, string(body)
+}
+
+func TestIntegrationLFSRequestsCarryClientCredentials(t *testing.T) {
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{Level: "debug"})
+	tmpDir := t.TempDir()
+	upstreamRoot := filepath.Join(tmpDir, "upstream")
+	clonesDir := filepath.Join(tmpDir, "clones")
+
+	upstream := newAuthzUpstream(t, upstreamRoot, "/private/")
+	mock := testServerWithLogging(ctx, upstream)
+	defer mock.Close()
+	_, cachewURL := startAuthzCachew(ctx, t, mock.URL, clonesDir, cachewServiceToken)
+
+	t.Run("AnonymousBatchDenied", func(t *testing.T) {
+		status, _ := lfsBatch(ctx, t, cachewURL, "private/repo", false)
+		assert.Equal(t, http.StatusUnauthorized, status)
+		assert.Equal(t, int32(0), upstream.asCachew.Load(),
+			"cachew must not substitute its own credentials on LFS requests")
+	})
+
+	t.Run("ClientCredentialsBatchServed", func(t *testing.T) {
+		status, body := lfsBatch(ctx, t, cachewURL, "private/repo", true)
+		assert.Equal(t, http.StatusOK, status)
+		assert.Contains(t, body, "transfer")
+		assert.True(t, upstream.asClient.Load() > 0, "the LFS request should be attributed to the client")
+		assert.Equal(t, int32(0), upstream.asCachew.Load())
+	})
+}
+
+// permissiveUpstream answers every ref advertisement with a well-formed but
+// empty upload-pack response, and 200s everything else. It stands in for a host
+// an attacker controls (or any host that simply answers 200), which is all that
+// is needed to make cachew classify a repository as public.
+type permissiveUpstream struct{ hits atomic.Int32 }
+
+func (u *permissiveUpstream) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	u.hits.Add(1)
+	if strings.Contains(r.URL.Path, "/info/refs") {
+		w.Header().Set("Content-Type", "application/x-git-upload-pack-advertisement")
+		_, _ = io.WriteString(w, pktLine("# service=git-upload-pack\n")+"0000"+"0000")
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+func TestIntegrationHostTraversalCannotLaunderAuthorization(t *testing.T) {
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{Level: "debug"})
+	tmpDir := t.TempDir()
+	upstreamRoot := filepath.Join(tmpDir, "upstream")
+	clonesDir := filepath.Join(tmpDir, "clones")
+
+	upstream := newAuthzUpstream(t, upstreamRoot, "/private/")
+	_, sha := seedUpstreamRepo(t, upstreamRoot, "private/repo")
+	mirrorUpstream(t, clonesDir, "local", "private/repo", filepath.Join(upstreamRoot, "private/repo"))
+
+	mock := testServerWithLogging(ctx, upstream)
+	defer mock.Close()
+	attacker := &permissiveUpstream{}
+	attackerServer := testServerWithLogging(ctx, attacker)
+	defer attackerServer.Close()
+
+	_, cachewURL := startAuthzCachewRouted(ctx, t, mock.URL, clonesDir, "",
+		map[string]string{"attacker.invalid": attackerServer.URL})
+
+	// Sanity check: the honest path to the same mirror is refused.
+	status, body := getRefs(ctx, t, cachewURL, "private/repo", false)
+	assert.Equal(t, http.StatusUnauthorized, status)
+	assert.False(t, strings.Contains(body, sha))
+
+	// Each host below resolves, via filepath.Join, to the mirror of
+	// local/private/repo while naming attacker.invalid as the authority to
+	// probe. Every suffix is a mirror-serving path, so none may be answered.
+	hosts := []string{
+		"attacker.invalid%2f%2e%2e",
+		"attacker.invalid%2f..",
+		"attacker.invalid%2F%2E%2E",
+	}
+	suffixes := []string{
+		"/info/refs?service=git-upload-pack",
+		"/snapshot.tar.zst",
+		"/snapshot.bundle",
+		"/lfs-snapshot.tar.zst",
+	}
+	for _, host := range hosts {
+		for _, suffix := range suffixes {
+			t.Run(strings.NewReplacer("%", "", "/", "", ".", "", "?", "", "=", "").Replace(host+suffix), func(t *testing.T) {
+				target := cachewURL + "/git/" + host + "/local/private/repo" + suffix
+				req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+				assert.NoError(t, err)
+				resp, err := (&http.Client{}).Do(req)
+				assert.NoError(t, err)
+				defer resp.Body.Close()
+				got, err := io.ReadAll(resp.Body)
+				assert.NoError(t, err)
+				assert.False(t, strings.Contains(string(got), sha),
+					"a request authorized against another host must not serve this mirror (status %d)", resp.StatusCode)
+				assert.Equal(t, http.StatusBadRequest, resp.StatusCode,
+					"host traversal must be refused outright rather than resolved to a mirror")
+			})
+		}
+
+		// ensure-refs reads the mirror directly rather than through
+		// git http-backend, whose own path-alias check incidentally blocks the
+		// smart-HTTP variants above.
+		t.Run("EnsureRefs"+strings.NewReplacer("%", "", "/", "", ".", "").Replace(host), func(t *testing.T) {
+			payload, err := json.Marshal(git.EnsureRefsRequest{Refs: map[string]string{"refs/heads/main": ""}})
+			assert.NoError(t, err)
+			req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+				cachewURL+"/git/"+host+"/local/private/repo"+git.EnsureRefsPath, strings.NewReader(string(payload)))
+			assert.NoError(t, err)
+			req.Header.Set("Content-Type", "application/json")
+			resp, err := (&http.Client{}).Do(req)
+			assert.NoError(t, err)
+			defer resp.Body.Close()
+			got, err := io.ReadAll(resp.Body)
+			assert.NoError(t, err)
+			assert.False(t, strings.Contains(string(got), sha),
+				"a request authorized against another host must not resolve refs from this mirror (status %d)", resp.StatusCode)
+			assert.Equal(t, http.StatusBadRequest, resp.StatusCode,
+				"host traversal must be refused outright rather than resolved to a mirror")
+		})
+	}
+}
+
+func TestIntegrationReceivePackQueryCannotBypassGating(t *testing.T) {
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{Level: "debug"})
+	tmpDir := t.TempDir()
+	upstreamRoot := filepath.Join(tmpDir, "upstream")
+	clonesDir := filepath.Join(tmpDir, "clones")
+
+	upstream := newAuthzUpstream(t, upstreamRoot, "/private/")
+	_, sha := seedUpstreamRepo(t, upstreamRoot, "private/repo")
+	mirrorUpstream(t, clonesDir, "local", "private/repo", filepath.Join(upstreamRoot, "private/repo"))
+
+	mock := testServerWithLogging(ctx, upstream)
+	defer mock.Close()
+	_, cachewURL := startAuthzCachew(ctx, t, mock.URL, clonesDir, "")
+
+	t.Run("EnsureRefs", func(t *testing.T) {
+		payload, err := json.Marshal(git.EnsureRefsRequest{Refs: map[string]string{"refs/heads/main": sha}})
+		assert.NoError(t, err)
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+			cachewURL+"/git/local/private/repo"+git.EnsureRefsPath+"?service=git-receive-pack",
+			strings.NewReader(string(payload)))
+		assert.NoError(t, err)
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := (&http.Client{}).Do(req)
+		assert.NoError(t, err)
+		defer resp.Body.Close()
+		body, err := io.ReadAll(resp.Body)
+		assert.NoError(t, err)
+		assert.NotEqual(t, http.StatusOK, resp.StatusCode,
+			"?service=git-receive-pack must not turn off authorization for a mirror-serving path")
+		assert.False(t, strings.Contains(string(body), sha),
+			"mirrored refs must not leak to an unauthenticated client")
+	})
+
+	for _, suffix := range []string{"/snapshot.tar.zst", "/snapshot.bundle", "/lfs-snapshot.tar.zst"} {
+		t.Run(strings.TrimPrefix(suffix, "/"), func(t *testing.T) {
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+				cachewURL+"/git/local/private/repo"+suffix+"?service=git-receive-pack", nil)
+			assert.NoError(t, err)
+			resp, err := (&http.Client{}).Do(req)
+			assert.NoError(t, err)
+			defer resp.Body.Close()
+			_, err = io.Copy(io.Discard, resp.Body)
+			assert.NoError(t, err)
+			assert.Equal(t, http.StatusUnauthorized, resp.StatusCode,
+				"?service=git-receive-pack must not turn off authorization for a mirror-serving path")
+		})
+	}
 }

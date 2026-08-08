@@ -12,7 +12,7 @@ import (
 
 	"github.com/alecthomas/errors"
 
-	"github.com/block/cachew/internal/logging"
+	"github.com/tenstorrent/internal-cachew/internal/logging"
 )
 
 // Backend is the pluggable storage layer for the metadata store. Implementations

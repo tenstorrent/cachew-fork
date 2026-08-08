@@ -11,10 +11,10 @@ import (
 
 	"github.com/alecthomas/errors"
 
-	"github.com/block/cachew/internal/cache"
-	"github.com/block/cachew/internal/jobscheduler"
-	"github.com/block/cachew/internal/logging"
-	"github.com/block/cachew/internal/strategy/handler"
+	"github.com/tenstorrent/internal-cachew/internal/cache"
+	"github.com/tenstorrent/internal-cachew/internal/jobscheduler"
+	"github.com/tenstorrent/internal-cachew/internal/logging"
+	"github.com/tenstorrent/internal-cachew/internal/strategy/handler"
 )
 
 func RegisterHermit(r *Registry) {

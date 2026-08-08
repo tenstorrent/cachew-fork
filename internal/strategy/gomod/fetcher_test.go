@@ -3,7 +3,7 @@ package gomod_test
 import (
 	"testing"
 
-	"github.com/block/cachew/internal/strategy/gomod"
+	"github.com/tenstorrent/internal-cachew/internal/strategy/gomod"
 )
 
 func TestCompositeFetcher_isPrivate(t *testing.T) {

@@ -13,9 +13,9 @@ import (
 	"github.com/alecthomas/errors"
 	"github.com/alecthomas/kong"
 
-	"github.com/block/cachew/client"
-	"github.com/block/cachew/internal/logging"
-	"github.com/block/cachew/internal/tracing"
+	"github.com/tenstorrent/internal-cachew/client"
+	"github.com/tenstorrent/internal-cachew/internal/logging"
+	"github.com/tenstorrent/internal-cachew/internal/tracing"
 )
 
 // Populated via -ldflags at build time.

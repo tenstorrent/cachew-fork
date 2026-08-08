@@ -16,12 +16,12 @@ import (
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 
-	"github.com/block/cachew/client"
-	"github.com/block/cachew/internal/snapshot"
+	"github.com/tenstorrent/internal-cachew/client"
+	"github.com/tenstorrent/internal-cachew/internal/snapshot"
 )
 
 //nolint:gochecknoglobals // OTel tracer instances are package-scoped by convention
-var tracer = otel.Tracer("github.com/block/cachew/cmd/cachew")
+var tracer = otel.Tracer("github.com/tenstorrent/internal-cachew/cmd/cachew")
 
 // inSpan runs fn inside a named child span and records the error returned by
 // fn on the span before propagating it.

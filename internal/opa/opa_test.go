@@ -10,8 +10,8 @@ import (
 
 	"github.com/alecthomas/assert/v2"
 
-	"github.com/block/cachew/internal/logging"
-	"github.com/block/cachew/internal/opa"
+	"github.com/tenstorrent/internal-cachew/internal/logging"
+	"github.com/tenstorrent/internal-cachew/internal/opa"
 )
 
 func newRequest(method, target string) *http.Request {
@@ -33,6 +33,8 @@ func TestMiddlewareDefaultPolicy(t *testing.T) {
 		{"RemotePostStrategy", http.MethodPost, "/git/github.com/org/repo", "10.0.0.1:9999", http.StatusOK},
 		{"RemoteLiveness", http.MethodGet, "/_liveness", "10.0.0.1:9999", http.StatusOK},
 		{"RemoteReadiness", http.MethodGet, "/_readiness", "10.0.0.1:9999", http.StatusOK},
+		{"LocalhostGetMetrics", http.MethodGet, "/metrics", "127.0.0.1:12345", http.StatusOK},
+		{"RemoteGetMetrics", http.MethodGet, "/metrics", "10.0.0.1:9999", http.StatusForbidden},
 		{"RemoteGetAdmin", http.MethodGet, "/admin/pprof/", "10.0.0.1:9999", http.StatusForbidden},
 		{"RemotePostAPI", http.MethodPost, "/api/v1/object/ns/key", "10.0.0.1:9999", http.StatusForbidden},
 		{"RemoteDeleteAPI", http.MethodDelete, "/api/v1/object/ns/key", "10.0.0.1:9999", http.StatusForbidden},
@@ -325,9 +327,10 @@ import data.cachew.authz
 
 test_localhost_allowed if authz.allow with input as {"remote_addr": "127.0.0.1:1", "path": ["api"]}
 test_remote_admin_denied if not authz.allow with input as {"remote_addr": "10.0.0.1:1", "path": ["admin"]}
+test_remote_metrics_denied if not authz.allow with input as {"remote_addr": "10.0.0.1:1", "path": ["metrics"]}
 `,
 			},
-			ExpectPass: 2,
+			ExpectPass: 3,
 		},
 		{
 			Name: "TestsWithData",

@@ -5,7 +5,7 @@ import (
 
 	"github.com/alecthomas/assert/v2"
 
-	"github.com/block/cachew/internal/featureflags"
+	"github.com/tenstorrent/internal-cachew/internal/featureflags"
 )
 
 func TestBoolFlagDefault(t *testing.T) {

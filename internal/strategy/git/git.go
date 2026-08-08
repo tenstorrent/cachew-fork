@@ -24,23 +24,25 @@ import (
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 
-	"github.com/block/cachew/internal/cache"
-	"github.com/block/cachew/internal/gitclone"
-	"github.com/block/cachew/internal/githubapp"
-	cachewhttputil "github.com/block/cachew/internal/httputil"
-	"github.com/block/cachew/internal/jobscheduler"
-	"github.com/block/cachew/internal/logging"
-	"github.com/block/cachew/internal/metadatadb"
-	"github.com/block/cachew/internal/snapshot"
-	"github.com/block/cachew/internal/strategy"
+	"github.com/tenstorrent/internal-cachew/internal/cache"
+	"github.com/tenstorrent/internal-cachew/internal/gitclone"
+	"github.com/tenstorrent/internal-cachew/internal/githubapp"
+	"github.com/tenstorrent/internal-cachew/internal/gitobject"
+	cachewhttputil "github.com/tenstorrent/internal-cachew/internal/httputil"
+	"github.com/tenstorrent/internal-cachew/internal/jobscheduler"
+	"github.com/tenstorrent/internal-cachew/internal/logging"
+	"github.com/tenstorrent/internal-cachew/internal/metadatadb"
+	"github.com/tenstorrent/internal-cachew/internal/repoauthz"
+	"github.com/tenstorrent/internal-cachew/internal/snapshot"
+	"github.com/tenstorrent/internal-cachew/internal/strategy"
 )
 
 //nolint:gochecknoglobals // OTel tracer instances are package-scoped by convention
-var tracer = otel.Tracer("github.com/block/cachew/internal/strategy/git")
+var tracer = otel.Tracer("github.com/tenstorrent/internal-cachew/internal/strategy/git")
 
-func Register(r *strategy.Registry, scheduler jobscheduler.Provider, cloneManagerProvider gitclone.ManagerProvider, tokenManagerProvider githubapp.TokenManagerProvider) {
+func Register(r *strategy.Registry, scheduler jobscheduler.Provider, cloneManagerProvider gitclone.ManagerProvider, tokenManagerProvider githubapp.TokenManagerProvider, authz *repoauthz.Authorizer) {
 	strategy.Register(r, "git", "Caches Git repositories, including tarball snapshots.", func(ctx context.Context, config Config, cache cache.Cache, mux strategy.Mux) (*Strategy, error) {
-		return New(ctx, config, scheduler, cache, mux, cloneManagerProvider, tokenManagerProvider)
+		return New(ctx, config, scheduler, cache, mux, cloneManagerProvider, tokenManagerProvider, authz)
 	})
 }
 
@@ -56,30 +58,101 @@ type Config struct {
 
 	IncrementalPullthrough  bool          `hcl:"incremental-pullthrough,optional" help:"Serve partially-cached upload-pack requests by fetching only missing objects into the local mirror instead of proxying the full response from upstream. When enabled, upload-pack bodies are capped at 8 MiB (2× the parse limit); larger bodies receive 413." default:"true"`
 	IncrementalFetchTimeout time.Duration `hcl:"incremental-fetch-timeout,optional" help:"Upper bound on the synchronous request-path fetch performed by incremental pull-through. The coalescing and verified attempts share this budget, and the coalescing attempt is capped at half so a verified retry still has room. On timeout the request falls back to upstream. Each underlying git fetch also honors fetch-timeout, and the preceding ref-staleness check is bounded separately by ls-remote-timeout." default:"2m"`
+
+	DisableUpstreamAuthz bool `hcl:"disable-upstream-authz,optional" help:"Disable all upstream authorization probing: per-request client authorization and the skip of proactive background refresh for auth-required repos. Unsafe: any client that can reach cachew can then read any mirrored private repo." default:"false"`
+}
+
+// clonedDefaultTransport returns a private copy of http.DefaultTransport's
+// configuration (proxy, dialer and TLS settings included) so the strategy never
+// shares connection pools or TLS state with the process-wide default.
+func clonedDefaultTransport() http.RoundTripper {
+	if t, ok := http.DefaultTransport.(*http.Transport); ok {
+		return t.Clone()
+	}
+	return http.DefaultTransport
+}
+
+// Option customises a Strategy during New, before it issues any upstream
+// request.
+type Option func(*Strategy)
+
+// WithHTTPTransport sets the transport backing the strategy's own HTTP client.
+// Unlike SetHTTPTransport it takes effect before New starts the background
+// warm-up, so a test can observe the warm-up's upstream requests.
+func WithHTTPTransport(t http.RoundTripper) Option {
+	return func(s *Strategy) { s.transport.set(t) }
+}
+
+// swappableTransport delegates to a RoundTripper that can be replaced while
+// requests are in flight. The strategy's HTTP client and reverse proxy both
+// hold one, so SetHTTPTransport can redirect upstream traffic without racing
+// the warm-up goroutine New starts.
+type swappableTransport struct {
+	delegate atomic.Pointer[http.RoundTripper]
+}
+
+func newSwappableTransport(rt http.RoundTripper) *swappableTransport {
+	s := &swappableTransport{}
+	s.set(rt)
+	return s
+}
+
+func (s *swappableTransport) set(rt http.RoundTripper) { s.delegate.Store(&rt) }
+
+func (s *swappableTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := (*s.delegate.Load()).RoundTrip(req)
+	return resp, errors.WithStack(err)
 }
 
 type Strategy struct {
 	config              Config
 	cache               cache.Cache
 	cloneManager        *gitclone.Manager
-	httpClient          *http.Client
+	transport           *swappableTransport
 	proxy               *httputil.ReverseProxy
 	ctx                 context.Context
 	scheduler           jobscheduler.Scheduler
 	spoolsMu            sync.Mutex
 	spools              map[string]*RepoSpools
-	tokenManager        *githubapp.TokenManager
-	snapshotMu          sync.Map // keyed by upstream URL, values are *sync.Mutex
-	snapshotSpools      sync.Map // keyed by upstream URL, values are *snapshotSpoolEntry
-	coldSnapshotMu      sync.Map // keyed by upstream URL, values are *coldSnapshotEntry
-	deferredRestoreOnce sync.Map // keyed by upstream URL, ensures at most one deferred restore per repo
-	forcedFetches       sync.Map // keyed by upstream URL, ensures at most one cooldown-bypassing fetch is queued per repo
+	serviceToken        func(ctx context.Context, org string) (string, error) // nil when no GitHub App is configured
+	snapshotMu          sync.Map                                              // keyed by upstream URL, values are *sync.Mutex
+	snapshotSpools      sync.Map                                              // keyed by upstream URL, values are *snapshotSpoolEntry
+	coldSnapshotMu      sync.Map                                              // keyed by upstream URL, values are *coldSnapshotEntry
+	deferredRestoreOnce sync.Map                                              // keyed by upstream URL, ensures at most one deferred restore per repo
+	forcedFetches       sync.Map                                              // keyed by upstream URL, ensures at most one cooldown-bypassing fetch is queued per repo
 	metrics             *gitMetrics
 	repoCounts          *RepoCounts
 	snapshotCoord       *SnapshotCoordinator
 	metadataWired       chan struct{} // closed by SetMetadataStore; gates warm-up
 	wiredOnce           sync.Once
 	ready               atomic.Bool
+	authz               *repoauthz.Authorizer
+}
+
+// validateAndDefaultConfig applies defaults and validates prerequisites (git,
+// and tar/pzstd when snapshots are enabled) that don't depend on any of New's
+// other dependencies.
+func validateAndDefaultConfig(config Config) (Config, error) {
+	if _, err := exec.LookPath("git"); err != nil {
+		return config, errors.New("git is required but not found in PATH")
+	}
+	if config.BundleCacheTTL == 0 {
+		config.BundleCacheTTL = 2 * time.Hour
+	}
+	if config.IncrementalFetchTimeout == 0 {
+		config.IncrementalFetchTimeout = 2 * time.Minute
+	}
+	if config.IncrementalFetchTimeout < 0 {
+		return config, errors.Errorf("incremental-fetch-timeout must be positive, got %v", config.IncrementalFetchTimeout)
+	}
+	if config.SnapshotInterval > 0 {
+		for _, bin := range []string{"tar", "pzstd"} {
+			if _, err := exec.LookPath(bin); err != nil {
+				return config, errors.Errorf("%s is required for snapshots (snapshot-interval > 0) but not found in PATH", bin)
+			}
+		}
+	}
+	return config, nil
 }
 
 func New(
@@ -90,25 +163,12 @@ func New(
 	mux strategy.Mux,
 	cloneManagerProvider gitclone.ManagerProvider,
 	tokenManagerProvider githubapp.TokenManagerProvider,
+	authz *repoauthz.Authorizer,
+	opts ...Option,
 ) (*Strategy, error) {
-	if _, err := exec.LookPath("git"); err != nil {
-		return nil, errors.New("git is required but not found in PATH")
-	}
-	if config.BundleCacheTTL == 0 {
-		config.BundleCacheTTL = 2 * time.Hour
-	}
-	if config.IncrementalFetchTimeout == 0 {
-		config.IncrementalFetchTimeout = 2 * time.Minute
-	}
-	if config.IncrementalFetchTimeout < 0 {
-		return nil, errors.Errorf("incremental-fetch-timeout must be positive, got %v", config.IncrementalFetchTimeout)
-	}
-	if config.SnapshotInterval > 0 {
-		for _, bin := range []string{"tar", "pzstd"} {
-			if _, err := exec.LookPath(bin); err != nil {
-				return nil, errors.Errorf("%s is required for snapshots (snapshot-interval > 0) but not found in PATH", bin)
-			}
-		}
+	config, err := validateAndDefaultConfig(config)
+	if err != nil {
+		return nil, err
 	}
 
 	logger := logging.FromContext(ctx)
@@ -145,17 +205,35 @@ func New(
 
 	m := newGitMetrics()
 
+	// The strategy owns its transport rather than sharing http.DefaultClient's,
+	// so swapping it cannot leak onto every other user of the process-wide
+	// default. When the strategy also owns its Authorizer, the probes go through
+	// the same transport, so redirecting it redirects them too. cachewd instead
+	// passes one Authorizer to every strategy that authorizes repository reads,
+	// so a repository reached through the git routes, the object API and the
+	// module proxy is probed for visibility once, not once per entry point.
+	transport := newSwappableTransport(clonedDefaultTransport())
+	if authz == nil {
+		authz = repoauthz.NewAuthorizer(&http.Client{Transport: transport}, 0)
+	}
+
 	s := &Strategy{
 		config:        config,
 		cache:         cache,
 		cloneManager:  cloneManager,
-		httpClient:    http.DefaultClient,
+		transport:     transport,
+		authz:         authz,
 		ctx:           ctx,
 		scheduler:     scheduler.WithQueuePrefix("git"),
 		spools:        make(map[string]*RepoSpools),
-		tokenManager:  tokenManager,
 		metrics:       m,
 		metadataWired: make(chan struct{}),
+	}
+	if tokenManager != nil {
+		s.serviceToken = tokenManager.GetTokenForOrg
+	}
+	for _, opt := range opts {
+		opt(s)
 	}
 	// Run startup fetches in the background so the HTTP listener (and
 	// /_liveness) come up immediately. /_readiness gates on Ready() so the
@@ -192,28 +270,8 @@ func New(
 	}()
 
 	s.proxy = &httputil.ReverseProxy{
-		Director: func(req *http.Request) {
-			req.URL.Scheme = "https"
-			req.URL.Host = req.PathValue("host")
-			req.URL.Path = "/" + req.PathValue("path")
-			req.Host = req.URL.Host
-
-			// Inject GitHub App authentication for github.com requests
-			if s.tokenManager != nil && req.URL.Host == "github.com" {
-				// Extract org from path (e.g., /squareup/blox.git/...)
-				parts := strings.Split(strings.TrimPrefix(req.URL.Path, "/"), "/")
-				if len(parts) >= 1 && parts[0] != "" {
-					org := parts[0]
-					token, err := s.tokenManager.GetTokenForOrg(req.Context(), org)
-					if err == nil && token != "" {
-						// Inject token as Basic auth with "x-access-token" username
-						req.SetBasicAuth("x-access-token", token)
-						logger.DebugContext(req.Context(), "Injecting GitHub App auth into upstream request", "org", org)
-					}
-				}
-			}
-		},
-		Transport: s.httpClient.Transport,
+		Director:  s.directUpstream,
+		Transport: transport,
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			logging.FromContext(r.Context()).ErrorContext(r.Context(), "Upstream request failed", "error", err)
 			w.WriteHeader(http.StatusBadGateway)
@@ -272,6 +330,12 @@ func (s *Strategy) warmExistingRepos(ctx context.Context) error {
 		return errors.Wrap(err, "discover existing clones")
 	}
 	for _, repo := range existing {
+		if !s.backgroundFetchAllowed(ctx, repo) {
+			logger.InfoContext(ctx, "Skipping startup fetch for existing repo", "upstream", repo.UpstreamURL())
+			s.scheduleMaintenanceJobs(repo)
+			continue
+		}
+
 		logger.InfoContext(ctx, "Running startup fetch for existing repo", "upstream", repo.UpstreamURL())
 
 		preRefs, err := repo.GetLocalRefs(ctx)
@@ -295,21 +359,27 @@ func (s *Strategy) warmExistingRepos(ctx context.Context) error {
 		maps.DeleteFunc(postRefs, func(k, v string) bool { return preRefs[k] == v })
 		logger.InfoContext(ctx, "Post-fetch changed refs for existing repo", "upstream", repo.UpstreamURL(), "refs", postRefs)
 
-		if s.config.SnapshotInterval > 0 {
-			s.scheduleSnapshotJobs(repo)
-		}
-		if s.config.RepackInterval > 0 {
-			s.scheduleRepackJobs(repo)
-		}
+		s.scheduleMaintenanceJobs(repo)
 	}
 	return nil
 }
 
-// SetHTTPTransport overrides the HTTP transport used for upstream requests.
-// This is intended for testing.
+func (s *Strategy) scheduleMaintenanceJobs(repo *gitclone.Repository) {
+	if s.config.SnapshotInterval > 0 {
+		s.scheduleSnapshotJobs(repo)
+	}
+	if s.config.RepackInterval > 0 {
+		s.scheduleRepackJobs(repo)
+	}
+}
+
+// SetHTTPTransport overrides the HTTP transport used for the strategy's own
+// upstream requests — the reverse proxy and, when the strategy owns its
+// Authorizer, the visibility probes. It touches only this Strategy's client, so
+// it cannot disturb other strategies or http.DefaultClient. Intended for
+// testing; safe to call while the strategy is serving.
 func (s *Strategy) SetHTTPTransport(t http.RoundTripper) {
-	s.httpClient.Transport = t
-	s.proxy.Transport = t
+	s.transport.set(t)
 }
 
 func (s *Strategy) String() string { return "git" }
@@ -322,6 +392,18 @@ func (s *Strategy) handleRequest(w http.ResponseWriter, r *http.Request) {
 	pathValue := r.PathValue("path")
 
 	logger.DebugContext(ctx, "Git request", "method", r.Method, "host", host, "path", pathValue)
+
+	// Both of the checks below run before any dispatch, so no serve path can be
+	// added later that silently bypasses either one.
+	if err := validateRepoTarget(host, pathValue); err != nil {
+		logger.WarnContext(ctx, "Rejecting git request target", "error", err, "host", host, "path", pathValue)
+		http.Error(w, "invalid repository path", http.StatusBadRequest)
+		return
+	}
+
+	if !s.authorizeServe(w, r, host, pathValue) {
+		return
+	}
 
 	if strings.HasSuffix(pathValue, EnsureRefsPath) {
 		s.handleEnsureRefs(w, r, host, pathValue)
@@ -832,7 +914,7 @@ func (s *Strategy) tryRestoreSnapshot(ctx context.Context, repo *gitclone.Reposi
 		span.End()
 	}()
 
-	cacheKey := mirrorSnapshotCacheKey(repo.UpstreamURL())
+	cacheKey := gitobject.MirrorSnapshot(repo.UpstreamURL()).Key
 
 	parentDir := filepath.Dir(repo.Path())
 	if err := os.MkdirAll(parentDir, 0o750); err != nil {
@@ -875,6 +957,13 @@ func (s *Strategy) submitFetch(repo *gitclone.Repository) {
 	// Use a separate queue from snapshot/repack so fetches are not serialized
 	// behind long-running jobs on the same upstream URL queue.
 	s.scheduler.Submit(repo.UpstreamURL()+"/fetch", "fetch", func(ctx context.Context) error {
+		// Backoff applies even though the request that triggered this was
+		// authorized: while upstream is failing, clients are already being
+		// forwarded upstream for correctness, so retrying per request only
+		// adds load.
+		if !s.fetchBackoffElapsed(ctx, repo) {
+			return nil
+		}
 		return s.doFetch(ctx, repo)
 	})
 }

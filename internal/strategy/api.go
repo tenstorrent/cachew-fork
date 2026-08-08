@@ -9,8 +9,8 @@ import (
 	"github.com/alecthomas/errors"
 	"github.com/alecthomas/hcl/v2"
 
-	"github.com/block/cachew/internal/cache"
-	"github.com/block/cachew/internal/metadatadb"
+	"github.com/tenstorrent/internal-cachew/internal/cache"
+	"github.com/tenstorrent/internal-cachew/internal/metadatadb"
 )
 
 // ErrNotFound is returned when a strategy is not found.

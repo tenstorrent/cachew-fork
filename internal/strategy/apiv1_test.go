@@ -12,9 +12,9 @@ import (
 
 	"github.com/alecthomas/assert/v2"
 
-	"github.com/block/cachew/internal/cache"
-	"github.com/block/cachew/internal/logging"
-	"github.com/block/cachew/internal/strategy"
+	"github.com/tenstorrent/internal-cachew/internal/cache"
+	"github.com/tenstorrent/internal-cachew/internal/logging"
+	"github.com/tenstorrent/internal-cachew/internal/strategy"
 )
 
 func TestPutObjectAbortsOnReadError(t *testing.T) {
@@ -24,7 +24,7 @@ func TestPutObjectAbortsOnReadError(t *testing.T) {
 	defer memCache.Close()
 
 	mux := http.NewServeMux()
-	_, err = strategy.NewAPIV1(ctx, struct{}{}, memCache, mux)
+	_, err = strategy.NewAPIV1(ctx, strategy.APIV1Config{}, memCache, mux, nil, nil)
 	assert.NoError(t, err)
 
 	key := cache.NewKey("abort-test")
@@ -52,7 +52,7 @@ func testAPISetup(t *testing.T) (http.Handler, context.Context) {
 	t.Cleanup(func() { memCache.Close() })
 
 	mux := http.NewServeMux()
-	_, err = strategy.NewAPIV1(ctx, struct{}{}, memCache, mux)
+	_, err = strategy.NewAPIV1(ctx, strategy.APIV1Config{}, memCache, mux, nil, nil)
 	assert.NoError(t, err)
 	return mux, ctx
 }
@@ -340,4 +340,56 @@ func (r *failingReader) Read(p []byte) (int, error) {
 		return n, io.ErrUnexpectedEOF
 	}
 	return n, nil
+}
+
+type stubConfig struct{}
+
+type stubStrategy struct{}
+
+func (stubStrategy) String() string { return "stub" }
+
+func TestObjectAuthorizationOfStrategyNamespaces(t *testing.T) {
+	registry := strategy.NewRegistry()
+	strategy.RegisterHost(registry)
+	strategy.Register(registry, "stub", "A strategy with no object authorization rule.",
+		func(context.Context, stubConfig, cache.Cache, strategy.Mux) (stubStrategy, error) {
+			return stubStrategy{}, nil
+		})
+
+	tests := []struct {
+		name       string
+		namespace  string
+		wantStatus int
+	}{
+		{name: "NamespaceNoStrategyOwns", namespace: "team-ci", wantStatus: http.StatusOK},
+		{name: "StrategyNamespaceServedUnchecked", namespace: "host", wantStatus: http.StatusOK},
+		{name: "StrategyNamespaceWithoutRule", namespace: "stub", wantStatus: http.StatusNotFound},
+		{name: "StrategyNamespaceWithoutRuleDifferentlyCased", namespace: "STUB", wantStatus: http.StatusNotFound},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, ctx, _ := logging.Configure(context.Background(), logging.Config{Level: "error"})
+			memCache, err := cache.NewMemory(ctx, cache.MemoryConfig{MaxTTL: time.Hour})
+			assert.NoError(t, err)
+			t.Cleanup(func() { memCache.Close() })
+
+			mux := http.NewServeMux()
+			_, err = strategy.NewAPIV1(ctx, strategy.APIV1Config{}, memCache, mux, nil, registry)
+			assert.NoError(t, err)
+
+			key := cache.NewKey("object")
+			namespace, err := cache.ParseNamespace(test.namespace)
+			assert.NoError(t, err)
+			w, err := memCache.Namespace(namespace).Create(ctx, key, http.Header{}, time.Hour)
+			assert.NoError(t, err)
+			_, err = w.Write([]byte("data"))
+			assert.NoError(t, err)
+			assert.NoError(t, w.Close())
+
+			req := httptest.NewRequest(http.MethodGet, "/api/v1/object/"+test.namespace+"/"+key.String(), nil)
+			rec := httptest.NewRecorder()
+			mux.ServeHTTP(rec, req.WithContext(ctx))
+			assert.Equal(t, test.wantStatus, rec.Code)
+		})
+	}
 }

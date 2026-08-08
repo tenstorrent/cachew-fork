@@ -6,7 +6,7 @@ import (
 
 	"github.com/alecthomas/errors"
 
-	"github.com/block/cachew/client"
+	"github.com/tenstorrent/internal-cachew/client"
 )
 
 // ParallelGet downloads an object from any Range-capable Cache into dst,

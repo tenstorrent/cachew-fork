@@ -12,7 +12,7 @@ import (
 
 	"github.com/alecthomas/assert/v2"
 
-	"github.com/block/cachew/internal/strategy/git"
+	"github.com/tenstorrent/internal-cachew/internal/strategy/git"
 )
 
 func TestResponseSpoolWriteAndRead(t *testing.T) {

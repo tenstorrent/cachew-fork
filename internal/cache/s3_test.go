@@ -9,11 +9,11 @@ import (
 	"github.com/alecthomas/assert/v2"
 	"github.com/alecthomas/errors"
 
-	"github.com/block/cachew/internal/cache"
-	"github.com/block/cachew/internal/cache/cachetest"
-	"github.com/block/cachew/internal/logging"
-	"github.com/block/cachew/internal/s3client"
-	"github.com/block/cachew/internal/s3client/s3clienttest"
+	"github.com/tenstorrent/internal-cachew/internal/cache"
+	"github.com/tenstorrent/internal-cachew/internal/cache/cachetest"
+	"github.com/tenstorrent/internal-cachew/internal/logging"
+	"github.com/tenstorrent/internal-cachew/internal/s3client"
+	"github.com/tenstorrent/internal-cachew/internal/s3client/s3clienttest"
 )
 
 func newS3Cache(t *testing.T, bucket string) cache.Cache {

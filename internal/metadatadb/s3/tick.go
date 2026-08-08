@@ -15,8 +15,8 @@ import (
 	"github.com/minio/minio-go/v7"
 	"golang.org/x/sync/errgroup"
 
-	"github.com/block/cachew/internal/logging"
-	"github.com/block/cachew/internal/metadatadb"
+	"github.com/tenstorrent/internal-cachew/internal/logging"
+	"github.com/tenstorrent/internal-cachew/internal/metadatadb"
 )
 
 // listing is one tick's full-prefix LIST. newest is the aging reference

@@ -8,7 +8,7 @@ import (
 
 	"github.com/alecthomas/errors"
 
-	"github.com/block/cachew/internal/httputil"
+	"github.com/tenstorrent/internal-cachew/internal/httputil"
 )
 
 // Fetch retrieves a response from cache or fetches from the request URL and caches it.

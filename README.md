@@ -196,6 +196,18 @@ opa {
 }
 ```
 
+### Per-repository client authorization
+
+OPA above is network/path-level: it never looks at *which repository* a
+request is for, or *whose* credentials it carries. A separate mechanism
+re-validates each client against the specific repository they're asking
+for, using only the credentials the client itself supplied — so a client
+with no access to a private repo can't read it just because cachew's own
+mirror is warm. Covers the git strategy's routes, the object API, and the
+Go module proxy. See [`docs/git-authz.md`](docs/git-authz.md) for the full
+design. Escape hatches: `disable-upstream-authz` (`strategy git`),
+`disable-git-object-authz` (`strategy apiv1`).
+
 ## GitHub App Authentication
 
 For private Git repositories and GitHub release assets, configure a GitHub App:

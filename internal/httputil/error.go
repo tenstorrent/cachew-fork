@@ -7,7 +7,7 @@ import (
 
 	"github.com/alecthomas/errors"
 
-	"github.com/block/cachew/internal/logging"
+	"github.com/tenstorrent/internal-cachew/internal/logging"
 )
 
 // ErrorResponse creates an error response with the given code and format, and also logs a message.

@@ -20,7 +20,8 @@ import (
 	"golang.org/x/mod/semver"
 	modzip "golang.org/x/mod/zip"
 
-	"github.com/block/cachew/internal/gitclone"
+	"github.com/tenstorrent/internal-cachew/internal/gitclone"
+	"github.com/tenstorrent/internal-cachew/internal/gomodobject"
 )
 
 type privateFetcher struct {
@@ -44,7 +45,7 @@ func (p *privateFetcher) Query(ctx context.Context, path, query string) (version
 	logger := p.logger.With("module", path, "query", query)
 	logger.DebugContext(ctx, "Private fetcher: Query")
 
-	gitURL := p.modulePathToGitURL(path)
+	gitURL := gomodobject.GitURL(path)
 
 	repo, err := p.cloneManager.GetOrCreate(ctx, gitURL)
 	if err != nil {
@@ -67,7 +68,7 @@ func (p *privateFetcher) List(ctx context.Context, path string) (versions []stri
 	logger := p.logger.With("module", path)
 	logger.DebugContext(ctx, "Private fetcher: List")
 
-	gitURL := p.modulePathToGitURL(path)
+	gitURL := gomodobject.GitURL(path)
 	repo, err := p.cloneManager.GetOrCreate(ctx, gitURL)
 	if err != nil {
 		return nil, errors.Wrapf(err, "get or create clone for %s", path)
@@ -89,7 +90,7 @@ func (p *privateFetcher) Download(ctx context.Context, path, version string) (in
 	logger := p.logger.With("module", path, "version", version)
 	logger.DebugContext(ctx, "Private fetcher: Download")
 
-	gitURL := p.modulePathToGitURL(path)
+	gitURL := gomodobject.GitURL(path)
 	repo, err := p.cloneManager.GetOrCreate(ctx, gitURL)
 	if err != nil {
 		return nil, nil, nil, errors.Wrapf(err, "get or create clone for %s", path)
@@ -150,13 +151,12 @@ func (p *privateFetcher) ensureReady(ctx context.Context, repo *gitclone.Reposit
 	}
 }
 
-func (p *privateFetcher) modulePathToGitURL(modulePath string) string {
-	return "https://" + modulePath
-}
-
 func (p *privateFetcher) verifyCommitExists(ctx context.Context, repo *gitclone.Repository, version string) error {
-	ref := VersionToGitRef(version)
-	if !repo.HasCommit(ctx, ref) {
+	// checkoutRef's leading-"-" rejection is a second, independent layer ahead
+	// of HasCommit's --end-of-options: this ref is a raw, unvalidated version
+	// string from the request, same as the checkout path below.
+	ref, ok := checkoutRef(version)
+	if !ok || !repo.HasCommit(ctx, ref) {
 		return errors.Errorf("commit %s not found in repository %s", version, repo.UpstreamURL())
 	}
 	return nil
@@ -216,8 +216,11 @@ func (p *privateFetcher) listVersions(ctx context.Context, repo *gitclone.Reposi
 
 func (p *privateFetcher) getCommitTime(ctx context.Context, repo *gitclone.Repository, ref string) (time.Time, error) {
 	output, err := gitclone.WithReadLockReturn(repo, func() ([]byte, error) {
-		// #nosec G204 - repo.Path() and ref are controlled by us
-		cmd := exec.CommandContext(ctx, "git", "-C", repo.Path(), "log", "-1", "--format=%cI", ref)
+		// ref derives from a requested version, so --end-of-options keeps it in
+		// revision position whatever it starts with.
+		// #nosec G204 - repo.Path() is ours and ref cannot be read as an option
+		cmd := exec.CommandContext(ctx, "git", "-C", repo.Path(), "log", "-1", "--format=%cI",
+			"--end-of-options", ref)
 		return cmd.CombinedOutput()
 	})
 
@@ -275,8 +278,9 @@ func (p *privateFetcher) generateInfo(ctx context.Context, repo *gitclone.Reposi
 
 func (p *privateFetcher) generateMod(ctx context.Context, repo *gitclone.Repository, modulePath, version string) io.ReadSeekCloser {
 	output, err := gitclone.WithReadLockReturn(repo, func() ([]byte, error) {
-		// #nosec G204 - version and repo.Path() are controlled by this package, not user input
-		cmd := exec.CommandContext(ctx, "git", "-C", repo.Path(), "show", fmt.Sprintf("%s:go.mod", VersionToGitRef(version)))
+		// #nosec G204 - repo.Path() is ours and the revision cannot be read as an option
+		cmd := exec.CommandContext(ctx, "git", "-C", repo.Path(), "show", "--end-of-options",
+			fmt.Sprintf("%s:go.mod", VersionToGitRef(version)))
 		return cmd.CombinedOutput()
 	})
 
@@ -296,7 +300,10 @@ func (p *privateFetcher) generateZip(ctx context.Context, repo *gitclone.Reposit
 	defer os.RemoveAll(tmpDir) //nolint:errcheck
 
 	cloneDir := filepath.Join(tmpDir, "repo")
-	gitRef := VersionToGitRef(version)
+	gitRef, ok := checkoutRef(version)
+	if !ok {
+		return nil, errors.Errorf("version %q does not name a checkable revision", version)
+	}
 
 	// Local clone from the mirror at the requested ref — git hardlinks objects by default.
 	// We use --no-checkout then checkout the specific ref so that both tagged versions and
@@ -306,8 +313,8 @@ func (p *privateFetcher) generateZip(ctx context.Context, repo *gitclone.Reposit
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return nil, errors.Wrapf(err, "git clone: %s", string(output))
 	}
-	// #nosec G204 - cloneDir and gitRef are controlled by us
-	cmd = exec.CommandContext(ctx, "git", "-C", cloneDir, "checkout", gitRef)
+	// #nosec G204 - cloneDir is ours and gitRef cannot be read as an option
+	cmd = exec.CommandContext(ctx, "git", "-C", cloneDir, "checkout", gitRef, "--")
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return nil, errors.Wrapf(err, "git checkout %s: %s", gitRef, string(output))
 	}
@@ -331,6 +338,22 @@ func newReadSeekCloser(r *bytes.Reader) io.ReadSeekCloser {
 
 func (r *readSeekCloser) Close() error {
 	return nil
+}
+
+// checkoutRef returns the revision to check out for a module version, and
+// whether it can be passed to git at all.
+//
+// Unlike the plumbing commands, "git checkout" has no --end-of-options, so a
+// revision that begins with "-" would be read as an option: "--pathspec-from-file"
+// and friends make that a way to reach files outside the clone. The module proxy
+// only routes canonical versions and resolved revisions to a fetcher, so nothing
+// legitimate is refused here.
+func checkoutRef(version string) (string, bool) {
+	ref := VersionToGitRef(version)
+	if ref == "" || strings.HasPrefix(ref, "-") {
+		return "", false
+	}
+	return ref, true
 }
 
 // VersionToGitRef converts a Go module version string to a git ref. For pseudo-versions

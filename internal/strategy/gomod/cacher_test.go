@@ -9,9 +9,9 @@ import (
 
 	"github.com/alecthomas/assert/v2"
 
-	"github.com/block/cachew/internal/cache"
-	"github.com/block/cachew/internal/logging"
-	"github.com/block/cachew/internal/strategy/gomod"
+	"github.com/tenstorrent/internal-cachew/internal/cache"
+	"github.com/tenstorrent/internal-cachew/internal/logging"
+	"github.com/tenstorrent/internal-cachew/internal/strategy/gomod"
 )
 
 func TestGoproxyCacherPutAbortsOnReadError(t *testing.T) {

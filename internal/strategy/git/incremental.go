@@ -7,8 +7,8 @@ import (
 
 	"github.com/alecthomas/errors"
 
-	"github.com/block/cachew/internal/gitclone"
-	"github.com/block/cachew/internal/logging"
+	"github.com/tenstorrent/internal-cachew/internal/gitclone"
+	"github.com/tenstorrent/internal-cachew/internal/logging"
 )
 
 // Incremental pull-through outcome values, recorded on the

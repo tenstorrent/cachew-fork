@@ -15,11 +15,11 @@ import (
 
 	"github.com/alecthomas/assert/v2"
 
-	"github.com/block/cachew/internal/cache"
-	"github.com/block/cachew/internal/gitclone"
-	"github.com/block/cachew/internal/githubapp"
-	"github.com/block/cachew/internal/logging"
-	"github.com/block/cachew/internal/strategy/git"
+	"github.com/tenstorrent/internal-cachew/internal/cache"
+	"github.com/tenstorrent/internal-cachew/internal/gitclone"
+	"github.com/tenstorrent/internal-cachew/internal/githubapp"
+	"github.com/tenstorrent/internal-cachew/internal/logging"
+	"github.com/tenstorrent/internal-cachew/internal/strategy/git"
 )
 
 func TestEnsureRefsHandler(t *testing.T) {
@@ -60,8 +60,8 @@ func TestEnsureRefsHandler(t *testing.T) {
 	mux := newTestMux()
 
 	cm := gitclone.NewManagerProvider(ctx, gitclone.Config{MirrorRoot: mirrorRoot}, nil)
-	s, err := git.New(ctx, git.Config{}, newTestScheduler(ctx, t), memCache, mux, cm,
-		func() (*githubapp.TokenManager, error) { return nil, nil }) //nolint:nilnil
+	s, err := git.New(ctx, git.Config{DisableUpstreamAuthz: true}, newTestScheduler(ctx, t), memCache, mux, cm,
+		func() (*githubapp.TokenManager, error) { return nil, nil }, nil) //nolint:nilnil
 	assert.NoError(t, err)
 	waitForReady(t, s)
 

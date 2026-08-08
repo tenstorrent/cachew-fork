@@ -17,6 +17,16 @@ var TransportHeaders = []string{ //nolint:gochecknoglobals
 	"Content-Range",
 }
 
+// CredentialHeaders carry caller credentials and must never be persisted as
+// cached object metadata: stored metadata is replayed to whoever later reads the
+// object, which would hand one caller's credentials to the next.
+var CredentialHeaders = []string{ //nolint:gochecknoglobals
+	"Authorization",
+	"Proxy-Authorization",
+	"Cookie",
+	"Set-Cookie",
+}
+
 // HopByHopHeaders are hop-by-hop headers that should not be forwarded by proxies (RFC 7230).
 var HopByHopHeaders = []string{ //nolint:gochecknoglobals
 	"Connection",

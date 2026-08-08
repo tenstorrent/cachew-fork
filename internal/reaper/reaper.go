@@ -12,7 +12,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/block/cachew/internal/logging"
+	"github.com/tenstorrent/internal-cachew/internal/logging"
 )
 
 // Start launches a background goroutine that reaps zombie child processes.

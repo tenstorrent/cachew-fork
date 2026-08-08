@@ -6,7 +6,7 @@ import (
 	"github.com/alecthomas/errors"
 	"github.com/google/uuid"
 
-	"github.com/block/cachew/client"
+	"github.com/tenstorrent/internal-cachew/client"
 )
 
 // ETagKey is the HTTP header key used to store the ETag.

@@ -15,15 +15,23 @@ import (
 	"github.com/open-policy-agent/opa/v1/storage/inmem"
 	"github.com/open-policy-agent/opa/v1/tester"
 
-	"github.com/block/cachew/internal/logging"
+	"github.com/tenstorrent/internal-cachew/internal/logging"
 )
 
-// DefaultPolicy allows all requests from localhost and restricts remote access to non-admin paths.
+// DefaultPolicy allows all requests from localhost and restricts remote access
+// to non-admin paths.
+//
+// "metrics" is in the restricted set because the metrics endpoint labels
+// several series with the org/repo name of every repository cachew has checked
+// or mirrored, so scraping it remotely enumerates private repository names
+// without going through any repository-level authorization. Deployments that
+// scrape from elsewhere must permit it explicitly rather than get it by
+// default.
 const DefaultPolicy = `package cachew.authz
 
 default allow := false
 allow if startswith(input.remote_addr, "127.0.0.1:")
-allow if not input.path[0] in {"api", "admin"}
+allow if not input.path[0] in {"api", "admin", "metrics"}
 `
 
 // Config for OPA policy evaluation. If neither Policy nor PolicyFile is set,
@@ -36,10 +44,19 @@ type Config struct {
 	Test       string `hcl:"test,optional" help:"Inline Rego test module run against the policy when cachewd starts."`
 }
 
-// Middleware returns an http.Handler that evaluates OPA policy before delegating to next.
-// The policy must define a boolean "allow" rule under package cachew.authz.
-// If allow is true the request proceeds; otherwise it is rejected with 403.
-func Middleware(ctx context.Context, cfg Config, next http.Handler) (http.Handler, error) {
+// An Authorizer is a compiled policy that can gate more than one listener.
+//
+// cachewd serves on two listeners — the main mux and the Prometheus metrics
+// port — and both must be gated by the same policy. Compiling once and sharing
+// the result is what makes "the same policy" true by construction rather than
+// by two call sites happening to be passed the same config.
+type Authorizer struct {
+	prepared rego.PreparedEvalQuery
+}
+
+// New compiles the configured policy. The policy must define a boolean "allow"
+// rule under package cachew.authz.
+func New(ctx context.Context, cfg Config) (*Authorizer, error) {
 	policy, err := loadPolicy(cfg)
 	if err != nil {
 		return nil, err
@@ -54,12 +71,18 @@ func Middleware(ctx context.Context, cfg Config, next http.Handler) (http.Handle
 	if err != nil {
 		return nil, errors.Errorf("compile OPA allow query: %w", err)
 	}
+	return &Authorizer{prepared: prepared}, nil
+}
 
+// Middleware returns an http.Handler that evaluates the policy before
+// delegating to next. If allow is true the request proceeds; otherwise it is
+// rejected with 403.
+func (a *Authorizer) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		input := buildInput(r)
 		logger := logging.FromContext(r.Context())
 
-		allowed, err := evalAllow(r.Context(), prepared, input)
+		allowed, err := evalAllow(r.Context(), a.prepared, input)
 		if err != nil {
 			logger.Error("OPA evaluation failed", "error", err)
 			http.Error(w, "policy evaluation error", http.StatusInternalServerError)
@@ -72,7 +95,18 @@ func Middleware(ctx context.Context, cfg Config, next http.Handler) (http.Handle
 		}
 
 		next.ServeHTTP(w, r)
-	}), nil
+	})
+}
+
+// Middleware compiles cfg and returns an http.Handler that evaluates it before
+// delegating to next. Callers gating more than one listener should use New and
+// share the resulting Authorizer.
+func Middleware(ctx context.Context, cfg Config, next http.Handler) (http.Handler, error) {
+	authorizer, err := New(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	return authorizer.Middleware(next), nil
 }
 
 // RunTests compiles the configured policy together with the Rego test module in

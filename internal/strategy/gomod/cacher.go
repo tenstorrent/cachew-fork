@@ -8,11 +8,17 @@ import (
 
 	"github.com/alecthomas/errors"
 
-	"github.com/block/cachew/internal/cache"
+	"github.com/tenstorrent/internal-cachew/internal/cache"
+	"github.com/tenstorrent/internal-cachew/internal/gomodobject"
 )
 
 type goproxyCacher struct {
 	cache cache.Cache
+	// private reports whether a module proxy path resolves to a private
+	// repository. It is recorded with every object so that reads of it through
+	// the generic object API can be authorized; a nil predicate marks everything
+	// public, which is only correct where no private paths are configured.
+	private func(name string) bool
 }
 
 func (g *goproxyCacher) Get(ctx context.Context, name string) (io.ReadCloser, error) {
@@ -31,9 +37,9 @@ func (g *goproxyCacher) Put(ctx context.Context, name string, content io.ReadSee
 		return nil
 	}
 
-	key := cache.NewKey(name)
+	object := gomodobject.New(name, g.private != nil && g.private(name))
 
-	wc, err := g.cache.Create(ctx, key, nil, 0)
+	wc, err := g.cache.Create(ctx, object.Key, object.Headers(), 0)
 	if err != nil {
 		return errors.Errorf("create cache entry: %w", err)
 	}

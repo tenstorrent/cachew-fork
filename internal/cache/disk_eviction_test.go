@@ -10,8 +10,8 @@ import (
 	"github.com/alecthomas/errors"
 	"go.etcd.io/bbolt"
 
-	"github.com/block/cachew/internal/cache"
-	"github.com/block/cachew/internal/logging"
+	"github.com/tenstorrent/internal-cachew/internal/cache"
+	"github.com/tenstorrent/internal-cachew/internal/logging"
 )
 
 func TestDiskEvictionBySize(t *testing.T) {

@@ -25,10 +25,10 @@ import (
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 
-	"github.com/block/cachew/internal/gitclone"
-	"github.com/block/cachew/internal/githubapp"
-	"github.com/block/cachew/internal/logging"
-	"github.com/block/cachew/internal/strategy/git"
+	"github.com/tenstorrent/internal-cachew/internal/gitclone"
+	"github.com/tenstorrent/internal-cachew/internal/githubapp"
+	"github.com/tenstorrent/internal-cachew/internal/logging"
+	"github.com/tenstorrent/internal-cachew/internal/strategy/git"
 )
 
 // fakeUpstreamMarker is the distinctive body returned by the fake upstream server
@@ -109,6 +109,8 @@ const e2eUpstreamHost = "127.0.0.1"
 // under e2eUpstreamHost.
 func setupE2EStrategy(ctx context.Context, t *testing.T, mirrorRoot string, cfg git.Config) (*git.Strategy, *httptest.Server) {
 	t.Helper()
+	// See newTestStrategyForMirror: avoids authorizing against the unreachable fake upstream.
+	cfg.DisableUpstreamAuthz = true
 	mux := http.NewServeMux()
 	cm := gitclone.NewManagerProvider(ctx, gitclone.Config{
 		MirrorRoot:       mirrorRoot,
@@ -117,7 +119,7 @@ func setupE2EStrategy(ctx context.Context, t *testing.T, mirrorRoot string, cfg 
 		RefCheckInterval: time.Nanosecond, // expire cooldown immediately so incremental can fetch
 	}, nil)
 	s, err := git.New(ctx, cfg, newTestScheduler(ctx, t), nil, mux, cm,
-		func() (*githubapp.TokenManager, error) { return nil, nil }) //nolint:nilnil
+		func() (*githubapp.TokenManager, error) { return nil, nil }, nil) //nolint:nilnil
 	assert.NoError(t, err)
 	t.Cleanup(func() { waitForReady(t, s) })
 	srv := newLoggingServer(ctx, mux)
@@ -535,6 +537,10 @@ func waitForFile(t *testing.T, path string) {
 // and returns the underlying manager.
 func newTestStrategyForMirror(ctx context.Context, t *testing.T, mirrorRoot string, cfg git.Config) (*git.Strategy, *gitclone.Manager) {
 	t.Helper()
+	// These tests exercise incremental pull-through against an unreachable fake
+	// upstream (e2eUpstreamHost); per-repo authorization would otherwise probe
+	// that same unreachable host and deny every request as auth-required.
+	cfg.DisableUpstreamAuthz = true
 	mux := newTestMux()
 	cm := gitclone.NewManagerProvider(ctx, gitclone.Config{
 		MirrorRoot:       mirrorRoot,
@@ -543,7 +549,7 @@ func newTestStrategyForMirror(ctx context.Context, t *testing.T, mirrorRoot stri
 		RefCheckInterval: time.Nanosecond, // expire cooldown immediately so incremental can fetch
 	}, nil)
 	s, err := git.New(ctx, cfg, newTestScheduler(ctx, t), nil, mux, cm,
-		func() (*githubapp.TokenManager, error) { return nil, nil }) //nolint:nilnil
+		func() (*githubapp.TokenManager, error) { return nil, nil }, nil) //nolint:nilnil
 	assert.NoError(t, err)
 	manager, err := cm()
 	assert.NoError(t, err)
@@ -554,6 +560,8 @@ func newTestStrategyForMirror(ctx context.Context, t *testing.T, mirrorRoot stri
 // lets the caller set RefCheckInterval. Used by the cooldown test.
 func newTestStrategyForMirrorWithRefCheck(ctx context.Context, t *testing.T, mirrorRoot string, cfg git.Config, refCheckInterval time.Duration) (*git.Strategy, *gitclone.Manager) {
 	t.Helper()
+	// See newTestStrategyForMirror: avoids authorizing against the unreachable fake upstream.
+	cfg.DisableUpstreamAuthz = true
 	mux := newTestMux()
 	cm := gitclone.NewManagerProvider(ctx, gitclone.Config{
 		MirrorRoot:       mirrorRoot,
@@ -562,7 +570,7 @@ func newTestStrategyForMirrorWithRefCheck(ctx context.Context, t *testing.T, mir
 		RefCheckInterval: refCheckInterval,
 	}, nil)
 	s, err := git.New(ctx, cfg, newTestScheduler(ctx, t), nil, mux, cm,
-		func() (*githubapp.TokenManager, error) { return nil, nil }) //nolint:nilnil
+		func() (*githubapp.TokenManager, error) { return nil, nil }, nil) //nolint:nilnil
 	assert.NoError(t, err)
 	manager, err := cm()
 	assert.NoError(t, err)
@@ -2079,8 +2087,8 @@ func TestIncrementalStaleInfoRefsForwardedThenBackgroundFetch(t *testing.T) {
 		hits:  &hits,
 	})
 
-	// SetHTTPTransport mutates http.DefaultClient, so test client requests must
-	// use a dedicated transport to avoid polluting the proxy hit counter.
+	// A dedicated client keeps the test's own requests to cachew out of the
+	// counting transport the strategy uses for its upstream requests.
 	client := &http.Client{Transport: http.DefaultTransport}
 
 	// Advance upstream after warm-up so the mirror is stale.

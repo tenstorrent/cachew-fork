@@ -10,8 +10,8 @@ import (
 
 	"github.com/alecthomas/assert/v2"
 
-	"github.com/block/cachew/client"
-	"github.com/block/cachew/internal/httputil"
+	"github.com/tenstorrent/internal-cachew/client"
+	"github.com/tenstorrent/internal-cachew/internal/httputil"
 )
 
 const testETag = `"abc123"`

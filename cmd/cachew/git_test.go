@@ -16,7 +16,7 @@ import (
 
 	"github.com/alecthomas/assert/v2"
 
-	"github.com/block/cachew/client"
+	"github.com/tenstorrent/internal-cachew/client"
 )
 
 // TestMain drops the GIT_* variables git exports under hooks so test git

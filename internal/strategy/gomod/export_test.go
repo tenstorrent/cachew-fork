@@ -3,9 +3,14 @@ package gomod
 import (
 	"context"
 	"io"
+	"net/http"
 
-	"github.com/block/cachew/internal/cache"
+	"github.com/tenstorrent/internal-cachew/internal/cache"
 )
+
+// SetAuthzHTTPClient points the strategy's upstream authorization probes at a
+// test client.
+func (s *Strategy) SetAuthzHTTPClient(client *http.Client) { s.authz.SetHTTPClient(client) }
 
 // TestableGoproxyCacher exposes goproxyCacher.Put for external tests.
 type TestableGoproxyCacher struct {
@@ -21,3 +26,6 @@ func NewTestableGoproxyCacher(c cache.Cache) *TestableGoproxyCacher {
 func (t *TestableGoproxyCacher) Put(ctx context.Context, name string, content io.ReadSeeker) error {
 	return t.inner.Put(ctx, name, content)
 }
+
+// CheckoutRef exposes checkoutRef for external tests.
+func CheckoutRef(version string) (string, bool) { return checkoutRef(version) }

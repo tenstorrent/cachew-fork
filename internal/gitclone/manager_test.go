@@ -13,7 +13,7 @@ import (
 	"github.com/alecthomas/assert/v2"
 	"github.com/alecthomas/errors"
 
-	"github.com/block/cachew/internal/logging"
+	"github.com/tenstorrent/internal-cachew/internal/logging"
 )
 
 // TestMain drops the GIT_* variables git exports under hooks so test git
@@ -1142,5 +1142,156 @@ func TestMirrorConfigAllowsUnreachableSHA(t *testing.T) {
 	uploadOut, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("upload-pack rejected unreachable SHA (mirror config should allow it):\n%s", uploadOut)
+	}
+}
+
+func TestFetchBackoff(t *testing.T) {
+	base := 15 * time.Minute
+	tests := []struct {
+		name     string
+		base     time.Duration
+		failures int
+		expected time.Duration
+	}{
+		{name: "NoFailures", base: base, failures: 0, expected: 0},
+		{name: "NegativeFailures", base: base, failures: -1, expected: 0},
+		{name: "FirstFailure", base: base, failures: 1, expected: 15 * time.Minute},
+		{name: "SecondFailure", base: base, failures: 2, expected: 30 * time.Minute},
+		{name: "ThirdFailure", base: base, failures: 3, expected: time.Hour},
+		{name: "CappedAtOneHour", base: base, failures: 4, expected: time.Hour},
+		{name: "CappedForManyFailures", base: base, failures: 64, expected: time.Hour},
+		{name: "SmallBaseStillCaps", base: time.Second, failures: 40, expected: time.Hour},
+		{name: "ZeroBaseUsesDefault", base: 0, failures: 1, expected: DefaultFetchInterval},
+		{name: "BaseAboveCapIsCapped", base: 3 * time.Hour, failures: 1, expected: time.Hour},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			assert.Equal(t, test.expected, FetchBackoff(test.base, test.failures))
+		})
+	}
+}
+
+func TestRepositoryBackgroundFetchBackoff(t *testing.T) {
+	base := 15 * time.Minute
+	repo := &Repository{state: StateReady, fetchSem: make(chan struct{}, 1)}
+	repo.fetchSem <- struct{}{}
+
+	assert.Equal(t, time.Duration(0), repo.BackgroundFetchBackoff(base))
+
+	repo.recordFetchOutcome(false)
+	assert.Equal(t, 1, repo.FetchFailures())
+	assert.True(t, repo.BackgroundFetchBackoff(base) > 14*time.Minute)
+
+	repo.recordFetchOutcome(false)
+	assert.Equal(t, 2, repo.FetchFailures())
+	assert.True(t, repo.BackgroundFetchBackoff(base) > 29*time.Minute)
+
+	for range 10 {
+		repo.recordFetchOutcome(false)
+	}
+	assert.True(t, repo.BackgroundFetchBackoff(base) > 59*time.Minute)
+	assert.True(t, repo.BackgroundFetchBackoff(base) <= time.Hour)
+
+	repo.mu.Lock()
+	repo.lastFetchAttempt = time.Now().Add(-2 * time.Hour)
+	repo.mu.Unlock()
+	assert.Equal(t, time.Duration(0), repo.BackgroundFetchBackoff(base))
+
+	repo.recordFetchOutcome(true)
+	assert.Equal(t, 0, repo.FetchFailures())
+	assert.Equal(t, time.Duration(0), repo.BackgroundFetchBackoff(base))
+	assert.True(t, !repo.LastFetch().IsZero())
+}
+
+func TestRepositoryFetchBackoffAcrossRealFetches(t *testing.T) {
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+	upstreamPath := createBareRepo(t, tmpDir)
+
+	clonePath := filepath.Join(tmpDir, "clone")
+	repo := &Repository{
+		state:       StateEmpty,
+		config:      testRepoConfig(),
+		path:        clonePath,
+		upstreamURL: upstreamPath,
+		fetchSem:    make(chan struct{}, 1),
+	}
+	repo.fetchSem <- struct{}{}
+	assert.NoError(t, repo.Clone(ctx))
+
+	base := 15 * time.Minute
+	assert.Equal(t, time.Duration(0), repo.BackgroundFetchBackoff(base))
+
+	missing := filepath.Join(tmpDir, "missing.git")
+	assert.NoError(t, exec.Command("git", "-C", clonePath, "remote", "set-url", "origin", missing).Run())
+
+	assert.Error(t, repo.FetchVerified(ctx))
+	assert.Equal(t, 1, repo.FetchFailures())
+	assert.True(t, repo.BackgroundFetchBackoff(base) > base-time.Minute)
+	assert.True(t, repo.BackgroundFetchBackoff(base) <= base)
+
+	assert.Error(t, repo.FetchVerified(ctx))
+	assert.Equal(t, 2, repo.FetchFailures())
+	assert.True(t, repo.BackgroundFetchBackoff(base) > 2*base-time.Minute)
+	assert.True(t, repo.BackgroundFetchBackoff(base) <= 2*base)
+
+	assert.NoError(t, exec.Command("git", "-C", clonePath, "remote", "set-url", "origin", upstreamPath).Run())
+	assert.NoError(t, repo.FetchVerified(ctx))
+	assert.Equal(t, 0, repo.FetchFailures())
+	assert.Equal(t, time.Duration(0), repo.BackgroundFetchBackoff(base))
+}
+
+func TestCommitLookupsRejectOptionsAndRevisionSyntax(t *testing.T) {
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+	barePath := createBareRepo(t, tmpDir)
+	repo := &Repository{
+		state:       StateReady,
+		path:        barePath,
+		upstreamURL: "https://example.com/test-repo",
+		fetchSem:    make(chan struct{}, 1),
+	}
+	repo.fetchSem <- struct{}{}
+
+	sideEffect := filepath.Join(tmpDir, "written-by-git")
+	tests := []struct {
+		name  string
+		input string
+		// option inputs must never be read as git options; revision inputs are
+		// only rejected where the caller promises to pass object names.
+		option bool
+	}{
+		{name: "OutputOption", input: "--output=" + sideEffect, option: true},
+		{name: "UploadPackOption", input: "--upload-pack=/bin/sh", option: true},
+		{name: "ShortOption", input: "-p", option: true},
+		{name: "BatchOption", input: "--batch-all-objects", option: true},
+		{name: "TextSearchRevision", input: ":/init"},
+		{name: "RegexRevision", input: "HEAD^{/init}"},
+		{name: "ReflogRevision", input: "HEAD@{0}"},
+		{name: "SymbolicRevision", input: "HEAD"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, []string{tt.input}, repo.missingCommitsLocked(ctx, []string{tt.input}))
+			_, err := os.Stat(sideEffect)
+			assert.True(t, os.IsNotExist(err), "git wrote %s for input %q", sideEffect, tt.input)
+		})
+	}
+
+	// Real object names still resolve, so the validation has not broken lookups.
+	out, err := exec.Command("git", "-C", barePath, "rev-parse", "HEAD").Output()
+	assert.NoError(t, err)
+	head := strings.TrimSpace(string(out))
+	assert.Zero(t, repo.missingCommitsLocked(ctx, []string{head}))
+	assert.True(t, repo.HasCommit(ctx, head))
+	// HasCommit resolves symbolic revisions by design, but an option must stay in
+	// revision position rather than changing what git does.
+	for _, tt := range tests {
+		if !tt.option {
+			continue
+		}
+		assert.False(t, repo.HasCommit(ctx, tt.input), "HasCommit resolved %q", tt.input)
+		_, err := os.Stat(sideEffect)
+		assert.True(t, os.IsNotExist(err), "git wrote %s for input %q", sideEffect, tt.input)
 	}
 }

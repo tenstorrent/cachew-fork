@@ -10,9 +10,9 @@ import (
 	"github.com/alecthomas/assert/v2"
 	"github.com/alecthomas/errors"
 
-	"github.com/block/cachew/internal/cache"
-	"github.com/block/cachew/internal/cache/cachetest"
-	"github.com/block/cachew/internal/logging"
+	"github.com/tenstorrent/internal-cachew/internal/cache"
+	"github.com/tenstorrent/internal-cachew/internal/cache/cachetest"
+	"github.com/tenstorrent/internal-cachew/internal/logging"
 )
 
 func TestMemoryCache(t *testing.T) {

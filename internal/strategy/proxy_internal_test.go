@@ -10,8 +10,8 @@ import (
 	"github.com/alecthomas/assert/v2"
 	"github.com/alecthomas/errors"
 
-	"github.com/block/cachew/internal/httputil"
-	"github.com/block/cachew/internal/logging"
+	"github.com/tenstorrent/internal-cachew/internal/httputil"
+	"github.com/tenstorrent/internal-cachew/internal/logging"
 )
 
 // TestWriteProxyErrorHonorsHTTPResponderStatus verifies writeProxyError uses

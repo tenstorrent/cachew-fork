@@ -8,7 +8,7 @@ import (
 
 	"github.com/alecthomas/errors"
 
-	"github.com/block/cachew/client"
+	"github.com/tenstorrent/internal-cachew/client"
 )
 
 // HeaderFunc returns headers to attach to each outgoing request.

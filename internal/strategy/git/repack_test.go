@@ -9,10 +9,10 @@ import (
 
 	"github.com/alecthomas/assert/v2"
 
-	"github.com/block/cachew/internal/gitclone"
-	"github.com/block/cachew/internal/githubapp"
-	"github.com/block/cachew/internal/logging"
-	"github.com/block/cachew/internal/strategy/git"
+	"github.com/tenstorrent/internal-cachew/internal/gitclone"
+	"github.com/tenstorrent/internal-cachew/internal/githubapp"
+	"github.com/tenstorrent/internal-cachew/internal/logging"
+	"github.com/tenstorrent/internal-cachew/internal/strategy/git"
 )
 
 func TestRepackInterval(t *testing.T) {
@@ -41,7 +41,7 @@ func TestRepackInterval(t *testing.T) {
 			}, nil)
 			s, err := git.New(ctx, git.Config{
 				RepackInterval: tt.repackInterval,
-			}, newTestScheduler(ctx, t), nil, mux, cm, func() (*githubapp.TokenManager, error) { return nil, nil }) //nolint:nilnil
+			}, newTestScheduler(ctx, t), nil, mux, cm, func() (*githubapp.TokenManager, error) { return nil, nil }, nil) //nolint:nilnil
 			assert.NoError(t, err)
 			assert.True(t, s != nil)
 		})
@@ -65,7 +65,7 @@ func TestRepackScheduledForExistingRepos(t *testing.T) {
 	}, nil)
 	s, err := git.New(ctx, git.Config{
 		RepackInterval: 24 * time.Hour,
-	}, newTestScheduler(ctx, t), nil, mux, cm, func() (*githubapp.TokenManager, error) { return nil, nil }) //nolint:nilnil
+	}, newTestScheduler(ctx, t), nil, mux, cm, func() (*githubapp.TokenManager, error) { return nil, nil }, nil) //nolint:nilnil
 	assert.NoError(t, err)
 	assert.True(t, s != nil)
 }

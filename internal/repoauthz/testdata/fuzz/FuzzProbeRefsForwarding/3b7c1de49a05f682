@@ -1,0 +1,5 @@
+go test fuzz v1
+string("org/repo?service=git-receive-pack#frag")
+string("Bearer client-token")
+string("application/x-git-upload-pack-advertisement")
+string("001e# service=git-upload-pack\n0000")

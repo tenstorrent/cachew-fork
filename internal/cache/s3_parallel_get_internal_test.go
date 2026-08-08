@@ -14,8 +14,8 @@ import (
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 
-	"github.com/block/cachew/internal/logging"
-	"github.com/block/cachew/internal/s3client/s3clienttest"
+	"github.com/tenstorrent/internal-cachew/internal/logging"
+	"github.com/tenstorrent/internal-cachew/internal/s3client/s3clienttest"
 )
 
 type roundTripperFunc func(*http.Request) (*http.Response, error)

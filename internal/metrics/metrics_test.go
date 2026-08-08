@@ -9,8 +9,8 @@ import (
 
 	"github.com/alecthomas/assert/v2"
 
-	"github.com/block/cachew/internal/logging"
-	"github.com/block/cachew/internal/metrics"
+	"github.com/tenstorrent/internal-cachew/internal/logging"
+	"github.com/tenstorrent/internal-cachew/internal/metrics"
 )
 
 func TestMetricsClient(t *testing.T) {
@@ -52,7 +52,7 @@ func TestMetricsDedicatedServer(t *testing.T) {
 	defer client.Close()
 
 	// ServeMetrics uses configured port
-	err = client.ServeMetrics(ctx)
+	err = client.ServeMetrics(ctx, allowAll)
 	assert.NoError(t, err)
 }
 
@@ -73,7 +73,7 @@ func TestMetricsOTLPOnly(t *testing.T) {
 	defer client.Close()
 
 	// ServeMetrics should not start server when Prometheus is disabled
-	err = client.ServeMetrics(ctx)
+	err = client.ServeMetrics(ctx, allowAll)
 	assert.NoError(t, err)
 }
 

@@ -14,10 +14,10 @@ import (
 
 	"github.com/alecthomas/assert/v2"
 
-	"github.com/block/cachew/internal/cache"
-	"github.com/block/cachew/internal/gitclone"
-	"github.com/block/cachew/internal/logging"
-	"github.com/block/cachew/internal/strategy/gomod"
+	"github.com/tenstorrent/internal-cachew/internal/cache"
+	"github.com/tenstorrent/internal-cachew/internal/gitclone"
+	"github.com/tenstorrent/internal-cachew/internal/logging"
+	"github.com/tenstorrent/internal-cachew/internal/strategy/gomod"
 )
 
 type mockGoModServer struct {
@@ -182,7 +182,7 @@ func setupGoModTest(t *testing.T) (*mockGoModServer, *http.ServeMux, context.Con
 	mux := http.NewServeMux()
 	_, err = gomod.New(ctx, gomod.Config{
 		Proxy: mock.server.URL,
-	}, memCache, mux, cm)
+	}, memCache, mux, cm, nil)
 	assert.NoError(t, err)
 
 	return mock, mux, ctx
@@ -392,7 +392,7 @@ func TestNewMissingGitBinaryForPrivatePaths(t *testing.T) {
 		_, err := gomod.New(ctx, gomod.Config{
 			Proxy:        "https://proxy.golang.org",
 			PrivatePaths: []string{"github.com/myorg"},
-		}, memCache, mux, cm)
+		}, memCache, mux, cm, nil)
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "git")
 	})
@@ -405,7 +405,7 @@ func TestNewMissingGitBinaryForPrivatePaths(t *testing.T) {
 		mux := http.NewServeMux()
 		_, err := gomod.New(ctx, gomod.Config{
 			Proxy: mock.server.URL,
-		}, memCache, mux, cm)
+		}, memCache, mux, cm, nil)
 		assert.NoError(t, err)
 	})
 }

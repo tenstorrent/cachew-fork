@@ -23,22 +23,23 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 
-	"github.com/block/cachew/internal/cache"
-	"github.com/block/cachew/internal/config"
-	"github.com/block/cachew/internal/gitclone"
-	"github.com/block/cachew/internal/githubapp"
-	"github.com/block/cachew/internal/jobscheduler"
-	"github.com/block/cachew/internal/logging"
-	"github.com/block/cachew/internal/metadatadb"
-	metadatas3 "github.com/block/cachew/internal/metadatadb/s3"
-	"github.com/block/cachew/internal/metrics"
-	"github.com/block/cachew/internal/opa"
-	"github.com/block/cachew/internal/reaper"
-	"github.com/block/cachew/internal/s3client"
-	"github.com/block/cachew/internal/strategy"
-	"github.com/block/cachew/internal/strategy/git"
-	"github.com/block/cachew/internal/strategy/gomod"
-	"github.com/block/cachew/internal/tracing"
+	"github.com/tenstorrent/internal-cachew/internal/cache"
+	"github.com/tenstorrent/internal-cachew/internal/config"
+	"github.com/tenstorrent/internal-cachew/internal/gitclone"
+	"github.com/tenstorrent/internal-cachew/internal/githubapp"
+	"github.com/tenstorrent/internal-cachew/internal/jobscheduler"
+	"github.com/tenstorrent/internal-cachew/internal/logging"
+	"github.com/tenstorrent/internal-cachew/internal/metadatadb"
+	metadatas3 "github.com/tenstorrent/internal-cachew/internal/metadatadb/s3"
+	"github.com/tenstorrent/internal-cachew/internal/metrics"
+	"github.com/tenstorrent/internal-cachew/internal/opa"
+	"github.com/tenstorrent/internal-cachew/internal/reaper"
+	"github.com/tenstorrent/internal-cachew/internal/repoauthz"
+	"github.com/tenstorrent/internal-cachew/internal/s3client"
+	"github.com/tenstorrent/internal-cachew/internal/strategy"
+	"github.com/tenstorrent/internal-cachew/internal/strategy/git"
+	"github.com/tenstorrent/internal-cachew/internal/strategy/gomod"
+	"github.com/tenstorrent/internal-cachew/internal/tracing"
 )
 
 type GlobalConfig struct {
@@ -48,7 +49,11 @@ type GlobalConfig struct {
 	ShutdownReadinessDelay time.Duration `hcl:"shutdown-readiness-delay,optional" default:"5s" help:"Delay between flipping readiness to 503 on SIGTERM and starting graceful shutdown."`
 	// ShutdownTimeout must be less than the pod's terminationGracePeriodSeconds
 	// (minus ShutdownReadinessDelay) or the kubelet will SIGKILL before Shutdown returns.
-	ShutdownTimeout  time.Duration       `hcl:"shutdown-timeout,optional" default:"150s" help:"Maximum time to wait for in-flight requests to drain on graceful shutdown."`
+	ShutdownTimeout time.Duration `hcl:"shutdown-timeout,optional" default:"150s" help:"Maximum time to wait for in-flight requests to drain on graceful shutdown."`
+	// RequiresAuthTTL is global rather than per-strategy: the git routes, the
+	// object API and the module proxy share one Authorizer, so the verdict they
+	// share can only have one lifetime.
+	RequiresAuthTTL  time.Duration       `hcl:"requires-auth-ttl,optional" default:"15m" help:"How long the per-repo 'upstream requires authentication' verdict is cached before being re-probed anonymously."`
 	SchedulerConfig  jobscheduler.Config `hcl:"scheduler,block"`
 	LoggingConfig    logging.Config      `hcl:"log,block"`
 	MetricsConfig    metrics.Config      `hcl:"metrics,block"`
@@ -129,7 +134,8 @@ func main() {
 	schedulerCtx, cancelScheduler := context.WithCancel(context.WithoutCancel(ctx))
 	schedulerProvider := jobscheduler.NewProvider(schedulerCtx, globalConfig.SchedulerConfig)
 
-	cr, mr, sr := newRegistries(schedulerProvider, gitManagerProvider, tokenManagerProvider, s3ClientProvider)
+	cr, mr, sr := newRegistries(schedulerProvider, gitManagerProvider, tokenManagerProvider, s3ClientProvider,
+		globalConfig.RequiresAuthTTL)
 
 	// Commands
 	switch { //nolint:gocritic
@@ -149,23 +155,25 @@ func main() {
 		}
 	}()
 
-	if err := metricsClient.ServeMetrics(ctx); err != nil {
-		fatalIfError(ctx, logger, err, "Failed to start metrics server")
-	}
+	// One compiled policy gates both listeners, so the metrics port cannot end
+	// up on a different (or no) policy from the main mux.
+	authorizer, err := opa.New(ctx, globalConfig.OPAConfig)
+	fatalIfError(ctx, logger, err, "Failed to initialise OPA middleware")
+
+	fatalIfError(ctx, logger, metricsClient.ServeMetrics(ctx, authorizer.Middleware), "Failed to start metrics server")
 
 	runOPATests(ctx, logger, globalConfig.OPAConfig)
 
 	logger.InfoContext(ctx, "Starting cachewd", "bind", globalConfig.Bind)
 
-	server, err := newServer(
+	server := newServer(
 		ctx,
 		mux,
 		globalConfig.Bind,
 		globalConfig.MetricsConfig,
-		globalConfig.OPAConfig,
+		authorizer,
 		globalConfig.LoggingConfig,
 	)
-	fatalIfError(ctx, logger, err, "Failed to create server")
 
 	serverErr := make(chan error, 1)
 	go func() {
@@ -249,11 +257,19 @@ func newRegistries(
 	cloneManagerProvider gitclone.ManagerProvider,
 	tokenManagerProvider githubapp.TokenManagerProvider,
 	s3ClientProvider s3client.ClientProvider,
+	requiresAuthTTL time.Duration,
 ) (
 	*cache.Registry,
 	*metadatadb.Registry,
 	*strategy.Registry,
 ) {
+	// One Authorizer for every strategy that authorizes repository reads. The
+	// git routes, the module proxy and the object API decide about the same
+	// repositories by the same means, so separate instances would probe upstream,
+	// and cache the resulting visibility verdict, once per entry point rather
+	// than once.
+	repoAuthorizer := repoauthz.NewAuthorizer(nil, requiresAuthTTL)
+
 	cr := cache.NewRegistry()
 	cache.RegisterMemory(cr)
 	cache.RegisterDisk(cr)
@@ -264,14 +280,14 @@ func newRegistries(
 	metadatas3.Register(mr, s3ClientProvider)
 
 	sr := strategy.NewRegistry()
-	strategy.RegisterAPIV1(sr)
+	strategy.RegisterAPIV1(sr, repoAuthorizer)
 	strategy.RegisterArtifactory(sr)
 	strategy.RegisterGitHubReleases(sr, tokenManagerProvider)
 	strategy.RegisterHermit(sr)
 	strategy.RegisterHost(sr)
 	strategy.RegisterHTTPProxy(sr)
-	git.Register(sr, scheduler, cloneManagerProvider, tokenManagerProvider)
-	gomod.Register(sr, cloneManagerProvider)
+	git.Register(sr, scheduler, cloneManagerProvider, tokenManagerProvider, repoAuthorizer)
+	gomod.Register(sr, cloneManagerProvider, repoAuthorizer)
 
 	return cr, mr, sr
 }
@@ -387,19 +403,16 @@ func newServer(
 	muxHandler http.Handler,
 	bind string,
 	metricsConfig metrics.Config,
-	opaConfig opa.Config,
+	authorizer *opa.Authorizer,
 	logConfig logging.Config,
-) (*http.Server, error) {
+) *http.Server {
 	var handler http.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		labeler, _ := otelhttp.LabelerFromContext(r.Context())
 		labeler.Add(attribute.String("cachew.http.path.prefix", extractPathPrefix(r.URL.Path)))
 		muxHandler.ServeHTTP(w, r)
 	})
 
-	handler, err := opa.Middleware(ctx, opaConfig, handler)
-	if err != nil {
-		return nil, errors.Errorf("initialise OPA middleware: %w", err)
-	}
+	handler = authorizer.Middleware(handler)
 
 	// Add standard otelhttp middleware
 	handler = otelhttp.NewMiddleware(metricsConfig.ServiceName,
@@ -425,7 +438,7 @@ func newServer(
 		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
 			return logging.ContextWithLogger(ctx, logger.With("client", c.RemoteAddr().String()))
 		},
-	}, nil
+	}
 }
 
 // loadGlobalConfig unmarshals the global config from HCL, using a two-pass

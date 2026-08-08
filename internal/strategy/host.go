@@ -8,8 +8,8 @@ import (
 
 	"github.com/alecthomas/errors"
 
-	"github.com/block/cachew/internal/cache"
-	"github.com/block/cachew/internal/strategy/handler"
+	"github.com/tenstorrent/internal-cachew/internal/cache"
+	"github.com/tenstorrent/internal-cachew/internal/strategy/handler"
 )
 
 func RegisterHost(r *Registry) {

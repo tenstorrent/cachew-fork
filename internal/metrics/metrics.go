@@ -3,6 +3,7 @@ package metrics
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/http"
 	"time"
 
@@ -19,7 +20,7 @@ import (
 	"go.opentelemetry.io/otel/sdk/resource"
 	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
 
-	"github.com/block/cachew/internal/logging"
+	"github.com/tenstorrent/internal-cachew/internal/logging"
 )
 
 // Config holds metrics configuration.
@@ -163,7 +164,16 @@ func (c *Client) Handler() http.Handler {
 
 // ServeMetrics starts a dedicated HTTP server for Prometheus metrics scraping.
 // This is only started if Prometheus exporter is enabled.
-func (c *Client) ServeMetrics(ctx context.Context) error {
+//
+// authorize gates the endpoint and is mandatory: this listener binds every
+// interface, and several series are labelled with the org/repo name of each
+// repository cachew has checked or mirrored, so serving it ungated leaks
+// private repository names to anyone who can reach the port. Passing nil is an
+// error rather than a silent opt-out so the gate cannot be lost by omission.
+func (c *Client) ServeMetrics(ctx context.Context, authorize func(http.Handler) http.Handler) error {
+	if authorize == nil {
+		return errors.New("metrics server requires an authorization middleware")
+	}
 	// Only start metrics server if Prometheus is enabled
 	if !c.prometheusEnabled {
 		return nil
@@ -176,8 +186,12 @@ func (c *Client) ServeMetrics(ctx context.Context) error {
 
 	server := &http.Server{
 		Addr:              fmt.Sprintf(":%d", c.port),
-		Handler:           mux,
+		Handler:           authorize(mux),
 		ReadHeaderTimeout: 5 * time.Second,
+		// The authorization middleware logs its decisions through the request
+		// context, which on this listener is not wrapped by the main mux's
+		// logging middleware.
+		BaseContext: func(net.Listener) context.Context { return ctx },
 	}
 
 	go func() {

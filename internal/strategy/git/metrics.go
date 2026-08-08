@@ -9,7 +9,7 @@ import (
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/trace"
 
-	"github.com/block/cachew/internal/metrics"
+	"github.com/tenstorrent/internal-cachew/internal/metrics"
 )
 
 type gitMetrics struct {
@@ -34,6 +34,9 @@ type gitMetrics struct {
 	incrementalServeTotal    metric.Int64Counter
 	incrementalFetchDuration metric.Float64Histogram
 	incrementalEligibleTotal metric.Int64Counter
+	authzCheckTotal          metric.Int64Counter
+	authzCheckDuration       metric.Float64Histogram
+	backgroundFetchSkips     metric.Int64Counter
 }
 
 func newGitMetrics() *gitMetrics {
@@ -60,7 +63,31 @@ func newGitMetrics() *gitMetrics {
 		incrementalServeTotal:    metrics.NewMetric[metric.Int64Counter](meter, "cachew.git.incremental_serves_total", "{serves}", "Incremental pull-through upload-pack serve events by outcome (local_hit, fetched, fallback_fetch_failed, fallback_missing, fallback_local_error, client_gone, client_gone_after_fetch, fallback_not_our_ref) and repository"),
 		incrementalFetchDuration: metrics.NewHistogram(meter, "cachew.git.incremental_fetch_duration_seconds", "s", "Wall-clock time from upload-pack handler entry through making wanted objects available for an incremental pull-through serve, by outcome and repository", metrics.LatencyBuckets()),
 		incrementalEligibleTotal: metrics.NewMetric[metric.Int64Counter](meter, "cachew.git.incremental_eligible_total", "{requests}", "Upload-pack POSTs against a ready mirror reaching the incremental pull-through decision, by engaged and repository; engaged=true matches an incremental_serves_total increment when the feature is enabled, except for a body mixing want and want-ref, which is forwarded before any serve is recorded; engaged=false means the request bypassed the incremental path (ls-refs, want-ref only, no wants, parse failure)"),
+		authzCheckTotal:          metrics.NewMetric[metric.Int64Counter](meter, "cachew.git.authz_checks_total", "{checks}", "Per-request client authorization outcomes by outcome (public, allowed, no_credentials, rejected, probe_error, internal_error) and repository"),
+		authzCheckDuration:       metrics.NewHistogram(meter, "cachew.git.authz_check_duration_seconds", "s", "Duration of per-request client authorization checks, including any upstream probe", metrics.FastLatencyBuckets()),
+		backgroundFetchSkips:     metrics.NewMetric[metric.Int64Counter](meter, "cachew.git.background_fetch_skips_total", "{skips}", "Background fetches skipped by reason (requires_auth, backoff, probe_error) and repository"),
 	}
+}
+
+// recordAuthzCheck records the outcome and cost of a per-request client
+// authorization check. Outcome "public" means the repository is served
+// anonymously by upstream so no client check was needed.
+func (m *gitMetrics) recordAuthzCheck(ctx context.Context, repo, outcome string, duration time.Duration) {
+	attrs := metric.WithAttributes(
+		attribute.String("repository", repo),
+		attribute.String("outcome", outcome),
+	)
+	m.authzCheckTotal.Add(ctx, 1, attrs)
+	m.authzCheckDuration.Record(ctx, duration.Seconds(), attrs)
+}
+
+// recordBackgroundFetchSkip records a background fetch that was not run.
+// Reason is one of "requires_auth", "backoff", "probe_error".
+func (m *gitMetrics) recordBackgroundFetchSkip(ctx context.Context, repo, reason string) {
+	m.backgroundFetchSkips.Add(ctx, 1, metric.WithAttributes(
+		attribute.String("repository", repo),
+		attribute.String("reason", reason),
+	))
 }
 
 // recordOperation records the duration and outcome of a git operation (clone,

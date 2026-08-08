@@ -22,7 +22,7 @@ import (
 	"github.com/alecthomas/assert/v2"
 	"github.com/alecthomas/errors"
 
-	"github.com/block/cachew/client"
+	"github.com/tenstorrent/internal-cachew/client"
 )
 
 // fakeServer is a minimal /api/v1 backend for exercising the client over HTTP.

@@ -14,12 +14,12 @@ import (
 	"github.com/alecthomas/errors"
 	"github.com/alecthomas/hcl/v2"
 
-	"github.com/block/cachew/internal/cache"
-	"github.com/block/cachew/internal/logging"
-	"github.com/block/cachew/internal/metadatadb"
-	"github.com/block/cachew/internal/strategy"
-	_ "github.com/block/cachew/internal/strategy/git"   // Register git strategy
-	_ "github.com/block/cachew/internal/strategy/gomod" // Register gomod strategy
+	"github.com/tenstorrent/internal-cachew/internal/cache"
+	"github.com/tenstorrent/internal-cachew/internal/logging"
+	"github.com/tenstorrent/internal-cachew/internal/metadatadb"
+	"github.com/tenstorrent/internal-cachew/internal/strategy"
+	_ "github.com/tenstorrent/internal-cachew/internal/strategy/git"   // Register git strategy
+	_ "github.com/tenstorrent/internal-cachew/internal/strategy/gomod" // Register gomod strategy
 )
 
 type loggingMux struct {
@@ -111,11 +111,12 @@ type classifiedBlocks struct {
 	strategies []*hcl.Block
 }
 
+// apiV1Strategy is the strategy that serves the object API, which is always
+// enabled whether or not the configuration mentions it.
+const apiV1Strategy = "apiv1"
+
 func classifyBlocks(ast *hcl.AST) (*classifiedBlocks, error) {
-	result := &classifiedBlocks{
-		// Always enable the default API strategy
-		strategies: []*hcl.Block{{Name: "apiv1"}},
-	}
+	result := &classifiedBlocks{}
 	for _, node := range ast.Entries {
 		block, ok := node.(*hcl.Block)
 		if !ok {
@@ -138,6 +139,23 @@ func classifyBlocks(ast *hcl.AST) (*classifiedBlocks, error) {
 		default:
 			return nil, errors.Errorf("%s: unknown block %q (expected \"cache\", \"metadata\", or \"strategy\")", block.Pos, block.Name)
 		}
+	}
+	// A configured apiv1 block replaces the implicit one rather than adding to
+	// it: constructing the strategy twice registers its routes twice, which
+	// http.ServeMux panics on. A second explicit block would do the same, so it
+	// is rejected here rather than left to crash the server at startup.
+	explicit := 0
+	for _, block := range result.strategies {
+		if block.Name != apiV1Strategy {
+			continue
+		}
+		explicit++
+		if explicit > 1 {
+			return nil, errors.Errorf("%s: only one %s strategy block is allowed", block.Pos, apiV1Strategy)
+		}
+	}
+	if explicit == 0 {
+		result.strategies = append([]*hcl.Block{{Name: apiV1Strategy}}, result.strategies...)
 	}
 	return result, nil
 }

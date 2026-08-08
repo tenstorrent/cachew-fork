@@ -14,3 +14,4 @@ block-test.hcl
 /cachewd
 cachew-playpen-overrides.hcl
 .run/playpen.cachew.run.xml
+rust/

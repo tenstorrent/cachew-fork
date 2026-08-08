@@ -15,12 +15,12 @@ import (
 	"github.com/alecthomas/assert/v2"
 	"github.com/alecthomas/errors"
 
-	"github.com/block/cachew/internal/cache"
-	"github.com/block/cachew/internal/cache/cachetest"
-	"github.com/block/cachew/internal/logging"
-	"github.com/block/cachew/internal/metadatadb"
-	"github.com/block/cachew/internal/s3client"
-	"github.com/block/cachew/internal/s3client/s3clienttest"
+	"github.com/tenstorrent/internal-cachew/internal/cache"
+	"github.com/tenstorrent/internal-cachew/internal/cache/cachetest"
+	"github.com/tenstorrent/internal-cachew/internal/logging"
+	"github.com/tenstorrent/internal-cachew/internal/metadatadb"
+	"github.com/tenstorrent/internal-cachew/internal/s3client"
+	"github.com/tenstorrent/internal-cachew/internal/s3client/s3clienttest"
 )
 
 // seedTier writes content to a single tier directly, so tests can diverge the

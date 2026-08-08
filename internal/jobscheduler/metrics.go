@@ -4,7 +4,7 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/metric"
 
-	"github.com/block/cachew/internal/metrics"
+	"github.com/tenstorrent/internal-cachew/internal/metrics"
 )
 
 type schedulerMetrics struct {

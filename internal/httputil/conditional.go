@@ -7,7 +7,7 @@ import (
 
 	"github.com/alecthomas/errors"
 
-	"github.com/block/cachew/client"
+	"github.com/tenstorrent/internal-cachew/client"
 )
 
 // ConditionalOptions extracts conditional-request and range options from an

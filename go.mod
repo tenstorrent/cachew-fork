@@ -1,4 +1,4 @@
-module github.com/block/cachew
+module github.com/tenstorrent/internal-cachew
 
 go 1.25.5
 

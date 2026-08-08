@@ -11,9 +11,9 @@ import (
 
 	"github.com/alecthomas/errors"
 
-	"github.com/block/cachew/internal/cache"
-	"github.com/block/cachew/internal/httputil"
-	"github.com/block/cachew/internal/logging"
+	"github.com/tenstorrent/internal-cachew/internal/cache"
+	"github.com/tenstorrent/internal-cachew/internal/httputil"
+	"github.com/tenstorrent/internal-cachew/internal/logging"
 )
 
 // CacheKeyParts holds the components used to build a cache key. Path is the

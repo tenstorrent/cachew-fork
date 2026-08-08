@@ -13,9 +13,9 @@ import (
 	"github.com/alecthomas/errors"
 	"github.com/minio/minio-go/v7"
 
-	"github.com/block/cachew/internal/logging"
-	"github.com/block/cachew/internal/metadatadb"
-	"github.com/block/cachew/internal/s3client"
+	"github.com/tenstorrent/internal-cachew/internal/logging"
+	"github.com/tenstorrent/internal-cachew/internal/metadatadb"
+	"github.com/tenstorrent/internal-cachew/internal/s3client"
 )
 
 const (

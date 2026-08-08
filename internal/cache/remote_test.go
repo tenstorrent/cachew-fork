@@ -10,11 +10,11 @@ import (
 
 	"github.com/alecthomas/assert/v2"
 
-	"github.com/block/cachew/internal/cache"
-	"github.com/block/cachew/internal/cache/cachetest"
-	"github.com/block/cachew/internal/logging"
-	"github.com/block/cachew/internal/metadatadb"
-	"github.com/block/cachew/internal/strategy"
+	"github.com/tenstorrent/internal-cachew/internal/cache"
+	"github.com/tenstorrent/internal-cachew/internal/cache/cachetest"
+	"github.com/tenstorrent/internal-cachew/internal/logging"
+	"github.com/tenstorrent/internal-cachew/internal/metadatadb"
+	"github.com/tenstorrent/internal-cachew/internal/strategy"
 )
 
 func TestRemoteCache(t *testing.T) {
@@ -28,7 +28,7 @@ func TestRemoteCache(t *testing.T) {
 		t.Cleanup(func() { memCache.Close() })
 
 		mux := http.NewServeMux()
-		_, err = strategy.NewAPIV1(ctx, struct{}{}, memCache, mux)
+		_, err = strategy.NewAPIV1(ctx, strategy.APIV1Config{}, memCache, mux, nil, nil)
 		assert.NoError(t, err)
 		ts := httptest.NewServer(mux)
 		t.Cleanup(ts.Close)
@@ -52,7 +52,7 @@ func TestRemoteInvalidateSkipsRemoteAuthoritativeTier(t *testing.T) {
 
 	tiered := cache.MaybeNewTiered(ctx, []cache.Cache{lower, authoritative}, metadatadb.New(ctx, metadatadb.NewMemoryBackend()))
 	mux := http.NewServeMux()
-	_, err = strategy.NewAPIV1(ctx, struct{}{}, tiered, mux)
+	_, err = strategy.NewAPIV1(ctx, strategy.APIV1Config{}, tiered, mux, nil, nil)
 	assert.NoError(t, err)
 	ts := httptest.NewServer(mux)
 	t.Cleanup(ts.Close)
@@ -96,7 +96,7 @@ func TestRemoteCacheSoak(t *testing.T) {
 	defer memCache.Close()
 
 	mux := http.NewServeMux()
-	_, err = strategy.NewAPIV1(ctx, struct{}{}, memCache, mux)
+	_, err = strategy.NewAPIV1(ctx, strategy.APIV1Config{}, memCache, mux, nil, nil)
 	assert.NoError(t, err)
 	ts := httptest.NewServer(mux)
 	defer ts.Close()

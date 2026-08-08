@@ -12,8 +12,8 @@ import (
 
 	"github.com/alecthomas/errors"
 
-	"github.com/block/cachew/internal/logging"
-	"github.com/block/cachew/internal/metadatadb"
+	"github.com/tenstorrent/internal-cachew/internal/logging"
+	"github.com/tenstorrent/internal-cachew/internal/metadatadb"
 )
 
 // The Tiered cache combines multiple caches.

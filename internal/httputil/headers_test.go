@@ -6,7 +6,7 @@ import (
 
 	"github.com/alecthomas/assert/v2"
 
-	"github.com/block/cachew/internal/httputil"
+	"github.com/tenstorrent/internal-cachew/internal/httputil"
 )
 
 func TestFilterHeaders(t *testing.T) {

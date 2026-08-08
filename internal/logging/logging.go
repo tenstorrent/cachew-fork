@@ -106,7 +106,7 @@ func Configure(ctx context.Context, config Config) (*slog.Logger, context.Contex
 			},
 		})
 	}
-	logger := slog.New(handler)
+	logger := slog.New(&sanitizeHandler{inner: handler})
 	return logger, context.WithValue(ctx, logKey{}, logger), nil
 }
 

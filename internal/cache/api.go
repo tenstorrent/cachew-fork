@@ -11,7 +11,7 @@ import (
 	"github.com/alecthomas/errors"
 	"github.com/alecthomas/hcl/v2"
 
-	"github.com/block/cachew/client"
+	"github.com/tenstorrent/internal-cachew/client"
 )
 
 // Namespace identifies a logical partition within a cache or metadata store.

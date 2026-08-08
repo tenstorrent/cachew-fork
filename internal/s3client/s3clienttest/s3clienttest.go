@@ -61,7 +61,7 @@ func Start(t *testing.T) string {
 	return bucket
 }
 
-const modulePrefix = "github.com/block/cachew/"
+const modulePrefix = "github.com/tenstorrent/internal-cachew/"
 
 // bucketName returns a deterministic, S3-legal bucket name that
 // incorporates the calling package path and the test name. This
@@ -78,7 +78,7 @@ func bucketName(t *testing.T) string {
 	for {
 		frame, more := frames.Next()
 		if !strings.Contains(frame.Function, "s3clienttest") {
-			// frame.Function is e.g. "github.com/block/cachew/internal/cache_test.TestS3Cache"
+			// frame.Function is e.g. "github.com/tenstorrent/internal-cachew/internal/cache_test.TestS3Cache"
 			fn := strings.TrimPrefix(frame.Function, modulePrefix)
 			if idx := strings.LastIndex(fn, "."); idx >= 0 {
 				pkg = fn[:idx]

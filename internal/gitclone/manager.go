@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -17,7 +18,7 @@ import (
 
 	"github.com/alecthomas/errors"
 
-	"github.com/block/cachew/internal/logging"
+	"github.com/tenstorrent/internal-cachew/internal/logging"
 )
 
 type State int
@@ -33,6 +34,18 @@ const (
 // killed process) can leave these behind, so they are skipped and removed by
 // DiscoverExisting on startup.
 const cloneTempPrefix = ".clone-"
+
+const (
+	// DefaultFetchInterval is the cadence used when Config.FetchInterval is
+	// unset, and the base of the background fetch backoff.
+	DefaultFetchInterval = 15 * time.Minute
+
+	// MaxFetchBackoff caps the backoff between failed background fetches. An
+	// hour is long enough that a permanently broken mirror (deleted upstream,
+	// revoked credentials) costs almost nothing, while still recovering
+	// reasonably promptly once upstream is healthy again.
+	MaxFetchBackoff = time.Hour
+)
 
 func (s State) String() string {
 	switch s {
@@ -95,6 +108,7 @@ type Repository struct {
 	refCheckErr        error
 	refCheckErrAt      time.Time // set when a ref check fails; gates the failure backoff
 	refCheckInFlight   chan struct{}
+	fetchFailures      int
 	fetchSem           chan struct{}
 	credentialProvider CredentialProvider
 	lsRemoteRuns       atomic.Int64
@@ -132,7 +146,7 @@ func NewManager(ctx context.Context, config Config, credentialProvider Credentia
 	}
 
 	if config.FetchInterval == 0 {
-		config.FetchInterval = 15 * time.Minute
+		config.FetchInterval = DefaultFetchInterval
 	}
 
 	if config.RefCheckInterval == 0 {
@@ -314,7 +328,14 @@ func RepoPathFromURL(upstreamURL string) (string, error) {
 	if err != nil {
 		return "", errors.Wrap(err, "parse upstream URL")
 	}
-	return filepath.Join(parsed.Host, strings.TrimSuffix(parsed.Path, ".git")), nil
+	repoPath := filepath.Join(parsed.Host, strings.TrimSuffix(parsed.Path, ".git"))
+	// Host and path both usually originate in a client-supplied request target,
+	// and Join collapses "..", so a traversal in either can walk out of the root
+	// every caller joins this onto. Refuse instead of silently resolving.
+	if repoPath == ".." || strings.HasPrefix(repoPath, ".."+string(filepath.Separator)) || filepath.IsAbs(repoPath) {
+		return "", errors.Errorf("upstream URL %q resolves outside the mirror root", upstreamURL)
+	}
+	return repoPath, nil
 }
 
 func (m *Manager) clonePathForURL(upstreamURL string) (string, error) {
@@ -366,6 +387,52 @@ func (r *Repository) NeedsFetch(fetchInterval time.Duration) bool {
 // (e.g. WithFetchExclusion's snapshot tar).
 func (r *Repository) FetchInFlight() bool {
 	return r.fetchActive.Load()
+}
+
+// FetchFailures returns the number of consecutive failed fetches.
+func (r *Repository) FetchFailures() int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.fetchFailures
+}
+
+// BackgroundFetchBackoff returns how much longer a background fetch must be
+// deferred after consecutive fetch failures, or zero if one may run now. The
+// backoff starts at base and doubles per failure up to MaxFetchBackoff; a
+// successful fetch clears it.
+func (r *Repository) BackgroundFetchBackoff(base time.Duration) time.Duration {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	backoff := FetchBackoff(base, r.fetchFailures)
+	if backoff == 0 {
+		return 0
+	}
+	remaining := backoff - time.Since(r.lastFetchAttempt)
+	if remaining < 0 {
+		return 0
+	}
+	return remaining
+}
+
+// FetchBackoff returns the interval to wait after the given number of
+// consecutive fetch failures, starting at base and doubling per failure,
+// capped at MaxFetchBackoff. Zero failures means no backoff, so healthy
+// mirrors keep their normal cadence.
+func FetchBackoff(base time.Duration, failures int) time.Duration {
+	if failures <= 0 {
+		return 0
+	}
+	if base <= 0 {
+		base = DefaultFetchInterval
+	}
+	backoff := base
+	for range failures - 1 {
+		if backoff >= MaxFetchBackoff {
+			break
+		}
+		backoff *= 2
+	}
+	return min(backoff, MaxFetchBackoff)
 }
 
 func (r *Repository) WithReadLock(fn func() error) error {
@@ -736,17 +803,33 @@ func (r *Repository) executeFetch(ctx context.Context, enforceSpeedLimit bool) e
 	}
 	output, err := cmd.CombinedOutput()
 	if err != nil {
+		r.recordFetchOutcome(false)
 		return errors.Wrapf(err, "git fetch: %s", string(output))
 	}
 
+	r.recordFetchOutcome(true)
 	r.mu.Lock()
-	r.lastFetch = time.Now()
 	// Drop any cached ref-staleness verdict so the next check reopens instead of
 	// serving a stale "behind" result for the rest of the interval. This also
 	// clears a cached failure, since upstream is now known reachable.
 	r.invalidateRefCheckLocked()
 	r.mu.Unlock()
 	return nil
+}
+
+// recordFetchOutcome updates the fetch bookkeeping that drives background
+// backoff. Consecutive failures accumulate so BackgroundFetchBackoff can
+// lengthen the retry interval; success resets to the normal cadence.
+func (r *Repository) recordFetchOutcome(success bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.lastFetchAttempt = time.Now()
+	if !success {
+		r.fetchFailures++
+		return
+	}
+	r.fetchFailures = 0
+	r.lastFetch = time.Now()
 }
 
 // EnsureRefsUpToDate checks whether the local mirror's refs match upstream.
@@ -955,14 +1038,27 @@ func (r *Repository) missingCommitsLocked(ctx context.Context, commits []string)
 		if sha == "" {
 			continue
 		}
-		// #nosec G204 - r.path and sha are controlled by us
-		cmd := exec.CommandContext(ctx, "git", "-C", r.path, "cat-file", "-e", sha)
+		// Callers pass client-supplied strings here, so anything that is not an
+		// object name is reported missing without forking git: that both keeps
+		// arbitrary revisions (and revision syntax such as "HEAD^{/regex}" or
+		// ":/text") out of the argument list and denies a caller a free existence
+		// oracle over the whole revision namespace.
+		if !objectNameRe.MatchString(sha) {
+			missing = append(missing, sha)
+			continue
+		}
+		// #nosec G204 - r.path is ours and sha is a validated object name
+		cmd := exec.CommandContext(ctx, "git", "-C", r.path, "cat-file", "-e", "--end-of-options", sha)
 		if err := cmd.Run(); err != nil {
 			missing = append(missing, sha)
 		}
 	}
 	return missing
 }
+
+// objectNameRe matches the object names git prints: 40 hex digits for SHA-1
+// repositories, 64 for SHA-256 ones.
+var objectNameRe = regexp.MustCompile(`^[0-9a-f]{40}([0-9a-f]{24})?$`)
 
 // refsSatisfied reports whether every ref in expect is present in localRefs at
 // the expected SHA (or at any SHA when the expected SHA is empty).
@@ -1075,8 +1171,10 @@ func (r *Repository) HasCommit(ctx context.Context, ref string) bool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
-	// #nosec G204 - r.path and ref are controlled by us
-	cmd := exec.CommandContext(ctx, "git", "-C", r.path, "cat-file", "-e", ref)
+	// ref may originate from a request, so --end-of-options keeps it in revision
+	// position no matter what it starts with.
+	// #nosec G204 - r.path is ours and ref cannot be read as an option
+	cmd := exec.CommandContext(ctx, "git", "-C", r.path, "cat-file", "-e", "--end-of-options", ref)
 	err := cmd.Run()
 	return err == nil
 }

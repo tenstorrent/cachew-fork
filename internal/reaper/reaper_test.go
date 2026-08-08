@@ -11,8 +11,8 @@ import (
 
 	"github.com/alecthomas/assert/v2"
 
-	"github.com/block/cachew/internal/logging"
-	"github.com/block/cachew/internal/reaper"
+	"github.com/tenstorrent/internal-cachew/internal/logging"
+	"github.com/tenstorrent/internal-cachew/internal/reaper"
 )
 
 func testContext(t *testing.T) context.Context {

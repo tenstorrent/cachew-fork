@@ -10,9 +10,9 @@ import (
 	"github.com/alecthomas/assert/v2"
 	"github.com/alecthomas/hcl/v2"
 
-	"github.com/block/cachew/internal/cache"
-	"github.com/block/cachew/internal/logging"
-	"github.com/block/cachew/internal/strategy"
+	"github.com/tenstorrent/internal-cachew/internal/cache"
+	"github.com/tenstorrent/internal-cachew/internal/logging"
+	"github.com/tenstorrent/internal-cachew/internal/strategy"
 )
 
 // Regression test for the upstream github.com/alecthomas/hcl/v2 bug where

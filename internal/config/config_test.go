@@ -10,10 +10,10 @@ import (
 	"github.com/alecthomas/assert/v2"
 	"github.com/alecthomas/hcl/v2"
 
-	"github.com/block/cachew/internal/cache"
-	"github.com/block/cachew/internal/logging"
-	"github.com/block/cachew/internal/metadatadb"
-	"github.com/block/cachew/internal/strategy"
+	"github.com/tenstorrent/internal-cachew/internal/cache"
+	"github.com/tenstorrent/internal-cachew/internal/logging"
+	"github.com/tenstorrent/internal-cachew/internal/metadatadb"
+	"github.com/tenstorrent/internal-cachew/internal/strategy"
 )
 
 func TestUnwrapBlock(t *testing.T) {
@@ -237,4 +237,59 @@ func TestLoadRequiresMetadataBackend(t *testing.T) {
 	_, _, err = Load(ctx, cr, mr, sr, ast, http.NewServeMux(), nil)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "expected a metadata backend")
+}
+
+// TestLoadAPIV1Block pins that the object API can be configured explicitly. The
+// strategy is enabled implicitly, so an explicit block must replace that
+// implicit one rather than adding a second: building apiv1 twice registers its
+// routes twice, which http.ServeMux panics on.
+func TestLoadAPIV1Block(t *testing.T) {
+	tests := []struct {
+		name    string
+		config  string
+		wantErr bool
+	}{
+		{name: "ImplicitWhenAbsent", config: ""},
+		{name: "ExplicitEmpty", config: `strategy apiv1 {}`},
+		{name: "ExplicitFlagAccepted", config: `strategy apiv1 { disable-git-object-authz = true }`},
+		{name: "ExplicitFlagAlongsideOtherStrategies",
+			config: "strategy hermit {}\nstrategy apiv1 { disable-git-object-authz = true }"},
+		{name: "DuplicateExplicitRejected", config: "strategy apiv1 {}\nstrategy apiv1 {}", wantErr: true},
+		{name: "DuplicateExplicitWithFlagRejected",
+			config: "strategy apiv1 {}\nstrategy apiv1 { disable-git-object-authz = true }", wantErr: true},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			source := "cache memory {}\nmetadata memory {}\n" + test.config + "\n"
+			ast, err := hcl.Parse(strings.NewReader(source))
+			assert.NoError(t, err)
+
+			classified, err := classifyBlocks(ast)
+			if test.wantErr {
+				assert.Error(t, err)
+				return
+			}
+			assert.NoError(t, err)
+			apiV1Blocks := 0
+			for _, block := range classified.strategies {
+				if block.Name == apiV1Strategy {
+					apiV1Blocks++
+				}
+			}
+			assert.Equal(t, 1, apiV1Blocks)
+
+			cr := cache.NewRegistry()
+			cache.RegisterMemory(cr)
+			mr := metadatadb.NewRegistry()
+			metadatadb.RegisterMemory(mr)
+			sr := strategy.NewRegistry()
+			strategy.RegisterAPIV1(sr, nil)
+			strategy.RegisterHermit(sr)
+
+			ctx := logging.ContextWithLogger(context.Background(), slog.Default())
+			_, _, err = Load(ctx, cr, mr, sr, ast, http.NewServeMux(), nil)
+			assert.NoError(t, err)
+		})
+	}
 }

@@ -9,7 +9,7 @@ import (
 	"github.com/alecthomas/errors"
 	"github.com/minio/minio-go/v7"
 
-	"github.com/block/cachew/client"
+	"github.com/tenstorrent/internal-cachew/client"
 )
 
 // minRangePartSize is the smallest per-request part worth fetching in

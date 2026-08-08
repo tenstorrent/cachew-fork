@@ -8,7 +8,7 @@ import (
 
 	"github.com/alecthomas/errors"
 
-	"github.com/block/cachew/internal/gitclone"
+	"github.com/tenstorrent/internal-cachew/internal/gitclone"
 )
 
 // uploadPackParseLimit bounds CPU and memory spent on hostile request bodies.

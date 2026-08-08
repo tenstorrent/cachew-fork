@@ -11,8 +11,8 @@ import (
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 
-	"github.com/block/cachew/internal/gitclone"
-	"github.com/block/cachew/internal/logging"
+	"github.com/tenstorrent/internal-cachew/internal/gitclone"
+	"github.com/tenstorrent/internal-cachew/internal/logging"
 )
 
 // EnsureRefsPath is the URL suffix for the ref-freshness endpoint. Clients

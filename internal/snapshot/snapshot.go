@@ -15,12 +15,12 @@ import (
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 
-	"github.com/block/cachew/client"
-	"github.com/block/cachew/internal/cache"
+	"github.com/tenstorrent/internal-cachew/client"
+	"github.com/tenstorrent/internal-cachew/internal/cache"
 )
 
 //nolint:gochecknoglobals // OTel tracer instances are package-scoped by convention
-var tracer = otel.Tracer("github.com/block/cachew/internal/snapshot")
+var tracer = otel.Tracer("github.com/tenstorrent/internal-cachew/internal/snapshot")
 
 // Create archives a directory using tar with zstd compression, then uploads to the cache.
 //

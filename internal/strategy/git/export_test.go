@@ -6,13 +6,20 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/block/cachew/internal/cache"
-	"github.com/block/cachew/internal/gitclone"
+	"github.com/tenstorrent/internal-cachew/internal/gitclone"
+	"github.com/tenstorrent/internal-cachew/internal/gitobject"
 )
 
 // Exports unexported symbols for use by external test packages.
 
 func IsGitRequest(pathValue string) bool { return isGitRequest(pathValue) }
+
+// SetServiceToken installs a stand-in for cachew's own GitHub App credentials,
+// so tests can observe which upstream requests they are attached to without a
+// real GitHub App.
+func (s *Strategy) SetServiceToken(resolve func(ctx context.Context, org string) (string, error)) {
+	s.serviceToken = resolve
+}
 
 func (s *Strategy) GenerateAndUploadSnapshot(ctx context.Context, repo *gitclone.Repository) error {
 	_, err := s.generateAndUploadSnapshot(ctx, repo)
@@ -32,8 +39,8 @@ func (s *Strategy) RunCoordinatedSnapshot(ctx context.Context, repo *gitclone.Re
 }
 
 // CacheBundle exports cacheBundle for testing.
-func (s *Strategy) CacheBundle(ctx context.Context, key cache.Key, r io.Reader) error {
-	return s.cacheBundle(ctx, key, r)
+func (s *Strategy) CacheBundle(ctx context.Context, bundle gitobject.Object, r io.Reader) error {
+	return s.cacheBundle(ctx, bundle, r)
 }
 
 // IsUploadPackPost exports isUploadPackPost for testing.

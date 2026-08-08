@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/block/cachew/internal/tracing"
+	"github.com/tenstorrent/internal-cachew/internal/tracing"
 )
 
 // New is a no-op when disabled and must return a non-nil stop function.
