@@ -259,9 +259,28 @@ log {
 }
 
 metrics {
-  service-name = "cachew"
+  service-name     = "cachew"
+  cardinality-limit = 2000  # default; caps distinct attribute sets per instrument per collection cycle
 }
 ```
+
+Instruments labeled by something with unbounded lifetime cardinality (e.g. `repository`) keep every attribute set
+they have ever seen for the life of the process — the OTel Go SDK has no way to forget one. Past `cardinality-limit`,
+new attribute sets are dropped from that instrument and aggregated into a synthetic `otel.metric.overflow="true"`
+series instead of growing memory without bound. `0` or negative disables the limit.
+
+Storage usage is measured periodically and exported as gauges:
+
+| Series | Labels | Meaning |
+| --- | --- | --- |
+| `cachew_storage_bytes` | `component` (`git_mirrors`, `object_cache`) | On-disk bytes per component; total cachew usage is `sum(cachew_storage_bytes)` |
+| `cachew_storage_capacity_bytes` | `component` | Configured limit, for components that have one |
+| `cachew_storage_repo_bytes` | `repository` | On-disk bytes of each mirrored repository |
+
+Mirror sizes require walking each mirror directory, so the scan is periodic rather than continuous. It runs on its own
+goroutine rather than the shared job-scheduler worker pool, so it never delays a fetch or clone. Tune or disable it
+with `git { storage-scan-interval = "15m" }`; `0` or negative disables storage measurement. Sizes are apparent file sizes rather
+than allocated blocks, and the `object_cache` series is absent for backends that cannot report stats cheaply (S3).
 
 Admin endpoints: `/_liveness`, `/_readiness`, `PUT /admin/log/level`, `/admin/pprof/`.
 

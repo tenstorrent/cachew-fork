@@ -32,6 +32,11 @@ type Config struct {
 	OTLPEndpoint       string `hcl:"otlp-endpoint" help:"OTLP endpoint URL." default:"http://localhost:4318"`
 	OTLPInsecure       bool   `hcl:"otlp-insecure" help:"Use insecure connection for OTLP." default:"false"`
 	OTLPExportInterval int    `hcl:"otlp-export-interval" help:"OTLP export interval in seconds." default:"60"`
+	// The OTel Go SDK has no API to forget an attribute set once recorded (see
+	// the upstream TODO in sdk/metric/internal/aggregate/lastvalue.go), so an
+	// unbounded label like a repository name grows memory for the life of the
+	// process without this.
+	CardinalityLimit int `hcl:"cardinality-limit,optional" help:"Maximum distinct attribute sets tracked per instrument per collection cycle. 0 or negative disables the limit." default:"2000"`
 }
 
 // Client provides OpenTelemetry metrics with configurable exporters.
@@ -108,6 +113,9 @@ func New(ctx context.Context, cfg Config) (*Client, error) {
 	// Create meter provider with all configured readers
 	providerOpts := []sdkmetric.Option{
 		sdkmetric.WithResource(res),
+	}
+	if cfg.CardinalityLimit > 0 {
+		providerOpts = append(providerOpts, sdkmetric.WithCardinalityLimit(cfg.CardinalityLimit))
 	}
 	for _, reader := range readers {
 		providerOpts = append(providerOpts, sdkmetric.WithReader(reader))

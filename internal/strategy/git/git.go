@@ -59,6 +59,8 @@ type Config struct {
 	IncrementalPullthrough  bool          `hcl:"incremental-pullthrough,optional" help:"Serve partially-cached upload-pack requests by fetching only missing objects into the local mirror instead of proxying the full response from upstream. When enabled, upload-pack bodies are capped at 8 MiB (2× the parse limit); larger bodies receive 413." default:"true"`
 	IncrementalFetchTimeout time.Duration `hcl:"incremental-fetch-timeout,optional" help:"Upper bound on the synchronous request-path fetch performed by incremental pull-through. The coalescing and verified attempts share this budget, and the coalescing attempt is capped at half so a verified retry still has room. On timeout the request falls back to upstream. Each underlying git fetch also honors fetch-timeout, and the preceding ref-staleness check is bounded separately by ls-remote-timeout." default:"2m"`
 
+	StorageScanInterval time.Duration `hcl:"storage-scan-interval,optional" help:"How often to measure on-disk storage usage for the cachew_storage_* metrics. Each scan walks every mirror directory, so raise it if the mirror set is large. 0 or negative disables storage measurement." default:"15m"`
+
 	DisableUpstreamAuthz bool `hcl:"disable-upstream-authz,optional" help:"Disable all upstream authorization probing: per-request client authorization and the skip of proactive background refresh for auth-required repos. Unsafe: any client that can reach cachew can then read any mirrored private repo." default:"false"`
 }
 
@@ -121,6 +123,7 @@ type Strategy struct {
 	deferredRestoreOnce sync.Map                                              // keyed by upstream URL, ensures at most one deferred restore per repo
 	forcedFetches       sync.Map                                              // keyed by upstream URL, ensures at most one cooldown-bypassing fetch is queued per repo
 	metrics             *gitMetrics
+	storage             *storageMetrics
 	repoCounts          *RepoCounts
 	snapshotCoord       *SnapshotCoordinator
 	metadataWired       chan struct{} // closed by SetMetadataStore; gates warm-up
@@ -227,6 +230,7 @@ func New(
 		scheduler:     scheduler.WithQueuePrefix("git"),
 		spools:        make(map[string]*RepoSpools),
 		metrics:       m,
+		storage:       newStorageMetrics(),
 		metadataWired: make(chan struct{}),
 	}
 	if tokenManager != nil {
@@ -265,9 +269,10 @@ func New(
 		if err := s.warmExistingRepos(warmCtx); err != nil {
 			logger.WarnContext(warmCtx, "Failed to warm existing repos", "error", err)
 		}
-		// After warm-up, so the evictor sees every discovered mirror and its
-		// restored last-served time rather than an empty map.
+		// After warm-up so the evictor, and the storage sampler's first scan,
+		// see every discovered mirror rather than an empty map.
 		s.scheduleIdleMirrorEvictor()
+		s.scheduleStorageSampler()
 		s.ready.Store(true)
 		logger.InfoContext(warmCtx, "Git strategy ready")
 	}()
