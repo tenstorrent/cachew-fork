@@ -742,3 +742,96 @@ func TestJobSchedulerCloneConcurrencyLimit(t *testing.T) {
 		return cloneCompleted.Load() == 4
 	}, "all clone jobs should eventually complete")
 }
+
+func TestJobSchedulerPeriodicRegistrationIsIdempotent(t *testing.T) {
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{Level: "error"})
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	scheduler := newTestScheduler(ctx, t, jobscheduler.Config{Concurrency: 4})
+
+	var single, doubled atomic.Int32
+	scheduler.SubmitPeriodicJob("queue-single", "periodic", 20*time.Millisecond, func(_ context.Context) error {
+		single.Add(1)
+		return nil
+	})
+	// The git strategy registers the same maintenance jobs for a repository
+	// from several code paths, so the duplicate registration below is the shape
+	// that used to silently multiply a job's real rate.
+	for range 4 {
+		scheduler.SubmitPeriodicJob("queue-doubled", "periodic", 20*time.Millisecond, func(_ context.Context) error {
+			doubled.Add(1)
+			return nil
+		})
+	}
+
+	eventually(t, 2*time.Second, func() bool { return single.Load() >= 5 },
+		"singly-registered job should fire repeatedly")
+
+	// Compare against the singly-registered job rather than a wall-clock count:
+	// both queues run under the same scheduler and timing, so a chain-per-
+	// registration would show up as a multiple here regardless of machine speed.
+	got, want := doubled.Load(), single.Load()
+	assert.True(t, got <= want+2,
+		"four registrations should not outpace one: got %d runs vs %d for a single registration", got, want)
+}
+
+func TestJobSchedulerCancelPeriodicJobStopsChain(t *testing.T) {
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{Level: "error"})
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	scheduler := newTestScheduler(ctx, t, jobscheduler.Config{Concurrency: 2})
+
+	var executions atomic.Int32
+	scheduler.SubmitPeriodicJob("queue1", "periodic", 20*time.Millisecond, func(_ context.Context) error {
+		executions.Add(1)
+		return nil
+	})
+	eventually(t, time.Second, func() bool { return executions.Load() >= 2 },
+		"periodic job should fire before cancel")
+
+	scheduler.CancelPeriodicJob("queue1", "periodic")
+	// Let any in-flight run and its re-arm timer land before sampling.
+	time.Sleep(100 * time.Millisecond)
+	before := executions.Load()
+	time.Sleep(300 * time.Millisecond)
+	assert.Equal(t, before, executions.Load(),
+		"periodic job should not fire after being cancelled")
+}
+
+func TestJobSchedulerCancelledPeriodicJobCanBeReRegistered(t *testing.T) {
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{Level: "error"})
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	scheduler := newTestScheduler(ctx, t, jobscheduler.Config{Concurrency: 2})
+
+	var executions atomic.Int32
+	run := func(_ context.Context) error {
+		executions.Add(1)
+		return nil
+	}
+	scheduler.SubmitPeriodicJob("queue1", "periodic", 20*time.Millisecond, run)
+	eventually(t, time.Second, func() bool { return executions.Load() >= 2 }, "job should fire before cancel")
+
+	scheduler.CancelPeriodicJob("queue1", "periodic")
+	time.Sleep(100 * time.Millisecond)
+	afterCancel := executions.Load()
+
+	// A repository that is evicted and later requested again re-registers its
+	// maintenance jobs, so cancellation must not poison the key permanently.
+	scheduler.SubmitPeriodicJob("queue1", "periodic", 20*time.Millisecond, run)
+	eventually(t, time.Second, func() bool { return executions.Load() > afterCancel },
+		"re-registered job should run again after cancellation")
+}
+
+func TestJobSchedulerCancelPeriodicJobIsSafeWhenAbsent(t *testing.T) {
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{Level: "error"})
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	scheduler := newTestScheduler(ctx, t, jobscheduler.Config{Concurrency: 2})
+	scheduler.CancelPeriodicJob("never-registered", "periodic")
+	assert.False(t, scheduler.QueueActive("never-registered"))
+}

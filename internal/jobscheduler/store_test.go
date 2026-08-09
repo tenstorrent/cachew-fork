@@ -185,3 +185,22 @@ func TestPeriodicJobRecordsLastRun(t *testing.T) {
 	assert.True(t, found, "last run should be recorded")
 	assert.True(t, !lastRun.Before(before), "last run should be at or after test start")
 }
+
+func TestScheduleStoreDeleteLastRun(t *testing.T) {
+	store, err := jobscheduler.NewScheduleStore(filepath.Join(t.TempDir(), "scheduler.db"))
+	assert.NoError(t, err)
+	defer store.Close()
+
+	assert.NoError(t, store.SetLastRun("periodic:queue1", time.Now()))
+	_, found, err := store.GetLastRun("periodic:queue1")
+	assert.NoError(t, err)
+	assert.True(t, found)
+
+	assert.NoError(t, store.DeleteLastRun("periodic:queue1"))
+	_, found, err = store.GetLastRun("periodic:queue1")
+	assert.NoError(t, err)
+	assert.False(t, found, "deleted key should not be found")
+
+	// A cancelled job may be cancelled again, or never have run at all.
+	assert.NoError(t, store.DeleteLastRun("periodic:queue1"), "deleting an absent key should succeed")
+}

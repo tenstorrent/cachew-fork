@@ -51,7 +51,22 @@ type Scheduler interface {
 	// SubmitPeriodicJob submits a job to the queue that runs immediately, and then periodically after the interval.
 	//
 	// Jobs run concurrently across queues, but never within a queue.
+	//
+	// Registration is idempotent per (queue, id): a second call while the first
+	// chain is still live is a no-op rather than a second chain. Callers such as
+	// the git strategy re-register the same maintenance jobs from several code
+	// paths for the same repository, and without this each registration would
+	// add an independent self-re-arming chain, multiplying the job's real rate.
 	SubmitPeriodicJob(queue, id string, interval time.Duration, run func(ctx context.Context) error)
+	// CancelPeriodicJob stops the periodic chain for (queue, id) and drops any
+	// pending run of it that has not started yet. A run already in progress is
+	// left to finish. Cancelling a job that is not registered is a no-op, and a
+	// later SubmitPeriodicJob for the same key starts a fresh chain.
+	CancelPeriodicJob(queue, id string)
+	// QueueActive reports whether the queue currently has a job executing. Use
+	// it after CancelPeriodicJob to tell "no more runs will start" apart from
+	// "no run is happening right now".
+	QueueActive(queue string) bool
 }
 
 type prefixedScheduler struct {
@@ -65,6 +80,14 @@ func (p *prefixedScheduler) Submit(queue, id string, run func(ctx context.Contex
 
 func (p *prefixedScheduler) SubmitPeriodicJob(queue, id string, interval time.Duration, run func(ctx context.Context) error) {
 	p.scheduler.SubmitPeriodicJob(p.prefix+queue, id, interval, run)
+}
+
+func (p *prefixedScheduler) CancelPeriodicJob(queue, id string) {
+	p.scheduler.CancelPeriodicJob(p.prefix+queue, id)
+}
+
+func (p *prefixedScheduler) QueueActive(queue string) bool {
+	return p.scheduler.QueueActive(p.prefix + queue)
 }
 
 func (p *prefixedScheduler) WithQueuePrefix(prefix string) Scheduler {
@@ -89,10 +112,17 @@ type RootScheduler struct {
 	ctx    context.Context //nolint:containedctx
 	cancel context.CancelFunc
 	// drain is closed by Drain so intake stops while workers keep running.
-	drain   chan struct{}
-	wg      sync.WaitGroup
-	store   ScheduleStore
-	metrics *schedulerMetrics
+	drain chan struct{}
+	// periodic maps the key of each live periodic chain to its generation.
+	// Presence means "a chain owns this key"; the generation lets a chain that
+	// was cancelled and then re-registered distinguish its own timers from
+	// those of the previous incarnation, so a straggler timer from the old
+	// chain exits instead of resurrecting it.
+	periodic    map[string]uint64
+	periodicSeq uint64
+	wg          sync.WaitGroup
+	store       ScheduleStore
+	metrics     *schedulerMetrics
 }
 
 var _ Scheduler = &RootScheduler{}
@@ -131,6 +161,7 @@ func New(ctx context.Context, config Config) (*RootScheduler, error) {
 		store:               store,
 		metrics:             m,
 		drain:               make(chan struct{}),
+		periodic:            make(map[string]uint64),
 	}
 	q.cond = sync.NewCond(&q.lock)
 	ctx, cancel := context.WithCancel(ctx)
@@ -195,8 +226,32 @@ func (q *RootScheduler) SubmitPeriodicJob(queue, id string, interval time.Durati
 		return
 	}
 	key := jobKey(queue, id)
+	q.lock.Lock()
+	if _, live := q.periodic[key]; live {
+		// A chain already owns this key. Registering again would create a
+		// second self-re-arming chain that serialises against the first but
+		// doubles its rate, so leave the existing one alone.
+		q.lock.Unlock()
+		return
+	}
+	q.periodicSeq++
+	gen := q.periodicSeq
+	q.periodic[key] = gen
+	q.lock.Unlock()
+	q.armPeriodic(queue, id, key, gen, interval, run)
+}
+
+// armPeriodic schedules one firing of a periodic chain and, once it has run,
+// the timer for the next. It is separate from SubmitPeriodicJob because the
+// re-arm must not go back through that function's idempotency check: the chain
+// still owns its key while re-arming, so routing the re-arm through the public
+// entry point would make it a no-op and the chain would stop after one run.
+func (q *RootScheduler) armPeriodic(queue, id, key string, gen uint64, interval time.Duration, run func(ctx context.Context) error) {
 	delay := q.periodicDelay(key, interval)
 	submit := func() {
+		if !q.periodicCurrent(key, gen) {
+			return
+		}
 		q.Submit(queue, id, func(ctx context.Context) error {
 			err := run(ctx)
 			if q.store != nil {
@@ -209,7 +264,7 @@ func (q *RootScheduler) SubmitPeriodicJob(queue, id string, interval time.Durati
 			// to wake and submit to a dead scheduler. The new pod's
 			// warmExistingRepos re-registers periodic jobs on startup.
 			go q.sleepThenSubmit(interval, func() {
-				q.SubmitPeriodicJob(queue, id, interval, run)
+				q.armPeriodic(queue, id, key, gen, interval, run)
 			})
 			return errors.WithStack(err)
 		})
@@ -219,6 +274,53 @@ func (q *RootScheduler) SubmitPeriodicJob(queue, id string, interval time.Durati
 		return
 	}
 	go q.sleepThenSubmit(delay, submit)
+}
+
+// periodicCurrent reports whether the chain identified by gen still owns key.
+// A cancelled chain, or one superseded by a later registration, does not.
+func (q *RootScheduler) periodicCurrent(key string, gen uint64) bool {
+	q.lock.Lock()
+	defer q.lock.Unlock()
+	current, live := q.periodic[key]
+	return live && current == gen
+}
+
+// CancelPeriodicJob stops the chain for (queue, id) and discards any run of it
+// still waiting in the queue. A run already executing is left to finish: jobs
+// receive the scheduler-wide context and there is no per-job cancellation, so
+// callers that need the job to be finished as well should check QueueActive.
+func (q *RootScheduler) CancelPeriodicJob(queue, id string) {
+	key := jobKey(queue, id)
+	q.lock.Lock()
+	delete(q.periodic, key)
+	pending := q.queue[:0]
+	for _, job := range q.queue {
+		if job.queue == queue && job.id == id {
+			continue
+		}
+		pending = append(pending, job)
+	}
+	q.queue = pending
+	q.metrics.queueDepth.Record(context.Background(), int64(len(q.queue)))
+	q.lock.Unlock()
+
+	// Drop the last-run stamp too. Leaving it behind would make a later
+	// re-registration of the same key sit out most of an interval before its
+	// first run, which for a re-cloned repository means its maintenance jobs
+	// silently skip their first cycle.
+	if q.store != nil {
+		if err := q.store.DeleteLastRun(key); err != nil {
+			logging.FromContext(q.ctx).WarnContext(q.ctx, "Failed to drop job last run", "key", key, "error", err)
+		}
+	}
+}
+
+// QueueActive reports whether a job is currently executing on the queue.
+func (q *RootScheduler) QueueActive(queue string) bool {
+	q.lock.Lock()
+	defer q.lock.Unlock()
+	_, active := q.active[queue]
+	return active
 }
 
 func (q *RootScheduler) isDraining() bool {

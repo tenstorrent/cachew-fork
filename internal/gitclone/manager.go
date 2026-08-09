@@ -85,6 +85,8 @@ type Config struct {
 	LsRemoteTimeout  time.Duration `hcl:"ls-remote-timeout,optional" help:"Upper bound for 'git ls-remote' so a slow upstream cannot block the request path indefinitely." default:"1m"`
 	RepackTimeout    time.Duration `hcl:"repack-timeout,optional" help:"Upper bound for 'git repack' so a slow repack on a large repository cannot block the scheduler queue indefinitely." default:"10m"`
 	RepackThreads    int           `hcl:"repack-threads,optional" help:"Threads for git repack operations. Limits memory since windowMemory and deltaCacheSize are per-thread. 0 = pack-threads." default:"4"`
+	MirrorTTL        time.Duration `hcl:"mirror-ttl,optional" help:"Delete a mirrored repository that no client has requested for this long. Its next request re-clones it, so keep this well above mirror-snapshot-interval or eviction turns a warm serve into a cold one. 0 disables idle eviction." default:"0"`
+	MirrorEvictScan  time.Duration `hcl:"mirror-evict-scan,optional" help:"How often to scan mirrors for idle eviction. Ignored when mirror-ttl is 0." default:"1h"`
 }
 
 // CredentialProvider provides credentials for git operations.
@@ -113,6 +115,16 @@ type Repository struct {
 	credentialProvider CredentialProvider
 	lsRemoteRuns       atomic.Int64
 	fetchActive        atomic.Bool // true while an executeFetch call is running
+	// serves counts client requests currently reading this mirror. The
+	// upload-pack path deliberately takes no lock — a read lock held for the
+	// length of a clone stream would block every fetch — so this counter is
+	// the only thing that can tell an evictor the directory is still in use.
+	serves int
+	// evicting closes the admission gate while the repository is being
+	// removed, so a request arriving mid-eviction re-clones rather than
+	// reading a directory about to be renamed out from under it.
+	evicting   bool
+	lastServed time.Time
 }
 
 type Manager struct {
@@ -121,6 +133,7 @@ type Manager struct {
 	clones             map[string]*Repository
 	clonesMu           sync.RWMutex
 	credentialProvider CredentialProvider
+	lastServed         *lastServedStore
 }
 
 // ManagerProvider is a function that lazily creates a singleton Manager.
@@ -173,6 +186,10 @@ func NewManager(ctx context.Context, config Config, credentialProvider Credentia
 		config.RepackTimeout = 10 * time.Minute
 	}
 
+	if config.MirrorEvictScan == 0 {
+		config.MirrorEvictScan = time.Hour
+	}
+
 	if err := os.MkdirAll(config.MirrorRoot, 0o750); err != nil {
 		return nil, errors.Wrap(err, "create root directory")
 	}
@@ -191,6 +208,7 @@ func NewManager(ctx context.Context, config Config, credentialProvider Credentia
 		gitTuningConfig:    DefaultGitTuningConfig(),
 		clones:             make(map[string]*Repository),
 		credentialProvider: credentialProvider,
+		lastServed:         loadLastServedStore(config.MirrorRoot),
 	}, nil
 }
 
@@ -226,6 +244,7 @@ func (m *Manager) GetOrCreate(_ context.Context, upstreamURL string) (*Repositor
 		upstreamURL:        upstreamURL,
 		fetchSem:           make(chan struct{}, 1),
 		credentialProvider: m.credentialProvider,
+		lastServed:         m.seedLastServed(upstreamURL),
 	}
 
 	headFile := filepath.Join(clonePath, "HEAD")
@@ -243,6 +262,167 @@ func (m *Manager) Get(upstreamURL string) *Repository {
 	m.clonesMu.RLock()
 	defer m.clonesMu.RUnlock()
 	return m.clones[upstreamURL]
+}
+
+// All returns the currently known repositories.
+func (m *Manager) All() []*Repository {
+	m.clonesMu.RLock()
+	defer m.clonesMu.RUnlock()
+	repos := make([]*Repository, 0, len(m.clones))
+	for _, repo := range m.clones {
+		repos = append(repos, repo)
+	}
+	return repos
+}
+
+// seedLastServed returns the recorded last-served time for a repository, or
+// the current time if there is none. Treating an unrecorded repository as
+// freshly served is the safe default: mirrors that predate the record, or
+// whose record was lost, then get a full idle period before they can be
+// evicted rather than being deleted the first time the evictor runs.
+func (m *Manager) seedLastServed(upstreamURL string) time.Time {
+	if recorded := m.lastServed.get(upstreamURL); !recorded.IsZero() {
+		return recorded
+	}
+	return time.Now()
+}
+
+// MarkServed records that a client has just been served from this repository.
+// The persistent record is only rewritten once it falls behind by
+// lastServedGranularity, so this is cheap enough for the request path.
+func (m *Manager) MarkServed(repo *Repository) error {
+	now := time.Now()
+	repo.mu.Lock()
+	repo.lastServed = now
+	repo.mu.Unlock()
+	if _, err := m.lastServed.record(repo.upstreamURL, now); err != nil {
+		return errors.Wrap(err, "record last served")
+	}
+	return nil
+}
+
+// IdleMirrors returns the ready repositories no client has requested for at
+// least ttl. A non-positive ttl disables idle eviction and returns nothing.
+func (m *Manager) IdleMirrors(ttl time.Duration) []*Repository {
+	if ttl <= 0 {
+		return nil
+	}
+	cutoff := time.Now().Add(-ttl)
+	var idle []*Repository
+	for _, repo := range m.All() {
+		repo.mu.RLock()
+		stale := repo.state == StateReady && repo.lastServed.Before(cutoff)
+		repo.mu.RUnlock()
+		if stale {
+			idle = append(idle, repo)
+		}
+	}
+	return idle
+}
+
+// BeginServe opens the admission gate for a request that is about to read the
+// mirror, reporting false if the repository is being evicted and the caller
+// should treat it as absent. Every true result must be paired with EndServe.
+func (r *Repository) BeginServe() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.evicting {
+		return false
+	}
+	r.serves++
+	return true
+}
+
+// EndServe releases a reservation taken by BeginServe.
+func (r *Repository) EndServe() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.serves > 0 {
+		r.serves--
+	}
+}
+
+// LastServed returns when a client was last served from this repository.
+func (r *Repository) LastServed() time.Time {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.lastServed
+}
+
+// beginEvict closes the admission gate if the repository is idle and ready.
+// Setting the flag before checking serves is what makes the check sound: a
+// request that passes BeginServe after this point cannot exist, so a zero
+// count here means no reader can appear later.
+func (r *Repository) beginEvict(cutoff time.Time) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.state != StateReady || r.evicting || !r.lastServed.Before(cutoff) {
+		return false
+	}
+	r.evicting = true
+	if r.serves > 0 {
+		r.evicting = false
+		return false
+	}
+	return true
+}
+
+func (r *Repository) abortEvict() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.evicting = false
+}
+
+// Evict removes an idle mirror from disk and forgets it, so that the next
+// request for it clones afresh. It declines, returning false, if the
+// repository stopped being idle or is busy — a fetch, snapshot or repack in
+// flight holds the fetch semaphore, and losing that race simply defers
+// eviction to the next scan.
+//
+// The caller must first stop the repository's periodic maintenance jobs;
+// otherwise they keep firing against a directory that no longer exists.
+func (m *Manager) Evict(ctx context.Context, repo *Repository, ttl time.Duration) (bool, error) {
+	if ttl <= 0 {
+		return false, nil
+	}
+	if !repo.beginEvict(time.Now().Add(-ttl)) {
+		return false, nil
+	}
+	evicted := false
+	err := repo.WithFetchExclusion(ctx, func() error {
+		// Rename before deleting. A straggler git process keeps working
+		// through its open descriptors, while any new path lookup fails at
+		// once instead of reading a half-deleted repository. The temp prefix
+		// makes DiscoverExisting clean up the leftovers if we die mid-delete.
+		trash, err := os.MkdirTemp(m.config.MirrorRoot, cloneTempPrefix+"evicted-")
+		if err != nil {
+			return errors.Wrap(err, "create eviction temp dir")
+		}
+		staged := filepath.Join(trash, "mirror")
+		if err := os.Rename(repo.path, staged); err != nil {
+			_ = os.RemoveAll(trash)
+			return errors.Wrapf(err, "stage mirror for eviction %s", repo.upstreamURL)
+		}
+		m.clonesMu.Lock()
+		delete(m.clones, repo.upstreamURL)
+		m.clonesMu.Unlock()
+		repo.state = StateEmpty
+		evicted = true
+		if err := os.RemoveAll(trash); err != nil {
+			return errors.Wrapf(err, "delete evicted mirror %s", repo.upstreamURL)
+		}
+		return nil
+	})
+	repo.abortEvict()
+	if err != nil {
+		return evicted, err
+	}
+	if evicted {
+		if err := m.lastServed.forget(repo.upstreamURL); err != nil {
+			return true, errors.Wrap(err, "forget last served")
+		}
+	}
+	return evicted, nil
 }
 
 func (m *Manager) DiscoverExisting(ctx context.Context) ([]*Repository, error) {
@@ -292,6 +472,7 @@ func (m *Manager) DiscoverExisting(ctx context.Context) ([]*Repository, error) {
 			upstreamURL:        upstreamURL,
 			fetchSem:           make(chan struct{}, 1),
 			credentialProvider: m.credentialProvider,
+			lastServed:         m.seedLastServed(upstreamURL),
 		}
 		repo.fetchSem <- struct{}{}
 

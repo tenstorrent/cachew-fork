@@ -14,6 +14,7 @@ var scheduleBucketName = []byte("schedule")
 type ScheduleStore interface {
 	GetLastRun(key string) (time.Time, bool, error)
 	SetLastRun(key string, t time.Time) error
+	DeleteLastRun(key string) error
 	Close() error
 }
 
@@ -60,6 +61,13 @@ func (s *boltScheduleStore) SetLastRun(key string, t time.Time) error {
 	}
 	return errors.WithStack(s.db.Update(func(tx *bbolt.Tx) error {
 		return errors.WithStack(tx.Bucket(scheduleBucketName).Put([]byte(key), data))
+	}))
+}
+
+// DeleteLastRun removes the record for key. Deleting an absent key succeeds.
+func (s *boltScheduleStore) DeleteLastRun(key string) error {
+	return errors.WithStack(s.db.Update(func(tx *bbolt.Tx) error {
+		return errors.WithStack(tx.Bucket(scheduleBucketName).Delete([]byte(key)))
 	}))
 }
 

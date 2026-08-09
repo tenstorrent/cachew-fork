@@ -265,6 +265,9 @@ func New(
 		if err := s.warmExistingRepos(warmCtx); err != nil {
 			logger.WarnContext(warmCtx, "Failed to warm existing repos", "error", err)
 		}
+		// After warm-up, so the evictor sees every discovered mirror and its
+		// restored last-served time rather than an empty map.
+		s.scheduleIdleMirrorEvictor()
 		s.ready.Store(true)
 		logger.InfoContext(warmCtx, "Git strategy ready")
 	}()
@@ -371,6 +374,68 @@ func (s *Strategy) scheduleMaintenanceJobs(repo *gitclone.Repository) {
 	if s.config.RepackInterval > 0 {
 		s.scheduleRepackJobs(repo)
 	}
+}
+
+// maintenanceJobIDs are the periodic jobs scheduleMaintenanceJobs registers per
+// repository, and so the set that must be cancelled before its mirror is
+// deleted.
+//
+//nolint:gochecknoglobals // fixed job identifiers, not configuration
+var maintenanceJobIDs = []string{
+	snapshotJobBase + "-periodic",
+	snapshotJobLFS + "-periodic",
+	snapshotJobMirror + "-periodic",
+	"repack-periodic",
+}
+
+func (s *Strategy) cancelMaintenanceJobs(repo *gitclone.Repository) {
+	for _, id := range maintenanceJobIDs {
+		s.scheduler.CancelPeriodicJob(repo.UpstreamURL(), id)
+	}
+}
+
+// scheduleIdleMirrorEvictor registers the single process-wide job that deletes
+// mirrors nothing has requested for mirror-ttl. It is one job rather than one
+// per repository so that evicting a repository cannot leave its own evictor
+// chain behind.
+func (s *Strategy) scheduleIdleMirrorEvictor() {
+	cfg := s.cloneManager.Config()
+	if cfg.MirrorTTL <= 0 {
+		return
+	}
+	logging.FromContext(s.ctx).InfoContext(s.ctx, "Idle mirror eviction enabled",
+		"mirror_ttl", cfg.MirrorTTL, "scan_interval", cfg.MirrorEvictScan)
+	s.scheduler.SubmitPeriodicJob("mirror-evictor", "evict-idle-mirrors", cfg.MirrorEvictScan, func(ctx context.Context) error {
+		return s.evictIdleMirrors(ctx, cfg.MirrorTTL)
+	})
+}
+
+func (s *Strategy) evictIdleMirrors(ctx context.Context, ttl time.Duration) error {
+	logger := logging.FromContext(ctx)
+	for _, repo := range s.cloneManager.IdleMirrors(ttl) {
+		upstream := repo.UpstreamURL()
+		// Stop the maintenance chains before deleting, so nothing re-arms
+		// against a missing directory. If eviction then declines, the next
+		// request for this repository reschedules them.
+		s.cancelMaintenanceJobs(repo)
+		if s.scheduler.QueueActive(upstream) {
+			logger.InfoContext(ctx, "Skipping eviction, repository busy", "upstream", upstream)
+			s.scheduleMaintenanceJobs(repo)
+			continue
+		}
+		evicted, err := s.cloneManager.Evict(ctx, repo, ttl)
+		if err != nil {
+			logger.ErrorContext(ctx, "Failed to evict idle mirror", "upstream", upstream, "error", err)
+			continue
+		}
+		if !evicted {
+			s.scheduleMaintenanceJobs(repo)
+			continue
+		}
+		logger.InfoContext(ctx, "Evicted idle mirror", "upstream", upstream,
+			"idle_for", time.Since(repo.LastServed()).Round(time.Minute))
+	}
+	return nil
 }
 
 // SetHTTPTransport overrides the HTTP transport used for the strategy's own
@@ -482,6 +547,20 @@ func (s *Strategy) handleGitRequest(w http.ResponseWriter, r *http.Request, host
 		if err := s.repoCounts.IncrementClone(upstreamURL); err != nil {
 			logger.WarnContext(ctx, "Failed to increment repo clone count", "error", err)
 		}
+	}
+
+	// Hold an admission reservation for the whole request. The upload-pack path
+	// below takes no lock, so this is what stops the idle evictor deleting the
+	// mirror out from under a clone that is already streaming.
+	if !repo.BeginServe() {
+		// The mirror is being evicted. Forwarding upstream is always correct,
+		// and the next request re-clones.
+		s.forwardToUpstream(w, r, host, pathValue)
+		return
+	}
+	defer repo.EndServe()
+	if err := s.cloneManager.MarkServed(repo); err != nil {
+		logger.WarnContext(ctx, "Failed to record last served time", "upstream", upstreamURL, "error", err)
 	}
 
 	state := repo.State()

@@ -345,6 +345,12 @@ func (c *capturingScheduler) SubmitPeriodicJob(_, id string, _ time.Duration, ru
 	c.jobs[id] = run
 }
 
+func (c *capturingScheduler) CancelPeriodicJob(_, id string) {
+	delete(c.jobs, id)
+}
+
+func (c *capturingScheduler) QueueActive(string) bool { return false }
+
 func TestValidateRepoTarget(t *testing.T) {
 	tests := []struct {
 		name    string
