@@ -206,7 +206,7 @@ func New(
 		return nil, errors.Wrap(err, "failed to create scheduler")
 	}
 
-	m := newGitMetrics()
+	m := newGitMetrics(ctx, config, logger)
 
 	// The strategy owns its transport rather than sharing http.DefaultClient's,
 	// so swapping it cannot leak onto every other user of the process-wide

@@ -282,6 +282,10 @@ goroutine rather than the shared job-scheduler worker pool, so it never delays a
 with `git { storage-scan-interval = "15m" }`; `0` or negative disables storage measurement. Sizes are apparent file sizes rather
 than allocated blocks, and the `object_cache` series is absent for backends that cannot report stats cheaply (S3).
 
+`cachew_authz_disabled{check=...}` is 1 if a client-authorization escape hatch is enabled, 0 otherwise, set once at
+startup. `check="upstream"` is the git strategy's `disable-upstream-authz`; `check="object_api"` is the object API's
+`disable-git-object-authz`. Both are meant to page someone — see [Per-repository client authorization](docs/git-authz.md).
+
 Admin endpoints: `/_liveness`, `/_readiness`, `PUT /admin/log/level`, `/admin/pprof/`.
 
 ## Full Configuration Example

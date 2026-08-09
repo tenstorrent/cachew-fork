@@ -217,7 +217,7 @@ func TestProactiveUpstreamContactAllowed(t *testing.T) {
 				config:       Config{DisableUpstreamAuthz: tt.disableUpstreamAuthz},
 				cloneManager: manager,
 				authz:        repoauthz.NewAuthorizer(&http.Client{Transport: transport}, time.Minute),
-				metrics:      newGitMetrics(),
+				metrics:      newGitMetrics(ctx, Config{DisableUpstreamAuthz: tt.disableUpstreamAuthz}, logging.FromContext(ctx)),
 			}
 
 			assert.Equal(t, tt.want, s.proactiveUpstreamContactAllowed(ctx, repo))
@@ -245,7 +245,7 @@ func TestPeriodicSnapshotJobsSkipAuthRequiredRepos(t *testing.T) {
 		config:       Config{SnapshotInterval: time.Hour},
 		cloneManager: manager,
 		authz:        repoauthz.NewAuthorizer(&http.Client{Transport: transport}, time.Minute),
-		metrics:      newGitMetrics(),
+		metrics:      newGitMetrics(ctx, Config{SnapshotInterval: time.Hour}, logging.FromContext(ctx)),
 		scheduler:    scheduler,
 	}
 
@@ -312,7 +312,7 @@ func TestDeniedRequestSchedulesNoUpstreamWork(t *testing.T) {
 				cloneManager: manager,
 				authz: repoauthz.NewAuthorizer(
 					&http.Client{Transport: &stubTransport{status: http.StatusUnauthorized}}, time.Minute),
-				metrics:   newGitMetrics(),
+				metrics:   newGitMetrics(ctx, Config{}, logging.FromContext(ctx)),
 				scheduler: scheduler,
 			}
 
@@ -437,7 +437,7 @@ func TestAuthorizeServeDeniesNonCanonicalRepoPath(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			_, ctx, _ := logging.Configure(t.Context(), logging.Config{Level: "error"})
-			s := &Strategy{metrics: newGitMetrics(), config: Config{DisableUpstreamAuthz: tt.disableUpstreamAuthz}}
+			s := &Strategy{metrics: newGitMetrics(ctx, Config{DisableUpstreamAuthz: tt.disableUpstreamAuthz}, logging.FromContext(ctx)), config: Config{DisableUpstreamAuthz: tt.disableUpstreamAuthz}}
 
 			r := httptest.NewRequest(http.MethodGet, "/git/github.com/"+tt.path, nil).WithContext(ctx)
 			w := httptest.NewRecorder()
