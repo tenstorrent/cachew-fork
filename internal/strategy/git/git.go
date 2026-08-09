@@ -239,6 +239,12 @@ func New(
 	for _, opt := range opts {
 		opt(s)
 	}
+	// Started here, not after warm-up: warm-up (mirror discovery, one
+	// `git config` per mirror) can take a while on a large mirror set, and
+	// cachew_storage_* should not be absent from Prometheus for that whole
+	// window. Its first scan may undercount until warm-up populates
+	// cloneManager, but a low reading beats no series at all.
+	s.scheduleStorageSampler()
 	// Run startup fetches in the background so the HTTP listener (and
 	// /_liveness) come up immediately. /_readiness gates on Ready() so the
 	// Service load balancer holds traffic until warming completes.
@@ -269,10 +275,9 @@ func New(
 		if err := s.warmExistingRepos(warmCtx); err != nil {
 			logger.WarnContext(warmCtx, "Failed to warm existing repos", "error", err)
 		}
-		// After warm-up so the evictor, and the storage sampler's first scan,
-		// see every discovered mirror rather than an empty map.
+		// After warm-up so the evictor sees every discovered mirror rather
+		// than an empty map.
 		s.scheduleIdleMirrorEvictor()
-		s.scheduleStorageSampler()
 		s.ready.Store(true)
 		logger.InfoContext(warmCtx, "Git strategy ready")
 	}()

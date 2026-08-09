@@ -59,9 +59,8 @@ func (s *Strategy) scheduleStorageSampler() {
 }
 
 func (s *Strategy) runStorageSampler(interval time.Duration) {
-	// The warm-up goroutine reaches here without checking ctx.Done() when
-	// SnapshotInterval is 0, so a shutdown mid-warm-up would otherwise still
-	// run one full walk.
+	// Guards against ctx already being cancelled by the time this goroutine
+	// actually runs (New returning does not guarantee it hasn't).
 	if s.ctx.Err() != nil {
 		return
 	}
