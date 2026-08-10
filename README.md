@@ -28,7 +28,7 @@ cachew git restore https://github.com/org/repo ./repo
 ```hcl
 git {
   snapshot-interval         = "1h"
-  repack-interval           = "1h"
+  repack-interval           = "18h"
   incremental-pullthrough   = true    # default; false disables incremental pull-through
   incremental-fetch-timeout = "2m"    # default
 }
@@ -319,7 +319,7 @@ git-clone {}
 
 git {
   snapshot-interval = "1h"
-  repack-interval   = "1h"
+  repack-interval   = "18h"
 }
 
 github-releases {
