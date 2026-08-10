@@ -88,6 +88,94 @@ func TestEvictDeclinesWhileServing(t *testing.T) {
 	assert.True(t, evicted, "mirror should be evictable once the request completes")
 }
 
+func TestEvictForQuotaReportsReclaimAlongsideError(t *testing.T) {
+	ctx, manager, create := newMirrorManager(t)
+	repo := create("https://github.com/org/reclaimed")
+	assert.NoError(t, manager.MarkServed(repo))
+
+	// Break the post-eviction bookkeeping flush by putting a directory where the
+	// record file goes, so the rename onto it fails. A quota caller subtracts
+	// what this returns from its running total, so the reclaim must still be
+	// reported: the bytes are gone, and discarding that would evict more mirrors
+	// to reach a target already met.
+	record := filepath.Join(manager.config.MirrorRoot, lastServedFile)
+	assert.NoError(t, os.Remove(record))
+	assert.NoError(t, os.Mkdir(record, 0o750))
+
+	result, err := manager.EvictForQuota(ctx, repo)
+	assert.Error(t, err)
+	assert.Equal(t, EvictResult{Unlinked: true, Reclaimed: true}, result,
+		"a failure after the delete must not cast doubt on the reclaim")
+
+	_, statErr := os.Stat(repo.Path())
+	assert.True(t, os.IsNotExist(statErr), "mirror directory should be gone")
+	assert.Zero(t, manager.Get("https://github.com/org/reclaimed"), "evicted repo should be forgotten")
+}
+
+func TestEvictForQuotaReportsUnreclaimedWhenDeleteFails(t *testing.T) {
+	ctx, manager, create := newMirrorManager(t)
+	repo := create("https://github.com/org/stuck")
+
+	// The mirror is unlinked but its staged copy survives, so the bytes are
+	// still on the volume with nothing serving them. A quota caller that
+	// subtracted them would stop reclaiming short of its target.
+	manager.removeAll = func(string) error { return os.ErrPermission }
+
+	result, err := manager.EvictForQuota(ctx, repo)
+	assert.Error(t, err)
+	assert.Equal(t, EvictResult{Unlinked: true, Reclaimed: false}, result)
+	assert.Zero(t, manager.Get("https://github.com/org/stuck"), "unlinked repo must not still be served")
+
+	var staged []string
+	entries, err := os.ReadDir(manager.config.MirrorRoot)
+	assert.NoError(t, err)
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), cloneTempPrefix) {
+			staged = append(staged, entry.Name())
+		}
+	}
+	assert.Equal(t, 1, len(staged), "the undeleted copy should still be on disk")
+}
+
+func TestReclaimLeftoversRetriesUndeletedStagedMirror(t *testing.T) {
+	ctx, manager, create := newMirrorManager(t)
+	repo := create("https://github.com/org/stuck")
+
+	manager.removeAll = func(string) error { return os.ErrPermission }
+	result, err := manager.EvictForQuota(ctx, repo)
+	assert.Error(t, err)
+	assert.False(t, result.Reclaimed)
+
+	remaining, err := manager.ReclaimLeftovers()
+	assert.Error(t, err)
+	assert.Equal(t, 1, len(remaining), "bytes still on the volume must stay visible to a byte budget")
+	_, statErr := os.Stat(remaining[0])
+	assert.NoError(t, statErr, "the staged copy should still be there")
+
+	manager.removeAll = os.RemoveAll
+	remaining, err = manager.ReclaimLeftovers()
+	assert.NoError(t, err)
+	assert.Zero(t, len(remaining), "a successful retry stops the bytes being counted")
+	assert.Zero(t, len(manager.leftovers), "a reclaimed leftover must not be retried forever")
+}
+
+func TestReclaimLeftoversForgetsVanishedStagedMirror(t *testing.T) {
+	ctx, manager, create := newMirrorManager(t)
+	repo := create("https://github.com/org/vanished")
+
+	manager.removeAll = func(string) error { return os.ErrPermission }
+	_, err := manager.EvictForQuota(ctx, repo)
+	assert.Error(t, err)
+
+	manager.removeAll = func(path string) error {
+		_ = os.RemoveAll(path)
+		return os.ErrNotExist
+	}
+	remaining, err := manager.ReclaimLeftovers()
+	assert.NoError(t, err, "an already-gone directory is a reclaim, not a failure")
+	assert.Zero(t, len(remaining))
+}
+
 func TestBeginServeRejectedDuringEviction(t *testing.T) {
 	_, _, create := newMirrorManager(t)
 	repo := create("https://github.com/org/evicting")

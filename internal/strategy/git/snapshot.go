@@ -1342,15 +1342,34 @@ func (s *Strategy) generateAndUploadLFSSnapshot(ctx context.Context, repo *gitcl
 // failure (e.g. a file removed mid-walk during snapshot prep) doesn't fail
 // the surrounding snapshot operation; the returned sum is best-effort.
 func dirSizeBytes(root string) (int64, error) {
-	var total int64
-	err := filepath.WalkDir(root, func(_ string, d os.DirEntry, err error) error {
+	total, _, err := measureDirSizeBytes(root)
+	return total, err
+}
+
+// measureDirSizeBytes is dirSizeBytes that reports what it skipped. exact is
+// false when an entry that still takes up space went uncounted, so a caller
+// that must not act on a short count can tell.
+//
+// A vanished entry keeps exact true. Repacks and evictions delete files under a
+// walk in progress, and those bytes really are gone, so treating that as a gap
+// would suppress every pass. Only an entry that exists but could not be read,
+// such as an unreadable subtree, leaves bytes the sum omits.
+func measureDirSizeBytes(root string) (total int64, exact bool, err error) {
+	exact = true
+	err = filepath.WalkDir(root, func(_ string, d os.DirEntry, err error) error {
 		if err != nil {
+			if !errors.Is(err, os.ErrNotExist) {
+				exact = false
+			}
 			return nil //nolint:nilerr // best-effort: skip unreadable entries
 		}
 		// Stat first so we don't drop files on filesystems where DirEntry.Type()
 		// reports "unknown" (e.g. some NFS/FUSE setups) and IsRegular() returns false.
 		info, infoErr := d.Info()
 		if infoErr != nil {
+			if !errors.Is(infoErr, os.ErrNotExist) {
+				exact = false
+			}
 			return nil //nolint:nilerr // best-effort: skip un-stat-able entries
 		}
 		if !info.Mode().IsRegular() {
@@ -1359,7 +1378,7 @@ func dirSizeBytes(root string) (int64, error) {
 		total += info.Size()
 		return nil
 	})
-	return total, errors.WithStack(err)
+	return total, exact, errors.WithStack(err)
 }
 
 func (s *Strategy) handleLFSSnapshotRequest(w http.ResponseWriter, r *http.Request, host, pathValue string) {

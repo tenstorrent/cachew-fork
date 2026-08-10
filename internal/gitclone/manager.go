@@ -3,12 +3,15 @@ package gitclone
 import (
 	"context"
 	"io/fs"
+	"maps"
 	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -134,6 +137,15 @@ type Manager struct {
 	clonesMu           sync.RWMutex
 	credentialProvider CredentialProvider
 	lastServed         *lastServedStore
+	// removeAll deletes a staged mirror during eviction. Indirected so tests can
+	// reach the unlinked-but-not-reclaimed path, which otherwise needs a
+	// filesystem failure.
+	removeAll func(string) error
+	// leftovers holds staged mirrors whose deletion failed. They still take up
+	// space but belong to no repository in All(), so ReclaimLeftovers retries
+	// and accounts for them.
+	leftovers   map[string]struct{}
+	leftoversMu sync.Mutex
 }
 
 // ManagerProvider is a function that lazily creates a singleton Manager.
@@ -209,6 +221,8 @@ func NewManager(ctx context.Context, config Config, credentialProvider Credentia
 		clones:             make(map[string]*Repository),
 		credentialProvider: credentialProvider,
 		lastServed:         loadLastServedStore(config.MirrorRoot),
+		removeAll:          os.RemoveAll,
+		leftovers:          make(map[string]struct{}),
 	}, nil
 }
 
@@ -381,14 +395,102 @@ func (r *Repository) abortEvict() {
 //
 // The caller must first stop the repository's periodic maintenance jobs;
 // otherwise they keep firing against a directory that no longer exists.
+//
+// A true return means the mirror was unlinked. Use EvictForQuota to find out
+// whether the space was reclaimed.
 func (m *Manager) Evict(ctx context.Context, repo *Repository, ttl time.Duration) (bool, error) {
 	if ttl <= 0 {
 		return false, nil
 	}
-	if !repo.beginEvict(time.Now().Add(-ttl)) {
-		return false, nil
+	result, err := m.evictAt(ctx, repo, time.Now().Add(-ttl))
+	return result.Unlinked, err
+}
+
+// EvictForQuota removes a mirror that is over a storage budget rather than
+// idle, so it requires no idleness: a cutoff of now admits every repository.
+//
+// In-flight protections are unchanged. A repository being read holds a serve
+// reservation, and a fetch, snapshot or repack holds the fetch semaphore, so
+// this declines instead of deleting a directory in use. As with Evict, the
+// caller must stop the repository's periodic maintenance jobs first.
+//
+// The result is meaningful even with an error, see [EvictResult]. A caller
+// enforcing a byte budget must count Reclaimed, not Unlinked.
+func (m *Manager) EvictForQuota(ctx context.Context, repo *Repository) (EvictResult, error) {
+	return m.evictAt(ctx, repo, time.Now())
+}
+
+// EvictResult reports how far an eviction got. The two steps fail
+// independently and mean different things to a caller.
+type EvictResult struct {
+	// Unlinked is set once the mirror is renamed out of its serving path and
+	// dropped from the manager. It no longer serves requests or appears in
+	// All(), so its maintenance jobs must stay cancelled whatever else failed.
+	Unlinked bool
+	// Reclaimed is set once the staged copy is deleted. Unlinked without
+	// Reclaimed means the bytes are still on the volume in a temp directory no
+	// scan attributes to a mirror, so a byte budget must not count them freed.
+	// The path is kept for [Manager.ReclaimLeftovers] to retry, and
+	// DiscoverExisting sweeps up anything left at the next start.
+	Reclaimed bool
+}
+
+func (m *Manager) rememberLeftover(path string) {
+	m.leftoversMu.Lock()
+	defer m.leftoversMu.Unlock()
+	m.leftovers[path] = struct{}{}
+}
+
+// ReclaimLeftovers retries deleting staged mirrors whose removal failed, and
+// returns the paths still on the volume.
+//
+// Those bytes belong to no repository in All(), so nothing else looks at them
+// before a restart. A byte budget must keep counting them until a retry
+// succeeds, or it gives the same space away twice.
+func (m *Manager) ReclaimLeftovers() (remaining []string, err error) {
+	m.leftoversMu.Lock()
+	paths := slices.Sorted(maps.Keys(m.leftovers))
+	m.leftoversMu.Unlock()
+
+	var errs []error
+	for _, path := range paths {
+		// A vanished directory counts as reclaimed: something else, a restart's
+		// DiscoverExisting or an operator, already freed the space.
+		if rmErr := m.removeAll(path); rmErr != nil && !errors.Is(rmErr, fs.ErrNotExist) {
+			remaining = append(remaining, path)
+			errs = append(errs, errors.Wrapf(rmErr, "delete leftover staged mirror %s", path))
+			continue
+		}
+		m.leftoversMu.Lock()
+		delete(m.leftovers, path)
+		m.leftoversMu.Unlock()
 	}
-	evicted := false
+	return remaining, errors.Join(errs...)
+}
+
+// MirrorsByLastServed returns the ready repositories, least recently served
+// first, which is the order to reclaim them in.
+func (m *Manager) MirrorsByLastServed() []*Repository {
+	var ready []*Repository
+	for _, repo := range m.All() {
+		repo.mu.RLock()
+		isReady := repo.state == StateReady
+		repo.mu.RUnlock()
+		if isReady {
+			ready = append(ready, repo)
+		}
+	}
+	sort.Slice(ready, func(i, j int) bool {
+		return ready[i].LastServed().Before(ready[j].LastServed())
+	})
+	return ready
+}
+
+func (m *Manager) evictAt(ctx context.Context, repo *Repository, cutoff time.Time) (EvictResult, error) {
+	if !repo.beginEvict(cutoff) {
+		return EvictResult{}, nil
+	}
+	result := EvictResult{}
 	err := repo.WithFetchExclusion(ctx, func() error {
 		// Rename before deleting. A straggler git process keeps working
 		// through its open descriptors, while any new path lookup fails at
@@ -400,6 +502,7 @@ func (m *Manager) Evict(ctx context.Context, repo *Repository, ttl time.Duration
 		}
 		staged := filepath.Join(trash, "mirror")
 		if err := os.Rename(repo.path, staged); err != nil {
+			// Nothing was moved in, so this is just the empty temp dir.
 			_ = os.RemoveAll(trash)
 			return errors.Wrapf(err, "stage mirror for eviction %s", repo.upstreamURL)
 		}
@@ -407,22 +510,29 @@ func (m *Manager) Evict(ctx context.Context, repo *Repository, ttl time.Duration
 		delete(m.clones, repo.upstreamURL)
 		m.clonesMu.Unlock()
 		repo.state = StateEmpty
-		evicted = true
-		if err := os.RemoveAll(trash); err != nil {
-			return errors.Wrapf(err, "delete evicted mirror %s", repo.upstreamURL)
+		result.Unlinked = true
+		if err := m.removeAll(trash); err != nil {
+			// The staged copy still occupies trash, so the bytes are not freed.
+			// Remember it: nothing else finds it before the next start, and a
+			// budget that stops counting it hands the space to the cache.
+			m.rememberLeftover(trash)
+			return errors.Wrapf(err, "delete evicted mirror %s (left at %s)", repo.upstreamURL, trash)
 		}
+		result.Reclaimed = true
 		return nil
 	})
 	repo.abortEvict()
 	if err != nil {
-		return evicted, err
+		return result, err
 	}
-	if evicted {
+	if result.Unlinked {
 		if err := m.lastServed.forget(repo.upstreamURL); err != nil {
-			return true, errors.Wrap(err, "forget last served")
+			// Bookkeeping only, and it runs after the delete, so the space is
+			// reclaimed either way.
+			return result, errors.Wrap(err, "forget last served")
 		}
 	}
-	return evicted, nil
+	return result, nil
 }
 
 func (m *Manager) DiscoverExisting(ctx context.Context) ([]*Repository, error) {

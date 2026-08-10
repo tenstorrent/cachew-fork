@@ -79,11 +79,13 @@ func TestDiskEvictionKeepsRecentlyRead(t *testing.T) {
 	unread := cache.NewKey("unread-key")
 	overflow := cache.NewKey("overflow-key")
 
-	// Two ~500KB entries stay under the 1MB limit, so nothing is evicted before the read below.
+	// Two ~500KB entries stay under the 1MB limit, so nothing is evicted before
+	// the read below. The spacing exceeds evict-interval, which is also the
+	// window over which a read's LRU bump is throttled.
 	writeDiskEntry(ctx, t, c, read)
-	time.Sleep(10 * time.Millisecond)
+	time.Sleep(60 * time.Millisecond)
 	writeDiskEntry(ctx, t, c, unread)
-	time.Sleep(10 * time.Millisecond)
+	time.Sleep(60 * time.Millisecond)
 
 	r, _, err := c.Open(ctx, read)
 	assert.NoError(t, err)

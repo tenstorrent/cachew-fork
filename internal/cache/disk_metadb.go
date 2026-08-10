@@ -2,6 +2,7 @@ package cache
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/json"
 	"io/fs"
 	"net/http"
@@ -18,7 +19,23 @@ var (
 	ttlBucketName          = []byte("ttl")
 	headersBucketName      = []byte("headers")
 	lastAccessedBucketName = []byte("lastaccessed")
+	baseTTLBucketName      = []byte("basettl")
 )
+
+// diskEntryMeta is what the read paths need about an entry. Stat and Open both
+// need all of it, so it is fetched in one transaction.
+type diskEntryMeta struct {
+	expiresAt time.Time
+	headers   http.Header
+	// baseTTL is the TTL the entry was written with, and how far a read slides
+	// expiry forward. Zero means the entry predates base-TTL tracking, so its
+	// expiry is left alone.
+	baseTTL time.Duration
+	// lastAccessedAt is what eviction ranks entries by. Reads compare it to now
+	// to decide whether re-recording it is worth a write. Zero means no record,
+	// which counts as stale and always writes.
+	lastAccessedAt time.Time
+}
 
 // diskMetaDB manages expiration times and headers for cache entries using bbolt.
 type diskMetaDB struct {
@@ -54,6 +71,9 @@ func newDiskMetaDB(dbPath string) (*diskMetaDB, error) {
 		if _, err := tx.CreateBucketIfNotExists(lastAccessedBucketName); err != nil {
 			return errors.WithStack(err)
 		}
+		if _, err := tx.CreateBucketIfNotExists(baseTTLBucketName); err != nil {
+			return errors.WithStack(err)
+		}
 		return nil
 	}); err != nil {
 		return nil, errors.Join(errors.Errorf("failed to create buckets: %w", err), db.Close())
@@ -83,6 +103,10 @@ func newDiskMetaDB(dbPath string) (*diskMetaDB, error) {
 
 // recordAccess renews an entry's TTL and bumps its last access time, in a single write transaction to keep cache hits
 // cheap.
+//
+// Both fields move forward only. Read paths hold a shared lock, so two readers
+// of one key can race to renew it. Without this guard the loser would overwrite
+// a later renewal with an older expiry and access time.
 func (s *diskMetaDB) recordAccess(namespace Namespace, key Key, expiresAt, accessedAt time.Time) error {
 	ttlBytes, err := expiresAt.MarshalBinary()
 	if err != nil {
@@ -97,11 +121,16 @@ func (s *diskMetaDB) recordAccess(namespace Namespace, key Key, expiresAt, acces
 	dbKey := compositeKey(namespace, key)
 	err = s.db.Update(func(tx *bbolt.Tx) error {
 		ttlBucket := tx.Bucket(ttlBucketName)
-		if err := ttlBucket.Put(dbKey, ttlBytes); err != nil {
-			return errors.WithStack(err)
+		if storedTimeIsBefore(ttlBucket.Get(dbKey), expiresAt) {
+			if err := ttlBucket.Put(dbKey, ttlBytes); err != nil {
+				return errors.WithStack(err)
+			}
 		}
 
 		lastAccessedBucket := tx.Bucket(lastAccessedBucketName)
+		if !storedTimeIsBefore(lastAccessedBucket.Get(dbKey), accessedAt) {
+			return nil
+		}
 		return errors.WithStack(lastAccessedBucket.Put(dbKey, accessedBytes))
 	})
 	if err != nil {
@@ -116,7 +145,24 @@ func (s *diskMetaDB) recordAccess(namespace Namespace, key Key, expiresAt, acces
 	return nil
 }
 
-func (s *diskMetaDB) set(key Key, namespace Namespace, expiresAt, accessedAt time.Time, headers http.Header) error {
+// storedTimeIsBefore reports whether the time recorded in raw is older than t,
+// and so whether writing t moves the value forward.
+//
+// Absent or unparseable bytes count as older: there is nothing worth keeping.
+func storedTimeIsBefore(raw []byte, t time.Time) bool {
+	if len(raw) == 0 {
+		return true
+	}
+	var stored time.Time
+	if err := stored.UnmarshalBinary(raw); err != nil {
+		return true
+	}
+	return stored.Before(t)
+}
+
+func (s *diskMetaDB) set(
+	key Key, namespace Namespace, expiresAt, accessedAt time.Time, baseTTL time.Duration, headers http.Header,
+) error {
 	ttlBytes, err := expiresAt.MarshalBinary()
 	if err != nil {
 		return errors.Errorf("failed to marshal TTL: %w", err)
@@ -132,6 +178,11 @@ func (s *diskMetaDB) set(key Key, namespace Namespace, expiresAt, accessedAt tim
 		return errors.Errorf("failed to encode headers: %w", err)
 	}
 
+	// Varint because a Duration is signed and so round trips without going
+	// through uint64. The value is only fetched by exact key, never compared or
+	// scanned as bytes, so byte order does not matter.
+	baseTTLBytes := binary.AppendVarint(nil, int64(baseTTL))
+
 	dbKey := compositeKey(namespace, key)
 	err = s.db.Update(func(tx *bbolt.Tx) error {
 		ttlBucket := tx.Bucket(ttlBucketName)
@@ -142,6 +193,12 @@ func (s *diskMetaDB) set(key Key, namespace Namespace, expiresAt, accessedAt tim
 		lastAccessedBucket := tx.Bucket(lastAccessedBucketName)
 		if err := lastAccessedBucket.Put(dbKey, accessedBytes); err != nil {
 			return errors.WithStack(err)
+		}
+
+		if baseTTLBucket := tx.Bucket(baseTTLBucketName); baseTTLBucket != nil {
+			if err := baseTTLBucket.Put(dbKey, baseTTLBytes); err != nil {
+				return errors.WithStack(err)
+			}
 		}
 
 		headersBucket := tx.Bucket(headersBucketName)
@@ -173,18 +230,45 @@ func (s *diskMetaDB) getTTL(namespace Namespace, key Key) (time.Time, error) {
 	return expiresAt, errors.WithStack(err)
 }
 
-func (s *diskMetaDB) getHeaders(namespace Namespace, key Key) (http.Header, error) {
-	var headers http.Header
+// getEntry reads an entry's expiry, base TTL, headers and access time in one
+// transaction, so a cache hit costs one View instead of several.
+func (s *diskMetaDB) getEntry(namespace Namespace, key Key) (diskEntryMeta, error) {
+	var meta diskEntryMeta
 	dbKey := compositeKey(namespace, key)
 	err := s.db.View(func(tx *bbolt.Tx) error {
-		bucket := tx.Bucket(headersBucketName)
-		headersBytes := bucket.Get(dbKey)
+		ttlBytes := tx.Bucket(ttlBucketName).Get(dbKey)
+		if ttlBytes == nil {
+			return fs.ErrNotExist
+		}
+		if err := meta.expiresAt.UnmarshalBinary(ttlBytes); err != nil {
+			return errors.WithStack(err)
+		}
+
+		headersBytes := tx.Bucket(headersBucketName).Get(dbKey)
 		if headersBytes == nil {
 			return fs.ErrNotExist
 		}
-		return errors.WithStack(json.Unmarshal(headersBytes, &headers))
+		if err := json.Unmarshal(headersBytes, &meta.headers); err != nil {
+			return errors.WithStack(err)
+		}
+
+		// Absent for entries written before base-TTL tracking, and zero if the
+		// record does not decode. Either way the caller leaves expiry alone.
+		if bucket := tx.Bucket(baseTTLBucketName); bucket != nil {
+			if stored, n := binary.Varint(bucket.Get(dbKey)); n > 0 {
+				meta.baseTTL = time.Duration(stored)
+			}
+		}
+
+		// Zero when absent or undecodable, which read paths treat as stale.
+		if accessedBytes := tx.Bucket(lastAccessedBucketName).Get(dbKey); accessedBytes != nil {
+			if err := meta.lastAccessedAt.UnmarshalBinary(accessedBytes); err != nil {
+				meta.lastAccessedAt = time.Time{}
+			}
+		}
+		return nil
 	})
-	return headers, errors.WithStack(err)
+	return meta, errors.WithStack(err)
 }
 
 func (s *diskMetaDB) delete(namespace Namespace, key Key) error {
@@ -200,6 +284,12 @@ func (s *diskMetaDB) delete(namespace Namespace, key Key) error {
 			return errors.WithStack(err)
 		}
 
+		if baseTTLBucket := tx.Bucket(baseTTLBucketName); baseTTLBucket != nil {
+			if err := baseTTLBucket.Delete(dbKey); err != nil {
+				return errors.WithStack(err)
+			}
+		}
+
 		headersBucket := tx.Bucket(headersBucketName)
 		return errors.WithStack(headersBucket.Delete(dbKey))
 	}))
@@ -213,6 +303,7 @@ func (s *diskMetaDB) deleteAll(entries []evictEntryKey) error {
 		ttlBucket := tx.Bucket(ttlBucketName)
 		lastAccessedBucket := tx.Bucket(lastAccessedBucketName)
 		headersBucket := tx.Bucket(headersBucketName)
+		baseTTLBucket := tx.Bucket(baseTTLBucketName)
 
 		for _, entry := range entries {
 			dbKey := compositeKey(entry.namespace, entry.key)
@@ -224,6 +315,11 @@ func (s *diskMetaDB) deleteAll(entries []evictEntryKey) error {
 			}
 			if err := headersBucket.Delete(dbKey); err != nil {
 				return errors.Errorf("failed to delete headers: %w", err)
+			}
+			if baseTTLBucket != nil {
+				if err := baseTTLBucket.Delete(dbKey); err != nil {
+					return errors.Errorf("failed to delete base TTL: %w", err)
+				}
 			}
 		}
 		return nil

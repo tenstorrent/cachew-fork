@@ -104,6 +104,44 @@ func TestDirSizeBytesMissingRoot(t *testing.T) {
 	assert.Equal(t, int64(0), size)
 }
 
+// The budget must not give uncounted mirror bytes to the object cache, so a
+// walk that skipped bytes still on disk must report a short count.
+func TestMeasureDirSizeBytesReportsUnreadableSubtree(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores permission bits, so the subtree stays readable")
+	}
+	root := t.TempDir()
+	assert.NoError(t, os.WriteFile(filepath.Join(root, "counted"), make([]byte, 100), 0o600))
+	locked := filepath.Join(root, "locked")
+	assert.NoError(t, os.MkdirAll(locked, 0o700))
+	assert.NoError(t, os.WriteFile(filepath.Join(locked, "hidden"), make([]byte, 50), 0o600))
+	assert.NoError(t, os.Chmod(locked, 0o000))
+	t.Cleanup(func() { assert.NoError(t, os.Chmod(locked, 0o700)) })
+
+	total, exact, err := measureDirSizeBytes(root)
+	assert.NoError(t, err)
+	assert.Equal(t, int64(100), total, "readable files should still be counted")
+	assert.False(t, exact, "bytes left on disk but uncounted must be reported")
+}
+
+// Repacks and evictions delete files under a walk in progress, and those bytes
+// really are gone, so treating a vanished entry as a gap would suppress
+// enforcement on every pass.
+func TestMeasureDirSizeBytesTreatsVanishedEntriesAsExact(t *testing.T) {
+	root := t.TempDir()
+	assert.NoError(t, os.WriteFile(filepath.Join(root, "a"), make([]byte, 100), 0o600))
+
+	total, exact, err := measureDirSizeBytes(root)
+	assert.NoError(t, err)
+	assert.Equal(t, int64(100), total)
+	assert.True(t, exact)
+
+	total, exact, err = measureDirSizeBytes(filepath.Join(t.TempDir(), "does-not-exist"))
+	assert.NoError(t, err)
+	assert.Equal(t, int64(0), total)
+	assert.True(t, exact, "a missing root is a measurement of nothing, not a failed measurement")
+}
+
 // DiscoverExisting runs `git config` against each discovered path, so a
 // plain directory with a HEAD file isn't enough — these must be real bare
 // repos. Needs `git`, not `git-lfs`.
@@ -151,6 +189,31 @@ func TestSampleStorageUsageSkipsScanWhenAlreadyCancelled(t *testing.T) {
 	// here should be recorded.
 	s.sampleStorageUsage(ctx)
 	assert.Equal(t, 0, len(s.storage.seenRepos))
+}
+
+// The sampler starts before warm-up, so an early pass sees a manager that has
+// not finished discovering its mirrors, and a measurement of nothing counts as
+// complete. Enforcing then would give the object cache the whole volume.
+func TestSampleStorageUsageWaitsForReadiness(t *testing.T) {
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{})
+	cm := newDiscoveredMirrorManager(ctx, t, 2)
+	c := newBudgetDiskCacheWithLimit(ctx, t, budgetCacheLimitMB)
+
+	s := &Strategy{
+		ctx:          ctx,
+		cloneManager: cm,
+		cache:        c,
+		storage:      newStorageMetrics(),
+		config:       Config{StorageLimitMB: budgetCacheLimitMB / 2},
+	}
+
+	configured := int64(budgetCacheLimitMB) * mib
+	s.sampleStorageUsage(ctx)
+	assert.Equal(t, configured, c.SizeLimit(), "the budget was applied before the mirrors were all discovered")
+
+	s.ready.Store(true)
+	s.sampleStorageUsage(ctx)
+	assert.True(t, c.SizeLimit() < configured, "a ready strategy should enforce the shared budget")
 }
 
 func TestSampleStorageUsageRecordsRepoSizes(t *testing.T) {

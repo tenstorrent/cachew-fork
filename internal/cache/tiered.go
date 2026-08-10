@@ -57,6 +57,17 @@ func (c authoritativeCache) Namespace(namespace Namespace) Cache {
 	return authoritativeCache{Cache: c.Cache.Namespace(namespace)}
 }
 
+// Unwrap exposes the wrapped backend. Embedding the Cache interface promotes
+// only Cache's methods, so optional interfaces like SizeLimiter are otherwise
+// invisible through the wrapper.
+func (c authoritativeCache) Unwrap() Cache { return c.Cache }
+
+// cacheUnwrapper is implemented by wrappers that expose the cache they wrap, so
+// an assertion for an optional interface reaches the backend.
+type cacheUnwrapper interface {
+	Unwrap() Cache
+}
+
 var _ Cache = (*Tiered)(nil)
 
 // Close all underlying caches.
@@ -233,6 +244,97 @@ func StatAuthoritative(ctx context.Context, c Cache, key Key, opts ...Option) (h
 	}
 	headers, err := c.Stat(ctx, key, opts...)
 	return headers, errors.WithStack(err)
+}
+
+// SizeLimiter is a cache with a local size limit that can be changed at
+// runtime, so space can be shared with another component on the same volume.
+//
+// Backends with no local size limit do not implement it. S3 is one: its
+// reclamation is a bucket lifecycle policy. Callers must treat its absence as
+// "this cache takes no part in a shared budget".
+type SizeLimiter interface {
+	// SetSizeLimit reassigns the limit eviction enforces, in bytes. It is
+	// capped by the configured limit, so a caller can only ever hand the cache
+	// less space than the operator allowed.
+	SetSizeLimit(ctx context.Context, limitBytes int64)
+	// SizeLimit returns the limit currently being enforced, in bytes.
+	SizeLimit() int64
+}
+
+var _ SizeLimiter = (*Tiered)(nil)
+
+// localSizeLimiter returns the first tier with an adjustable size limit.
+//
+// The first such tier is the most local one, and so the one sharing a volume
+// with anything else competing for space. Deeper tiers are remote or
+// authoritative and are left alone, because shrinking them could discard the
+// only copy.
+func (t Tiered) localSizeLimiter() (SizeLimiter, bool) {
+	for _, c := range t.caches {
+		if sl, ok := resolveLocalSizeLimiter(c); ok {
+			return sl, true
+		}
+	}
+	return nil, false
+}
+
+// SetSizeLimit forwards to the most local tier that has an adjustable limit, and
+// does nothing when no tier has one.
+func (t Tiered) SetSizeLimit(ctx context.Context, limitBytes int64) {
+	if sl, ok := t.localSizeLimiter(); ok {
+		sl.SetSizeLimit(ctx, limitBytes)
+	}
+}
+
+// SizeLimit reports the limit of the most local tier that has an adjustable one,
+// and 0 when no tier has one.
+func (t Tiered) SizeLimit() int64 {
+	if sl, ok := t.localSizeLimiter(); ok {
+		return sl.SizeLimit()
+	}
+	return 0
+}
+
+// resolveLocalSizeLimiter finds the size limiter for the most local copy behind
+// c, reporting whether one exists.
+//
+// Wrappers are unwrapped before each assertion, because a single-backend cache
+// is wrapped in authoritativeCache and that hides the backend's SizeLimiter.
+//
+// Tiered is resolved through its tiers instead of asserted directly, because it
+// satisfies SizeLimiter whether or not any tier behind it is adjustable.
+// Asserting it would report success for an all-remote tier set, and the caller
+// would reserve budget no cache can use.
+func resolveLocalSizeLimiter(c Cache) (SizeLimiter, bool) {
+	for c != nil {
+		if t, ok := c.(Tiered); ok {
+			return t.localSizeLimiter()
+		}
+		if sl, ok := c.(SizeLimiter); ok {
+			return sl, true
+		}
+		u, ok := c.(cacheUnwrapper)
+		if !ok {
+			return nil, false
+		}
+		c = u.Unwrap()
+	}
+	return nil, false
+}
+
+// SetLocalSizeLimit sets the local size limit of whichever backend behind c has
+// one, returning the limit now in force and whether any backend had one.
+//
+// The limit in force can be below limitBytes, because a backend caps the request
+// at its configured limit. A caller dividing a shared budget must use the
+// returned value, or it holds back space the cache cannot use.
+func SetLocalSizeLimit(ctx context.Context, c Cache, limitBytes int64) (int64, bool) {
+	sl, ok := resolveLocalSizeLimiter(c)
+	if !ok {
+		return 0, false
+	}
+	sl.SetSizeLimit(ctx, limitBytes)
+	return sl.SizeLimit(), true
 }
 
 // Open returns a reader from the first cache that succeeds.

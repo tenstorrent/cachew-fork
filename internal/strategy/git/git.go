@@ -61,6 +61,9 @@ type Config struct {
 
 	StorageScanInterval time.Duration `hcl:"storage-scan-interval,optional" help:"How often to measure on-disk storage usage for the cachew_storage_* metrics. Each scan walks every mirror directory, so raise it if the mirror set is large. 0 or negative disables storage measurement." default:"15m"`
 
+	StorageLimitMB    int `hcl:"storage-limit-mb,optional" help:"Total on-disk budget in megabytes shared by the git mirrors and the object cache on the same volume. Mirrors take priority: the object cache gets what the mirrors are not using, down to storage-min-cache-mb, and its LRU eviction reclaims the difference. Mirrors are reclaimed, least recently served first, only when they alone do not fit. Enforced on the storage-scan-interval, so storage measurement must be enabled. 0 disables the shared budget and leaves each component its own limit." default:"0"`
+	StorageMinCacheMB int `hcl:"storage-min-cache-mb,optional" help:"Floor in megabytes on the object cache's share of storage-limit-mb, so growing mirrors cannot squeeze the cache to nothing and make every request a cold miss. Ignored when storage-limit-mb is 0." default:"5120"`
+
 	DisableUpstreamAuthz bool `hcl:"disable-upstream-authz,optional" help:"Disable all upstream authorization probing: per-request client authorization and the skip of proactive background refresh for auth-required repos. Unsafe: any client that can reach cachew can then read any mirrored private repo." default:"false"`
 }
 
@@ -147,6 +150,21 @@ func validateAndDefaultConfig(config Config) (Config, error) {
 	}
 	if config.IncrementalFetchTimeout < 0 {
 		return config, errors.Errorf("incremental-fetch-timeout must be positive, got %v", config.IncrementalFetchTimeout)
+	}
+	// A negative budget or floor disables both components instead of limiting
+	// either: a negative floor lifts the mirror ceiling above the whole budget,
+	// and the cache is then given an allowance SetSizeLimit refuses. A budget
+	// that is never measured is equally unenforced, because enforcement only
+	// runs on the storage scan.
+	if config.StorageLimitMB < 0 {
+		return config, errors.Errorf("storage-limit-mb must not be negative, got %d", config.StorageLimitMB)
+	}
+	if config.StorageMinCacheMB < 0 {
+		return config, errors.Errorf("storage-min-cache-mb must not be negative, got %d", config.StorageMinCacheMB)
+	}
+	if config.StorageLimitMB > 0 && config.StorageScanInterval <= 0 {
+		return config, errors.Errorf("storage-limit-mb requires storage measurement, but storage-scan-interval is %v",
+			config.StorageScanInterval)
 	}
 	if config.SnapshotInterval > 0 {
 		for _, bin := range []string{"tar", "pzstd"} {
@@ -433,6 +451,12 @@ func (s *Strategy) evictIdleMirrors(ctx context.Context, ttl time.Duration) erro
 			s.scheduleMaintenanceJobs(repo)
 			continue
 		}
+		// Measured before eviction, because afterwards the directory is gone. A
+		// failure here only costs the byte count on the metric.
+		size, sizeErr := dirSizeBytes(repo.Path())
+		if sizeErr != nil {
+			size = 0
+		}
 		evicted, err := s.cloneManager.Evict(ctx, repo, ttl)
 		if err != nil {
 			logger.ErrorContext(ctx, "Failed to evict idle mirror", "upstream", upstream, "error", err)
@@ -442,6 +466,7 @@ func (s *Strategy) evictIdleMirrors(ctx context.Context, ttl time.Duration) erro
 			s.scheduleMaintenanceJobs(repo)
 			continue
 		}
+		s.storage.recordMirrorEviction(ctx, mirrorEvictReasonIdle, size)
 		logger.InfoContext(ctx, "Evicted idle mirror", "upstream", upstream,
 			"idle_for", time.Since(repo.LastServed()).Round(time.Minute))
 	}

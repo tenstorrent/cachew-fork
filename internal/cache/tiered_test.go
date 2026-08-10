@@ -1118,3 +1118,76 @@ func TestTieredCacheSoak(t *testing.T) {
 		TTL:              5 * time.Minute,
 	})
 }
+
+func TestSetLocalSizeLimit(t *testing.T) {
+	const limit = 512 * 1024
+	for _, test := range []struct {
+		name    string
+		build   func(ctx context.Context, disk *cache.Disk) cache.Cache
+		applied bool
+	}{
+		{"SingleBackendIsWrappedAsAuthoritative", func(ctx context.Context, disk *cache.Disk) cache.Cache {
+			return newTiered(ctx, disk)
+		}, true},
+		{"MultipleTiers", func(ctx context.Context, disk *cache.Disk) cache.Cache {
+			return newTiered(ctx, disk, cache.NoOpCache())
+		}, true},
+		{"AdjustableTierIsNotFirst", func(ctx context.Context, disk *cache.Disk) cache.Cache {
+			return newTiered(ctx, cache.NoOpCache(), disk)
+		}, true},
+		{"NoAdjustableBackend", func(ctx context.Context, _ *cache.Disk) cache.Cache {
+			return newTiered(ctx, cache.NoOpCache())
+		}, false},
+		// Tiered satisfies SizeLimiter whatever is behind it, so a tier set with
+		// nothing adjustable must report failure rather than a silent no-op.
+		// The caller reserves budget based on that answer.
+		{"MultipleTiersNoneAdjustable", func(ctx context.Context, _ *cache.Disk) cache.Cache {
+			return newTiered(ctx, cache.NoOpCache(), cache.NoOpCache())
+		}, false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, ctx, _ := logging.Configure(t.Context(), logging.Config{Level: "debug"})
+
+			disk, err := cache.NewDisk(ctx, cache.DiskConfig{
+				Root:          t.TempDir(),
+				LimitMB:       10,
+				MaxTTL:        time.Hour,
+				EvictInterval: time.Hour,
+			})
+			assert.NoError(t, err)
+			defer disk.Close()
+
+			effective, applied := cache.SetLocalSizeLimit(ctx, test.build(ctx, disk), limit)
+			assert.Equal(t, test.applied, applied)
+			if !test.applied {
+				assert.Equal(t, int64(0), effective)
+				return
+			}
+			assert.Equal(t, int64(limit), effective)
+			assert.Equal(t, int64(limit), disk.SizeLimit())
+		})
+	}
+}
+
+// A request above the backend's configured limit is capped, and the reported
+// limit must be the capped value. A caller dividing a shared budget derives the
+// other component's ceiling from it, and would otherwise hold back space the
+// cache can never use.
+func TestSetLocalSizeLimitReportsCappedLimit(t *testing.T) {
+	_, ctx, _ := logging.Configure(t.Context(), logging.Config{Level: "debug"})
+
+	disk, err := cache.NewDisk(ctx, cache.DiskConfig{
+		Root:          t.TempDir(),
+		LimitMB:       10,
+		MaxTTL:        time.Hour,
+		EvictInterval: time.Hour,
+	})
+	assert.NoError(t, err)
+	defer disk.Close()
+
+	const configured = 10 * 1024 * 1024
+	effective, applied := cache.SetLocalSizeLimit(ctx, newTiered(ctx, disk, cache.NoOpCache()), 50*1024*1024)
+	assert.True(t, applied)
+	assert.Equal(t, int64(configured), effective)
+	assert.Equal(t, int64(configured), disk.SizeLimit())
+}

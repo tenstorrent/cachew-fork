@@ -21,11 +21,14 @@ import (
 	"github.com/tenstorrent/internal-cachew/internal/logging"
 )
 
+// diskBackendName is the config keyword for this backend and its metrics label.
+const diskBackendName = "disk"
+
 // RegisterDisk cache with the given registry.
 func RegisterDisk(r *Registry) {
 	Register(
 		r,
-		"disk",
+		diskBackendName,
 		"Caches objects on local disk, with a maximum size limit and LRU eviction",
 		NewDisk,
 	)
@@ -39,15 +42,32 @@ type DiskConfig struct {
 }
 
 type Disk struct {
-	logger       *slog.Logger
-	config       DiskConfig
-	namespace    Namespace
-	db           *diskMetaDB
-	size         *atomic.Int64
+	logger    *slog.Logger
+	config    DiskConfig
+	namespace Namespace
+	db        *diskMetaDB
+	size      *atomic.Int64
+	// limit is the size ceiling eviction enforces, in bytes. Starts at
+	// config.LimitMB. A pointer because Namespace views copy the struct but
+	// must share one mutable limit.
+	limit   *atomic.Int64
+	metrics *cacheMetrics
+	// runEviction is buffered so a request made during a sweep is queued
+	// instead of dropped; that sweep may already have read the old limit.
 	runEviction  chan struct{}
 	stop         context.CancelFunc
 	evictionDone chan struct{}
 	locks        *[diskLockStripes]sync.RWMutex
+	// recentAccess holds access times that recordRead throttled instead of
+	// persisting, so eviction still ranks by true access order. Sweeps run on
+	// every writer close and size-limit change, not just on evict-interval, so
+	// a key read inside the throttle window could otherwise be evicted while it
+	// is the most recently used entry.
+	//
+	// Entries are dropped when the stamp is persisted, when the key is deleted,
+	// and when a sweep expires or evicts it, so the map stays bounded by the
+	// live keyspace. A pointer because Namespace views must share one map.
+	recentAccess *sync.Map // map[evictEntryKey]time.Time
 }
 
 const diskLockStripes = 1024
@@ -122,12 +142,16 @@ func NewDisk(ctx context.Context, config DiskConfig) (*Disk, error) {
 		config:       config,
 		db:           db,
 		size:         &atomic.Int64{},
-		runEviction:  make(chan struct{}),
+		limit:        &atomic.Int64{},
+		metrics:      newCacheMetrics(diskBackendName),
+		runEviction:  make(chan struct{}, 1),
 		stop:         stop,
 		evictionDone: make(chan struct{}),
 		locks:        &[diskLockStripes]sync.RWMutex{},
+		recentAccess: &sync.Map{},
 	}
 	disk.size.Store(size)
+	disk.limit.Store(int64(config.LimitMB) * 1024 * 1024)
 
 	go disk.evictionLoop(ctx)
 
@@ -156,6 +180,39 @@ func (d *Disk) Size() int64 {
 	return d.size.Load()
 }
 
+// SizeLimit returns the size ceiling eviction is currently enforcing, in bytes.
+func (d *Disk) SizeLimit() int64 {
+	return d.limit.Load()
+}
+
+// SetSizeLimit changes the size ceiling eviction enforces and runs a sweep, so
+// a reduction takes effect immediately instead of at the next tick.
+//
+// The configured limit-mb is the maximum: a caller sharing a storage budget can
+// give the cache less space than the operator allowed, never more. A
+// non-positive limit is ignored, because a zero-sized cache misses everything.
+func (d *Disk) SetSizeLimit(ctx context.Context, limitBytes int64) {
+	configured := int64(d.config.LimitMB) * 1024 * 1024
+	if limitBytes <= 0 {
+		return
+	}
+	limitBytes = min(limitBytes, configured)
+	if d.limit.Swap(limitBytes) == limitBytes {
+		return
+	}
+	d.metrics.recordSizeLimit(ctx, limitBytes)
+	d.TriggerEviction()
+}
+
+// TriggerEviction asks the eviction loop to sweep. It never blocks: if a sweep
+// is already queued, a second request would only repeat it.
+func (d *Disk) TriggerEviction() {
+	select {
+	case d.runEviction <- struct{}{}:
+	default:
+	}
+}
+
 func (d *Disk) Stats(_ context.Context) (Stats, error) {
 	count, err := d.db.count()
 	if err != nil {
@@ -164,7 +221,7 @@ func (d *Disk) Stats(_ context.Context) (Stats, error) {
 	return Stats{
 		Objects:  count,
 		Size:     d.size.Load(),
-		Capacity: int64(d.config.LimitMB) * 1024 * 1024,
+		Capacity: d.limit.Load(),
 	}, nil
 }
 
@@ -208,6 +265,7 @@ func (d *Disk) Create(ctx context.Context, key Key, headers http.Header, ttl tim
 		path:      fullPath,
 		tempPath:  f.Name(),
 		expiresAt: expiresAt,
+		baseTTL:   ttl,
 		headers:   clonedHeaders,
 		ctx:       ctx,
 		cancel:    cancel,
@@ -239,6 +297,7 @@ func (d *Disk) Delete(_ context.Context, key Key) error {
 	if err := d.db.delete(d.namespace, key); err != nil {
 		return errors.Errorf("failed to delete TTL metadata: %w", err)
 	}
+	d.recentAccess.Delete(evictEntryKey{d.namespace, key})
 
 	d.size.Add(-info.Size())
 
@@ -256,27 +315,92 @@ func (d *Disk) Invalidate(ctx context.Context, key Key) error {
 	return errors.WithStack(err)
 }
 
+// recordRead bumps an entry's last access time for LRU and slides its expiry,
+// so entries that stay in demand stay warm.
+//
+// Expiry slides by the entry's own TTL, not max-ttl, so a short-lived object
+// stays short-lived. Entries written before base-TTL tracking have no recorded
+// TTL and expire on their original schedule.
+//
+// The slide is skipped while more than half the window remains, as in the S3
+// backend, otherwise every read of a hot key writes to bbolt to move an expiry
+// that is nowhere near firing.
+//
+// The persisted access stamp is throttled to one write per evict-interval for
+// the same reason. Throttled reads go to recentAccess, which eviction reads, so
+// the throttle costs only stamp durability across a restart, not LRU accuracy.
+func (d *Disk) recordRead(ctx context.Context, key Key, meta diskEntryMeta, now time.Time) error {
+	expiresAt := meta.expiresAt
+	extended := false
+	if meta.baseTTL > 0 && expiresAt.Sub(now) < meta.baseTTL/2 {
+		expiresAt = now.Add(min(meta.baseTTL, d.config.MaxTTL))
+		extended = true
+	}
+	if !extended && now.Sub(meta.lastAccessedAt) < d.config.EvictInterval {
+		d.recentAccess.Store(evictEntryKey{d.namespace, key}, now)
+		return nil
+	}
+	if err := d.db.recordAccess(d.namespace, key, expiresAt, now); err != nil {
+		return errors.Errorf("failed to record access: %w", err)
+	}
+	// The persisted stamp covers this read, so an overlay value no later than it
+	// is redundant. A concurrent throttled read may have stored a later time,
+	// which the stamp does not cover, so drop only the value seen here and only
+	// if it is still the one stored.
+	entry := evictEntryKey{d.namespace, key}
+	if prev, ok := d.recentAccess.Load(entry); ok {
+		if at, isTime := prev.(time.Time); !isTime || !at.After(now) {
+			d.recentAccess.CompareAndDelete(entry, prev)
+		}
+	}
+	if extended {
+		d.metrics.recordTTLExtension(ctx, d.namespace)
+	}
+	return nil
+}
+
+// statLocked reads and renews an entry's metadata under the key's read lock, so
+// a concurrent commit or delete cannot land between the read and the renewal.
+//
+// The expired case returns instead of deleting, because Delete takes the same
+// lock exclusively and the caller must release this one first.
+func (d *Disk) statLocked(
+	ctx context.Context, key Key, fullPath string, now time.Time,
+) (info os.FileInfo, headers http.Header, expired bool, err error) {
+	lock := d.keyLock(d.namespace, key)
+	lock.RLock()
+	defer lock.RUnlock()
+
+	info, err = os.Stat(fullPath)
+	if err != nil {
+		return nil, nil, false, errors.Errorf("failed to stat file: %w", err)
+	}
+	meta, err := d.db.getEntry(d.namespace, key)
+	if err != nil {
+		return nil, nil, false, errors.Errorf("failed to get metadata: %w", err)
+	}
+	if now.After(meta.expiresAt) {
+		return nil, nil, true, nil
+	}
+
+	// A stat is a read, so it renews the entry like an open does. Otherwise a
+	// client that only stats an object lets it expire while still using it.
+	if err := d.recordRead(ctx, key, meta, now); err != nil {
+		return nil, nil, false, err
+	}
+	return info, meta.headers, false, nil
+}
+
 func (d *Disk) Stat(ctx context.Context, key Key, opts ...Option) (http.Header, error) {
 	path := d.keyToPath(d.namespace, key)
 	fullPath := filepath.Join(d.config.Root, path)
 
-	info, err := os.Stat(fullPath)
+	info, headers, expired, err := d.statLocked(ctx, key, fullPath, time.Now())
 	if err != nil {
-		return nil, errors.Errorf("failed to stat file: %w", err)
+		return nil, err
 	}
-
-	expiresAt, err := d.db.getTTL(d.namespace, key)
-	if err != nil {
-		return nil, errors.Errorf("failed to get TTL: %w", err)
-	}
-
-	if time.Now().After(expiresAt) {
+	if expired {
 		return nil, errors.Join(fs.ErrNotExist, d.Delete(ctx, key))
-	}
-
-	headers, err := d.db.getHeaders(d.namespace, key)
-	if err != nil {
-		return nil, errors.Errorf("failed to get headers: %w", err)
 	}
 
 	headers.Set("Content-Length", strconv.FormatInt(info.Size(), 10))
@@ -286,7 +410,9 @@ func (d *Disk) Stat(ctx context.Context, key Key, opts ...Option) (http.Header, 
 	return headers, nil
 }
 
-func (d *Disk) openLocked(key Key, fullPath string, now time.Time) (f *os.File, headers http.Header, expired bool, err error) {
+func (d *Disk) openLocked(
+	ctx context.Context, key Key, fullPath string, now time.Time,
+) (f *os.File, headers http.Header, expired bool, err error) {
 	lock := d.keyLock(d.namespace, key)
 	lock.RLock()
 	defer lock.RUnlock()
@@ -295,29 +421,24 @@ func (d *Disk) openLocked(key Key, fullPath string, now time.Time) (f *os.File, 
 	if err != nil {
 		return nil, nil, false, errors.Errorf("failed to open file: %w", err)
 	}
-	expiresAt, err := d.db.getTTL(d.namespace, key)
+	meta, err := d.db.getEntry(d.namespace, key)
 	if err != nil {
 		return nil, nil, false, errors.Join(err, f.Close())
 	}
-	if now.After(expiresAt) {
+	if now.After(meta.expiresAt) {
 		return f, nil, true, nil
 	}
-	headers, err = d.db.getHeaders(d.namespace, key)
-	if err != nil {
-		return nil, nil, false, errors.Join(errors.Errorf("failed to get headers: %w", err), f.Close())
+	if err := d.recordRead(ctx, key, meta, now); err != nil {
+		return nil, nil, false, errors.Join(err, f.Close())
 	}
-	ttl := min(expiresAt.Sub(now), d.config.MaxTTL)
-	if err := d.db.recordAccess(d.namespace, key, now.Add(ttl), now); err != nil {
-		return nil, nil, false, errors.Join(errors.Errorf("failed to record access: %w", err), f.Close())
-	}
-	return f, headers, false, nil
+	return f, meta.headers, false, nil
 }
 
 func (d *Disk) Open(ctx context.Context, key Key, opts ...Option) (io.ReadCloser, http.Header, error) {
 	path := d.keyToPath(d.namespace, key)
 	fullPath := filepath.Join(d.config.Root, path)
 
-	f, headers, expired, err := d.openLocked(key, fullPath, time.Now())
+	f, headers, expired, err := d.openLocked(ctx, key, fullPath, time.Now())
 	if err != nil {
 		return nil, nil, err
 	}
@@ -370,15 +491,28 @@ func (d *Disk) evictionLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if err := d.evict(); err != nil {
+			if err := d.sweep(ctx); err != nil {
 				d.logger.ErrorContext(ctx, "eviction failed", "error", err)
 			}
 		case <-d.runEviction:
-			if err := d.evict(); err != nil {
+			if err := d.sweep(ctx); err != nil {
 				d.logger.ErrorContext(ctx, "eviction failed", "error", err)
 			}
 		}
 	}
+}
+
+// sweep runs one eviction pass and records the outcome, so "ran and reclaimed
+// nothing" can be told apart from "never ran".
+func (d *Disk) sweep(ctx context.Context) error {
+	start := time.Now()
+	err := d.evict(ctx)
+	status := "success"
+	if err != nil {
+		status = "error"
+	}
+	d.metrics.recordSweep(ctx, status, time.Since(start))
+	return errors.WithStack(err)
 }
 
 type evictFileInfo struct {
@@ -395,7 +529,7 @@ type evictEntryKey struct {
 	key       Key
 }
 
-func (d *Disk) evict() error {
+func (d *Disk) evict(ctx context.Context) error {
 	var remainingFiles []evictFileInfo
 	var expiredEntries []evictEntryKey
 	now := time.Now()
@@ -407,7 +541,10 @@ func (d *Disk) evict() error {
 		info, err := os.Stat(fullPath)
 		if err != nil {
 			if errors.Is(err, fs.ErrNotExist) {
+				// Metadata outliving its file. Reclaims no bytes, so it is
+				// counted separately from a real expiry.
 				expiredEntries = append(expiredEntries, evictEntryKey{namespace, key})
+				d.metrics.recordEviction(ctx, evictReasonOrphaned, namespace, 0)
 			}
 			return nil
 		}
@@ -418,6 +555,7 @@ func (d *Disk) evict() error {
 			}
 			expiredEntries = append(expiredEntries, evictEntryKey{namespace, key})
 			d.size.Add(-info.Size())
+			d.metrics.recordEviction(ctx, evictReasonExpired, namespace, info.Size())
 		} else {
 			remainingFiles = append(remainingFiles, evictFileInfo{
 				namespace:  namespace,
@@ -425,7 +563,7 @@ func (d *Disk) evict() error {
 				path:       path,
 				size:       info.Size(),
 				expiresAt:  expiresAt,
-				accessedAt: lastAccessedAt,
+				accessedAt: d.lastAccess(namespace, key, lastAccessedAt),
 			})
 		}
 		return nil
@@ -438,7 +576,7 @@ func (d *Disk) evict() error {
 		return err
 	}
 
-	return d.evictBySize(remainingFiles)
+	return d.evictBySize(ctx, remainingFiles)
 }
 
 func (d *Disk) deleteExpiredEntries(expiredEntries []evictEntryKey) error {
@@ -448,11 +586,31 @@ func (d *Disk) deleteExpiredEntries(expiredEntries []evictEntryKey) error {
 	if err := d.db.deleteAll(expiredEntries); err != nil {
 		return errors.Errorf("failed to delete expired metadata: %w", err)
 	}
+	// The entries are gone, so their throttled access times rank nothing.
+	// Dropping them keeps recentAccess bounded by the live keyspace.
+	for _, entry := range expiredEntries {
+		d.recentAccess.Delete(entry)
+	}
 	return nil
 }
 
-func (d *Disk) evictBySize(remainingFiles []evictFileInfo) error {
-	limitBytes := int64(d.config.LimitMB) * 1024 * 1024
+// lastAccess is the time eviction ranks an entry by: the later of the persisted
+// stamp and any throttled read recordRead kept in memory. Older in-memory values
+// are ignored, since a persist and a throttled read can land in either order.
+func (d *Disk) lastAccess(namespace Namespace, key Key, persisted time.Time) time.Time {
+	recent, ok := d.recentAccess.Load(evictEntryKey{namespace, key})
+	if !ok {
+		return persisted
+	}
+	at, ok := recent.(time.Time)
+	if !ok || !at.After(persisted) {
+		return persisted
+	}
+	return at
+}
+
+func (d *Disk) evictBySize(ctx context.Context, remainingFiles []evictFileInfo) error {
+	limitBytes := d.limit.Load()
 	if d.size.Load() <= limitBytes {
 		return nil
 	}
@@ -474,6 +632,7 @@ func (d *Disk) evictBySize(remainingFiles []evictFileInfo) error {
 		}
 		sizeEvictedEntries = append(sizeEvictedEntries, evictEntryKey{f.namespace, f.key})
 		d.size.Add(-f.size)
+		d.metrics.recordEviction(ctx, evictReasonSize, f.namespace, f.size)
 	}
 
 	return d.deleteExpiredEntries(sizeEvictedEntries)
@@ -487,6 +646,7 @@ type diskWriter struct {
 	path      string
 	tempPath  string
 	expiresAt time.Time
+	baseTTL   time.Duration
 	headers   http.Header
 	size      int64
 	ctx       context.Context
@@ -532,11 +692,7 @@ func (w *diskWriter) Close() error {
 	}
 
 	w.disk.size.Add(w.size)
-
-	select {
-	case w.disk.runEviction <- struct{}{}:
-	default:
-	}
+	w.disk.TriggerEviction()
 
 	return nil
 }
@@ -552,7 +708,7 @@ func (w *diskWriter) commitLocked() error {
 	if err := os.Rename(w.tempPath, w.path); err != nil {
 		return errors.Errorf("failed to rename temp file: %w", err)
 	}
-	if err := w.disk.db.set(w.key, w.namespace, w.expiresAt, time.Now(), w.headers); err != nil {
+	if err := w.disk.db.set(w.key, w.namespace, w.expiresAt, time.Now(), w.baseTTL, w.headers); err != nil {
 		return errors.Join(errors.Errorf("failed to set metadata: %w", err), os.Remove(w.path))
 	}
 	return nil
