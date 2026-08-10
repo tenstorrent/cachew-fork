@@ -14,7 +14,6 @@ import (
 	"github.com/alecthomas/errors"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/metric"
 
 	"github.com/tenstorrent/internal-cachew/internal/cache"
 	"github.com/tenstorrent/internal-cachew/internal/gitobject"
@@ -72,14 +71,14 @@ func NewAPIV1(
 		authz:      authz,
 		strategies: strategies,
 	}
-	authzDisabled := metrics.NewMetric[metric.Int64Gauge](otel.Meter("cachew.apiv1"), "cachew.authz.disabled", "",
-		"1 if a client-authorization escape hatch is enabled for this check, 0 otherwise. check identifies which: upstream (git strategy's disable-upstream-authz), object_api (apiv1's disable-git-object-authz)")
 	var objectAPIAuthzDisabled int64
 	if config.DisableGitObjectAuthz {
 		objectAPIAuthzDisabled = 1
 		s.logger.WarnContext(ctx, "Authorization of git object reads is disabled, any client reaching the object API can read private repository snapshots")
 	}
-	authzDisabled.Record(ctx, objectAPIAuthzDisabled, metric.WithAttributes(attribute.String("check", "object_api")))
+	metrics.NewConstGauge(otel.Meter("cachew.apiv1"), "cachew.authz.disabled", "",
+		"1 if a client-authorization escape hatch is enabled for this check, 0 otherwise. check identifies which: upstream (git strategy's disable-upstream-authz), object_api (apiv1's disable-git-object-authz)",
+		objectAPIAuthzDisabled, attribute.String("check", "object_api"))
 	mux.Handle("GET /api/v1/object/{namespace}/{key}", http.HandlerFunc(s.getObject))
 	mux.Handle("HEAD /api/v1/object/{namespace}/{key}", http.HandlerFunc(s.statObject))
 	mux.Handle("POST /api/v1/object/{namespace}/{key}", http.HandlerFunc(s.putObject))

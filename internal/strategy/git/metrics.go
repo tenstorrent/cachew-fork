@@ -38,7 +38,6 @@ type gitMetrics struct {
 	authzCheckTotal          metric.Int64Counter
 	authzCheckDuration       metric.Float64Histogram
 	backgroundFetchSkips     metric.Int64Counter
-	authzDisabled            metric.Int64Gauge
 }
 
 func newGitMetrics(ctx context.Context, config Config, logger *slog.Logger) *gitMetrics {
@@ -68,24 +67,22 @@ func newGitMetrics(ctx context.Context, config Config, logger *slog.Logger) *git
 		authzCheckTotal:          metrics.NewMetric[metric.Int64Counter](meter, "cachew.git.authz_checks_total", "{checks}", "Per-request client authorization outcomes by outcome (public, allowed, no_credentials, rejected, probe_error, internal_error) and repository"),
 		authzCheckDuration:       metrics.NewHistogram(meter, "cachew.git.authz_check_duration_seconds", "s", "Duration of per-request client authorization checks, including any upstream probe", metrics.FastLatencyBuckets()),
 		backgroundFetchSkips:     metrics.NewMetric[metric.Int64Counter](meter, "cachew.git.background_fetch_skips_total", "{skips}", "Background fetches skipped by reason (requires_auth, backoff, probe_error) and repository"),
-		authzDisabled:            metrics.NewMetric[metric.Int64Gauge](meter, "cachew.authz.disabled", "", "1 if a client-authorization escape hatch is enabled for this check, 0 otherwise. check identifies which: upstream (git strategy's disable-upstream-authz), object_api (apiv1's disable-git-object-authz)"),
 	}
-	m.recordAuthzDisabled(ctx, "upstream", config.DisableUpstreamAuthz)
+	registerAuthzDisabled(meter, "upstream", config.DisableUpstreamAuthz)
 	if config.DisableUpstreamAuthz {
 		logger.WarnContext(ctx, "Upstream authorization probing is disabled, any client reaching cachew can read any mirrored private repo")
 	}
 	return m
 }
 
-// recordAuthzDisabled publishes whether a client-authorization escape hatch
-// is enabled, so a dashboard can surface it regardless of whether anyone is
-// watching the startup log line for it.
-func (m *gitMetrics) recordAuthzDisabled(ctx context.Context, check string, disabled bool) {
+func registerAuthzDisabled(meter metric.Meter, check string, disabled bool) {
 	var v int64
 	if disabled {
 		v = 1
 	}
-	m.authzDisabled.Record(ctx, v, metric.WithAttributes(attribute.String("check", check)))
+	metrics.NewConstGauge(meter, "cachew.authz.disabled", "",
+		"1 if a client-authorization escape hatch is enabled for this check, 0 otherwise. check identifies which: upstream (git strategy's disable-upstream-authz), object_api (apiv1's disable-git-object-authz)",
+		v, attribute.String("check", check))
 }
 
 // recordAuthzCheck records the outcome and cost of a per-request client

@@ -1,8 +1,10 @@
 package metrics
 
 import (
+	"context"
 	"reflect"
 
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
 )
 
@@ -81,6 +83,35 @@ func NewHistogram(meter metric.Meter, path, unit, description string, buckets []
 		panic(err)
 	}
 	return h
+}
+
+// NewConstGauge publishes a value that is fixed for the life of the process,
+// such as whether a config flag is set.
+//
+// It must be an asynchronous gauge rather than an Int64Gauge written once at
+// construction. Instruments obtained from otel.Meter before
+// otel.SetMeterProvider installs a real provider are delegating stubs whose
+// Record is a no-op, and setting the delegate later only forwards subsequent
+// measurements — a single write made before that point is lost with no error.
+// An observable registration is replayed against the delegate and re-observed
+// on every collection, so it survives being constructed before metrics
+// initialisation.
+func NewConstGauge(
+	meter metric.Meter, path, unit, description string, value int64, attrs ...attribute.KeyValue,
+) metric.Int64ObservableGauge {
+	g, err := meter.Int64ObservableGauge(
+		path,
+		metric.WithUnit(unit),
+		metric.WithDescription(description),
+		metric.WithInt64Callback(func(_ context.Context, o metric.Int64Observer) error {
+			o.Observe(value, metric.WithAttributes(attrs...))
+			return nil
+		}),
+	)
+	if err != nil {
+		panic(err)
+	}
+	return g
 }
 
 func NewMetric[OM any](meter metric.Meter, path, unit, description string) OM {
