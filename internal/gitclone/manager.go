@@ -2,6 +2,7 @@ package gitclone
 
 import (
 	"context"
+	"encoding/hex"
 	"io/fs"
 	"maps"
 	"net/url"
@@ -87,6 +88,8 @@ type Config struct {
 	FetchTimeout     time.Duration `hcl:"fetch-timeout,optional" help:"Upper bound for 'git fetch' so a slow upstream cannot block the fetch path indefinitely." default:"5m"`
 	LsRemoteTimeout  time.Duration `hcl:"ls-remote-timeout,optional" help:"Upper bound for 'git ls-remote' so a slow upstream cannot block the request path indefinitely." default:"1m"`
 	RepackTimeout    time.Duration `hcl:"repack-timeout,optional" help:"Upper bound for 'git repack' so a slow repack on a large repository cannot block the scheduler queue indefinitely." default:"10m"`
+	PruneTimeout     time.Duration `hcl:"prune-timeout,optional" help:"Upper bound for the pruning repack, which rewrites every pack and so takes much longer than the geometric repack that repack-timeout bounds." default:"1h"`
+	PruneGrace       time.Duration `hcl:"prune-grace,optional" help:"How long an object must have been unreachable before the pruning repack deletes it. The first prune to see an object unreachable quarantines it as a loose file and starts the window; a later prune deletes it once the window has elapsed. This keeps a force-push from dropping an object a client is still mid-transfer on, since upload-pack serves the mirror without a lock. 0 deletes every unreachable object on the first prune that sees it." default:"24h"`
 	RepackThreads    int           `hcl:"repack-threads,optional" help:"Threads for git repack operations. Limits memory since windowMemory and deltaCacheSize are per-thread. 0 = pack-threads." default:"4"`
 	MirrorTTL        time.Duration `hcl:"mirror-ttl,optional" help:"Delete a mirrored repository that no client has requested for this long. Its next request re-clones it, so keep this well above mirror-snapshot-interval or eviction turns a warm serve into a cold one. 0 disables idle eviction." default:"0"`
 	MirrorEvictScan  time.Duration `hcl:"mirror-evict-scan,optional" help:"How often to scan mirrors for idle eviction. Ignored when mirror-ttl is 0." default:"1h"`
@@ -196,6 +199,13 @@ func NewManager(ctx context.Context, config Config, credentialProvider Credentia
 
 	if config.RepackTimeout == 0 {
 		config.RepackTimeout = 10 * time.Minute
+	}
+
+	// Also covers negatives: a non-positive timeout cancels the prune context
+	// before the first command starts, so every prune would fail rather than
+	// run unbounded.
+	if config.PruneTimeout <= 0 {
+		config.PruneTimeout = 1 * time.Hour
 	}
 
 	if config.MirrorEvictScan == 0 {
@@ -1422,6 +1432,203 @@ func (r *Repository) Repack(ctx context.Context) error {
 	repackCtx, cancel := context.WithTimeout(ctx, r.config.RepackTimeout)
 	defer cancel()
 
+	if err := r.runRepack(repackCtx, "-d", "--geometric=2", "--write-midx", "--write-bitmap-index"); err != nil {
+		return err
+	}
+
+	logger.InfoContext(ctx, "Geometric repack completed", "upstream", r.upstreamURL)
+	return nil
+}
+
+// PruneUnreachable reclaims objects that no ref points at any more. Those are
+// what git fetch --prune leaves behind: it deletes the ref, which makes the
+// objects unreachable, but never removes the objects themselves.
+//
+// A plain git prune would reclaim nothing. Mirrors set transfer.unpackLimit=1
+// so fetched objects always land in a pack, and prune only deletes loose
+// objects; dropping a packed one takes a repack that leaves it out. That is why
+// this passes -A instead of the --geometric roll-up [Repository.Repack] uses,
+// which combines packs wholesale and so carries unreachable objects forward
+// indefinitely. The cost is that every pack is rewritten, making this far more
+// expensive than the geometric repack.
+//
+// It takes two commands, the same pair git gc runs. repack -A does not delete
+// the objects it drops from a pack, it rewrites them as loose files; git prune
+// is what removes them, and only once they are older than --expire.
+//
+// git dates an object by when it was written, never by when it stopped being
+// reachable: a packed object inherits the mtime of the pack holding it, and
+// that mtime is preserved when repack loosens it. Handing --expire that date
+// directly cannot express a grace period, because a commit written months ago
+// and orphaned by a force-push a second later already reads as ancient. So the
+// mirror records the missing timestamp itself: objects this prune loosened are
+// the ones observed unreachable for the first time, and their mtime is stamped
+// to now, starting the window. A later prune leaves those already-loose objects
+// alone, so the clock keeps running, and deletes them once it has elapsed.
+//
+// prune-grace therefore means time since the object stopped being reachable,
+// which is the guarantee readers need: upload-pack serves the mirror without a
+// lock (mirrors set uploadpack.allowAnySHA1InWant, so unreachable objects are
+// serveable), and a client mid-clone must not have one deleted underneath it
+// just because a force-push landed. A zero grace disables the quarantine and
+// deletes every unreachable object on the first prune that sees it.
+//
+// Holds the fetch exclusion throughout, because a fetch writes objects before
+// it writes the refs that make them reachable, and a prune overlapping that
+// window would see those objects as garbage. A prune therefore blocks fetches
+// and snapshots on the repository until it finishes, which is why
+// prune-interval is meant to be much longer than fetch-interval.
+//
+// Returns the bytes the prune returned to the volume. Both measurements are
+// taken under the exclusion, so a concurrent fetch cannot grow the mirror
+// between them and hide the reclamation. It is a walk of the mirror directory
+// because the object count git reports says nothing about the bytes those
+// objects occupied. Best-effort: a failed walk costs the number, not the prune.
+func (r *Repository) PruneUnreachable(ctx context.Context) (int64, error) {
+	var reclaimed int64
+	err := r.WithFetchExclusion(ctx, func() error {
+		before, sizeErr := dirSizeBytes(r.path)
+		if sizeErr != nil {
+			before = 0
+		}
+
+		grace := max(r.config.PruneGrace, 0)
+
+		// One budget for both commands: the repack dominates, and prune has
+		// nothing to do if it did not finish.
+		pruneCtx, cancel := context.WithTimeout(ctx, r.config.PruneTimeout)
+		defer cancel()
+
+		quarantined, looseErr := looseObjects(r.path)
+		if looseErr != nil {
+			return looseErr
+		}
+
+		// No --unpack-unreachable: that flag would delete the objects git reads
+		// as older than the cutoff instead of loosening them, which is exactly
+		// the case grace has to cover. Bare -A loosens every unreachable object.
+		if err := r.runRepack(pruneCtx, "-A", "-d", "--write-midx", "--write-bitmap-index"); err != nil {
+			return err
+		}
+
+		// Stamped before the cutoff is taken so a zero grace still expires them.
+		if grace > 0 {
+			if err := startQuarantine(r.path, quarantined, time.Now()); err != nil {
+				return err
+			}
+		}
+
+		// Measured after the wait for the exclusion, so the window is grace
+		// from when the prune runs rather than from when it was queued.
+		cutoff := time.Now().Add(-grace).Format(time.RFC3339)
+
+		// #nosec G204 - r.path is controlled by us and cutoff is a formatted timestamp
+		cmd := exec.CommandContext(pruneCtx, "git", "-C", r.path, "prune", "--expire="+cutoff)
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+		cmd.Cancel = func() error {
+			return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		}
+		if output, err := cmd.CombinedOutput(); err != nil {
+			return errors.Wrapf(err, "git prune: %s", string(output))
+		}
+
+		if before > 0 {
+			if after, afterErr := dirSizeBytes(r.path); afterErr == nil {
+				reclaimed = before - after
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	return reclaimed, nil
+}
+
+// looseObjects returns the path of every loose object in the mirror, which is
+// how a prune tells the objects it just loosened from those an earlier prune
+// already quarantined and whose grace window is therefore already running.
+func looseObjects(repoPath string) (map[string]struct{}, error) {
+	objectsDir := filepath.Join(repoPath, "objects")
+	fanouts, err := os.ReadDir(objectsDir)
+	if err != nil {
+		return nil, errors.Wrapf(err, "read %s", objectsDir)
+	}
+
+	loose := make(map[string]struct{})
+	for _, fanout := range fanouts {
+		// objects/ also holds pack/ and info/; only the two-hex-digit fanout
+		// directories hold loose objects.
+		if !fanout.IsDir() || len(fanout.Name()) != 2 {
+			continue
+		}
+		if _, err := hex.DecodeString(fanout.Name()); err != nil {
+			continue
+		}
+		dir := filepath.Join(objectsDir, fanout.Name())
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return nil, errors.Wrapf(err, "read %s", dir)
+		}
+		for _, entry := range entries {
+			loose[filepath.Join(dir, entry.Name())] = struct{}{}
+		}
+	}
+	return loose, nil
+}
+
+// startQuarantine stamps every loose object that alreadyLoose does not cover
+// with now, recording when the mirror first observed it unreachable. git
+// carries the original write time across the loosening, so without this the
+// grace window would be measured from when the object was written.
+func startQuarantine(repoPath string, alreadyLoose map[string]struct{}, now time.Time) error {
+	current, err := looseObjects(repoPath)
+	if err != nil {
+		return err
+	}
+	for path := range current {
+		if _, quarantined := alreadyLoose[path]; quarantined {
+			continue
+		}
+		// A concurrent reader cannot delete these, but a crashed prune may have
+		// left a stale entry, so a vanished object is not an error.
+		if err := os.Chtimes(path, now, now); err != nil && !os.IsNotExist(err) {
+			return errors.Wrapf(err, "stamp quarantine on %s", path)
+		}
+	}
+	return nil
+}
+
+// dirSizeBytes sums the apparent size of every regular file under root.
+// Entries that vanish under the walk are skipped: a prune deletes files while
+// it runs, and those bytes really are gone.
+func dirSizeBytes(root string) (int64, error) {
+	var total int64
+	err := filepath.WalkDir(root, func(_ string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil //nolint:nilerr // best-effort: skip unreadable entries
+		}
+		info, infoErr := d.Info()
+		if infoErr != nil {
+			return nil //nolint:nilerr // entry vanished or is unreadable
+		}
+		if info.Mode().IsRegular() {
+			total += info.Size()
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, errors.Wrapf(err, "walk %s", root)
+	}
+	return total, nil
+}
+
+// runRepack invokes git repack with the given arguments, cleaning up the
+// multi-pack-index lock if the process is killed.
+func (r *Repository) runRepack(ctx context.Context, repackArgs ...string) error {
 	threads := r.config.RepackThreads
 	if threads <= 0 {
 		threads = r.config.PackThreads
@@ -1431,12 +1638,16 @@ func (r *Repository) Repack(ctx context.Context) error {
 	// config uses high values (512m deltaCacheSize, 1g windowMemory) tuned for
 	// serving performance with many threads. Repack is a background task that
 	// can afford to be slower in exchange for bounded memory.
-	// #nosec G204 - r.path is controlled by us
-	cmd := exec.CommandContext(repackCtx, "git", "-C", r.path,
-		"-c", "pack.threads="+strconv.Itoa(threads),
+	args := append([]string{
+		"-C", r.path,
+		"-c", "pack.threads=" + strconv.Itoa(threads),
 		"-c", "pack.windowMemory=256m",
 		"-c", "pack.deltaCacheSize=128m",
-		"repack", "-d", "--geometric=2", "--write-midx", "--write-bitmap-index")
+		"repack",
+	}, repackArgs...)
+
+	// #nosec G204 - r.path is controlled by us, as are the caller's flags
+	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error {
 		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
@@ -1449,12 +1660,11 @@ func (r *Repository) Repack(ctx context.Context) error {
 		// serving performance. Remove it so the next attempt can proceed.
 		lockPath := filepath.Join(r.path, "objects", "pack", "multi-pack-index.lock")
 		if rmErr := os.Remove(lockPath); rmErr == nil {
-			logger.WarnContext(ctx, "Removed stale multi-pack-index.lock after repack failure", "upstream", r.upstreamURL)
+			logging.FromContext(ctx).WarnContext(ctx,
+				"Removed stale multi-pack-index.lock after repack failure", "upstream", r.upstreamURL)
 		}
 		return errors.Wrapf(err, "git repack: %s", string(output))
 	}
-
-	logger.InfoContext(ctx, "Geometric repack completed", "upstream", r.upstreamURL)
 	return nil
 }
 

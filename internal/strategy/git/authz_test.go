@@ -345,6 +345,10 @@ func (c *capturingScheduler) SubmitPeriodicJob(_, id string, _ time.Duration, ru
 	c.jobs[id] = run
 }
 
+func (c *capturingScheduler) SubmitPeriodicJobAfter(queue, id string, _, interval time.Duration, run func(ctx context.Context) error) {
+	c.SubmitPeriodicJob(queue, id, interval, run)
+}
+
 func (c *capturingScheduler) CancelPeriodicJob(_, id string) {
 	delete(c.jobs, id)
 }

@@ -67,7 +67,7 @@ func (s *Strategy) handleEnsureRefs(w http.ResponseWriter, r *http.Request, host
 	// status and fetched are mutated by the handler and read by the deferred
 	// metric. Default to "error" so that any early return without explicit
 	// classification is treated as a failure.
-	status := "error"
+	status := statusError
 	fetched := false
 	defer func() {
 		span.SetAttributes(attribute.String("cachew.status", status), attribute.Bool("cachew.fetched", fetched))
@@ -141,6 +141,6 @@ func (s *Strategy) handleEnsureRefs(w http.ResponseWriter, r *http.Request, host
 	if len(missingCommits) > 0 {
 		status = "missing_commits"
 	} else {
-		status = "success"
+		status = statusSuccess
 	}
 }

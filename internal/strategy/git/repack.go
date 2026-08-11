@@ -2,6 +2,7 @@ package git
 
 import (
 	"context"
+	"hash/fnv"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,10 +14,22 @@ import (
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/tenstorrent/internal-cachew/internal/gitclone"
+	"github.com/tenstorrent/internal-cachew/internal/logging"
+)
+
+// repackJobID and pruneJobID are separate periodic jobs submitted on the
+// repository's own queue, so they never overlap each other or a snapshot. They
+// are deliberately not ordered relative to one another: prune deletes the
+// unreachable objects outright, so a geometric repack that follows it has
+// nothing to undo, and a prune that follows a repack still sees every
+// unreachable object because a geometric roll-up carries them forward.
+const (
+	repackJobID = "repack-periodic"
+	pruneJobID  = "prune-periodic"
 )
 
 func (s *Strategy) scheduleRepackJobs(repo *gitclone.Repository) {
-	s.scheduler.SubmitPeriodicJob(repo.UpstreamURL(), "repack-periodic", s.config.RepackInterval, func(ctx context.Context) (returnErr error) {
+	s.scheduler.SubmitPeriodicJob(repo.UpstreamURL(), repackJobID, s.config.RepackInterval, func(ctx context.Context) (returnErr error) {
 		upstream := repo.UpstreamURL()
 		ctx, span := tracer.Start(ctx, "git.repack",
 			trace.WithAttributes(
@@ -42,9 +55,9 @@ func (s *Strategy) scheduleRepackJobs(repo *gitclone.Repository) {
 
 		start := time.Now()
 		err := repo.Repack(ctx)
-		status := "success"
+		status := statusSuccess
 		if err != nil {
-			status = "error"
+			status = statusError
 		}
 		s.metrics.recordOperation(ctx, "repack", status, "background", time.Since(start))
 
@@ -55,6 +68,68 @@ func (s *Strategy) scheduleRepackJobs(repo *gitclone.Repository) {
 
 		return errors.Wrap(err, "repack")
 	})
+}
+
+// schedulePruneJobs registers the periodic reclamation of objects that no ref
+// points at any more. Kept separate from the repack job because it is far more
+// expensive, holds the fetch exclusion, and so runs on its own much longer
+// interval.
+//
+// Its first run is staggered rather than immediate: enabling pruning, or
+// restarting a server whose mirrors have never been pruned, would otherwise
+// queue a full-pack rewrite for every mirror at once, each holding that
+// mirror's fetch exclusion.
+func (s *Strategy) schedulePruneJobs(repo *gitclone.Repository) {
+	upstream := repo.UpstreamURL()
+	firstRun := firstPruneDelay(upstream, s.config.PruneInterval)
+	s.scheduler.SubmitPeriodicJobAfter(upstream, pruneJobID, firstRun, s.config.PruneInterval, func(ctx context.Context) (returnErr error) {
+		ctx, span := tracer.Start(ctx, "git.prune",
+			trace.WithAttributes(
+				attribute.String("cachew.operation", "prune"),
+				attribute.String("cachew.upstream", upstream),
+			),
+		)
+		defer func() {
+			if returnErr != nil {
+				span.RecordError(returnErr)
+				span.SetStatus(codes.Error, returnErr.Error())
+			}
+			span.End()
+		}()
+
+		logger := logging.FromContext(ctx)
+		logger.InfoContext(ctx, "Prune started", "upstream", upstream)
+
+		start := time.Now()
+		reclaimed, err := repo.PruneUnreachable(ctx)
+		status := statusSuccess
+		if err != nil {
+			status = statusError
+		}
+		s.metrics.recordOperation(ctx, "prune", status, "background", time.Since(start))
+
+		if err == nil {
+			logger.InfoContext(ctx, "Prune completed", "upstream", upstream, "reclaimed_bytes", reclaimed)
+			s.metrics.recordPruneReclaimed(ctx, upstream, reclaimed)
+			span.SetAttributes(attribute.Int64("cachew.prune_reclaimed_bytes", reclaimed))
+		}
+
+		return errors.Wrap(err, "prune")
+	})
+}
+
+// firstPruneDelay spreads mirrors' first prunes over the interval, keyed on the
+// upstream URL so a mirror lands in the same slot across restarts instead of
+// walking towards the front of the window each time the server comes up.
+func firstPruneDelay(upstream string, interval time.Duration) time.Duration {
+	if interval <= 0 {
+		return 0
+	}
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(upstream))
+	// #nosec G115 -- interval > 0 here, so uint64(interval) <= math.MaxInt64 and
+	// the modulo result is always < interval, which can never overflow back to int64.
+	return time.Duration(h.Sum64() % uint64(interval))
 }
 
 // countPackFiles returns the number of .pack files in the mirror's

@@ -1152,12 +1152,7 @@ func (s *Strategy) scheduleDeferredMirrorRestore(ctx context.Context, repo *gitc
 		repo.MarkReady()
 		logger.InfoContext(ctx, "Deferred mirror restore completed", "upstream", upstream)
 
-		if s.config.SnapshotInterval > 0 {
-			s.scheduleSnapshotJobs(repo)
-		}
-		if s.config.RepackInterval > 0 {
-			s.scheduleRepackJobs(repo)
-		}
+		s.scheduleMaintenanceJobs(repo)
 		return nil
 	})
 }

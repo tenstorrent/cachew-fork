@@ -51,6 +51,7 @@ type Config struct {
 	SnapshotMaxAge         time.Duration `hcl:"snapshot-max-age,optional" help:"How long an unchanged snapshot (same HEAD commit) may be served before regeneration. Requires shared metadata; keep well below the cache max-ttl. 0 regenerates every interval." default:"24h"`
 	MirrorSnapshotInterval time.Duration `hcl:"mirror-snapshot-interval,optional" help:"How often to generate mirror snapshots for pod bootstrap. 0 uses snapshot-interval. Defaults to 2h." default:"2h"`
 	RepackInterval         time.Duration `hcl:"repack-interval,optional" help:"How often to run full repack. 0 disables." default:"0"`
+	PruneInterval          time.Duration `hcl:"prune-interval,optional" help:"How often to reclaim objects no ref points at any more, which git fetch --prune orphans but never deletes. Unlike repack-interval's geometric roll-up this rewrites every pack, so it is far more expensive and belongs on a much longer interval. Runs while holding the fetch exclusion, so a mirror is not fetched or snapshotted during it. 0 disables pruning, and mirrors then grow monotonically with upstream ref churn." default:"0"`
 	ZstdThreads            int           `hcl:"zstd-threads,optional" help:"Threads for zstd compression/decompression. 0 = all CPU cores; useful for short-lived CLI invocations but risky on a long-running server where multiple snapshot/restore operations can run concurrently." default:"4"`
 	BundleCacheTTL         time.Duration `hcl:"bundle-cache-ttl,optional" help:"TTL of cached server-side git bundles." default:"2h"`
 
@@ -402,6 +403,9 @@ func (s *Strategy) scheduleMaintenanceJobs(repo *gitclone.Repository) {
 	if s.config.RepackInterval > 0 {
 		s.scheduleRepackJobs(repo)
 	}
+	if s.config.PruneInterval > 0 {
+		s.schedulePruneJobs(repo)
+	}
 }
 
 // maintenanceJobIDs are the periodic jobs scheduleMaintenanceJobs registers per
@@ -413,7 +417,8 @@ var maintenanceJobIDs = []string{
 	snapshotJobBase + "-periodic",
 	snapshotJobLFS + "-periodic",
 	snapshotJobMirror + "-periodic",
-	"repack-periodic",
+	repackJobID,
+	pruneJobID,
 }
 
 func (s *Strategy) cancelMaintenanceJobs(repo *gitclone.Repository) {
@@ -543,6 +548,7 @@ func (s *Strategy) handleRequest(w http.ResponseWriter, r *http.Request) {
 	// requests, unknown paths, etc.) is forwarded to upstream so it isn't
 	// mistakenly treated as a clone/fetch.
 	if isGitRequest(pathValue) {
+		s.metrics.recordRequest(ctx, gitRequestType(pathValue))
 		s.handleGitRequest(w, r, host, pathValue)
 		return
 	}
@@ -876,6 +882,16 @@ func isGitRequest(pathValue string) bool {
 		strings.HasSuffix(pathValue, "/git-upload-pack")
 }
 
+// gitRequestType labels the two smart-HTTP endpoints served locally. Only ever
+// called for a path isGitRequest accepted, so anything that is not ref
+// discovery is negotiation.
+func gitRequestType(pathValue string) string {
+	if strings.HasSuffix(pathValue, "/info/refs") {
+		return "info-refs"
+	}
+	return "upload-pack"
+}
+
 func ExtractRepoPath(pathValue string) string {
 	repoPath := pathValue
 	repoPath = strings.TrimSuffix(repoPath, "/info/refs")
@@ -969,12 +985,7 @@ func (s *Strategy) startClone(ctx context.Context, repo *gitclone.Repository) (r
 
 			logger.InfoContext(ctx, "Post-restore fetch completed, serving", "upstream", upstream)
 
-			if s.config.SnapshotInterval > 0 {
-				s.scheduleSnapshotJobs(repo)
-			}
-			if s.config.RepackInterval > 0 {
-				s.scheduleRepackJobs(repo)
-			}
+			s.scheduleMaintenanceJobs(repo)
 			return nil
 		}
 	}
@@ -999,12 +1010,7 @@ func (s *Strategy) startClone(ctx context.Context, repo *gitclone.Repository) (r
 	s.metrics.recordOperation(ctx, "clone", "success", "background", time.Since(cloneStart))
 	logger.InfoContext(ctx, "Clone completed", "upstream", upstream, "path", repo.Path())
 
-	if s.config.SnapshotInterval > 0 {
-		s.scheduleSnapshotJobs(repo)
-	}
-	if s.config.RepackInterval > 0 {
-		s.scheduleRepackJobs(repo)
-	}
+	s.scheduleMaintenanceJobs(repo)
 	return nil
 }
 

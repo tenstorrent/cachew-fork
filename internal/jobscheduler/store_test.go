@@ -204,3 +204,49 @@ func TestScheduleStoreDeleteLastRun(t *testing.T) {
 	// A cancelled job may be cancelled again, or never have run at all.
 	assert.NoError(t, store.DeleteLastRun("periodic:queue1"), "deleting an absent key should succeed")
 }
+
+func TestPeriodicJobAfterHoldsBackTheFirstRun(t *testing.T) {
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{Level: "error"})
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	dbPath := filepath.Join(t.TempDir(), "scheduler.db")
+	scheduler, err := jobscheduler.New(ctx, jobscheduler.Config{Concurrency: 2, SchedulerDB: dbPath})
+	assert.NoError(t, err)
+	defer scheduler.Close()
+
+	var executed atomic.Bool
+	scheduler.SubmitPeriodicJobAfter("queue1", "periodic", 300*time.Millisecond, 5*time.Second, func(_ context.Context) error {
+		executed.Store(true)
+		return nil
+	})
+
+	time.Sleep(100 * time.Millisecond)
+	assert.False(t, executed.Load(), "job should not run before its initial delay elapses")
+	eventually(t, time.Second, executed.Load, "job should run once its initial delay elapses")
+}
+
+func TestPeriodicJobAfterIgnoresInitialDelayOnceStamped(t *testing.T) {
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{Level: "error"})
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	dbPath := filepath.Join(t.TempDir(), "scheduler.db")
+
+	store, err := jobscheduler.NewScheduleStore(dbPath)
+	assert.NoError(t, err)
+	assert.NoError(t, store.SetLastRun("periodic:queue1", time.Now().Add(-10*time.Second)))
+	assert.NoError(t, store.Close())
+
+	scheduler, err := jobscheduler.New(ctx, jobscheduler.Config{Concurrency: 2, SchedulerDB: dbPath})
+	assert.NoError(t, err)
+	defer scheduler.Close()
+
+	var executed atomic.Bool
+	scheduler.SubmitPeriodicJobAfter("queue1", "periodic", time.Minute, 5*time.Second, func(_ context.Context) error {
+		executed.Store(true)
+		return nil
+	})
+
+	eventually(t, time.Second, executed.Load, "an overdue job should not be held back by the initial delay")
+}

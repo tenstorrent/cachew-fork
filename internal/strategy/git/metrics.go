@@ -38,6 +38,7 @@ type gitMetrics struct {
 	authzCheckTotal          metric.Int64Counter
 	authzCheckDuration       metric.Float64Histogram
 	backgroundFetchSkips     metric.Int64Counter
+	pruneReclaimedBytes      metric.Int64Counter
 }
 
 func newGitMetrics(ctx context.Context, config Config, logger *slog.Logger) *gitMetrics {
@@ -67,6 +68,7 @@ func newGitMetrics(ctx context.Context, config Config, logger *slog.Logger) *git
 		authzCheckTotal:          metrics.NewMetric[metric.Int64Counter](meter, "cachew.git.authz_checks_total", "{checks}", "Per-request client authorization outcomes by outcome (public, allowed, no_credentials, rejected, probe_error, internal_error) and repository"),
 		authzCheckDuration:       metrics.NewHistogram(meter, "cachew.git.authz_check_duration_seconds", "s", "Duration of per-request client authorization checks, including any upstream probe", metrics.FastLatencyBuckets()),
 		backgroundFetchSkips:     metrics.NewMetric[metric.Int64Counter](meter, "cachew.git.background_fetch_skips_total", "{skips}", "Background fetches skipped by reason (requires_auth, backoff, probe_error) and repository"),
+		pruneReclaimedBytes:      metrics.NewMetric[metric.Int64Counter](meter, "cachew.git.prune_reclaimed_bytes_total", "By", "Bytes returned to the volume by pruning objects no ref points at any more, by repository. A flat zero while prunes are running means mirror growth is reachable history, not orphaned objects"),
 	}
 	registerAuthzDisabled(meter, "upstream", config.DisableUpstreamAuthz)
 	if config.DisableUpstreamAuthz {
@@ -105,6 +107,25 @@ func (m *gitMetrics) recordBackgroundFetchSkip(ctx context.Context, repo, reason
 		attribute.String("reason", reason),
 	))
 }
+
+// recordPruneReclaimed records the bytes a prune returned to the volume. A
+// prune that ran while the mirror grew for another reason can measure negative,
+// which is dropped rather than recorded as a reclaim of zero, so the counter
+// only ever reflects real reclamation.
+func (m *gitMetrics) recordPruneReclaimed(ctx context.Context, repo string, bytes int64) {
+	if bytes <= 0 {
+		return
+	}
+	m.pruneReclaimedBytes.Add(ctx, bytes, metric.WithAttributes(
+		attribute.String("repository", repo),
+	))
+}
+
+// Values of the status label on operation and ensure-refs metrics.
+const (
+	statusSuccess = "success"
+	statusError   = "error"
+)
 
 // recordOperation records the duration and outcome of a git operation (clone,
 // fetch, repack, snapshot). trigger is "background" for scheduled-job work and

@@ -58,6 +58,13 @@ type Scheduler interface {
 	// paths for the same repository, and without this each registration would
 	// add an independent self-re-arming chain, multiplying the job's real rate.
 	SubmitPeriodicJob(queue, id string, interval time.Duration, run func(ctx context.Context) error)
+	// SubmitPeriodicJobAfter is [Scheduler.SubmitPeriodicJob] with the first
+	// run held back by initialDelay instead of firing immediately. Use it for
+	// jobs expensive enough that having every registration of them run at once
+	// on startup is itself a problem. The delay applies only when the job has
+	// no recorded last run; a job that already has one keeps waiting out the
+	// remainder of its interval as usual.
+	SubmitPeriodicJobAfter(queue, id string, initialDelay, interval time.Duration, run func(ctx context.Context) error)
 	// CancelPeriodicJob stops the periodic chain for (queue, id) and drops any
 	// pending run of it that has not started yet. A run already in progress is
 	// left to finish. Cancelling a job that is not registered is a no-op, and a
@@ -80,6 +87,10 @@ func (p *prefixedScheduler) Submit(queue, id string, run func(ctx context.Contex
 
 func (p *prefixedScheduler) SubmitPeriodicJob(queue, id string, interval time.Duration, run func(ctx context.Context) error) {
 	p.scheduler.SubmitPeriodicJob(p.prefix+queue, id, interval, run)
+}
+
+func (p *prefixedScheduler) SubmitPeriodicJobAfter(queue, id string, initialDelay, interval time.Duration, run func(ctx context.Context) error) {
+	p.scheduler.SubmitPeriodicJobAfter(p.prefix+queue, id, initialDelay, interval, run)
 }
 
 func (p *prefixedScheduler) CancelPeriodicJob(queue, id string) {
@@ -222,6 +233,14 @@ func (q *RootScheduler) Submit(queue, id string, run func(ctx context.Context) e
 }
 
 func (q *RootScheduler) SubmitPeriodicJob(queue, id string, interval time.Duration, run func(ctx context.Context) error) {
+	q.submitPeriodic(queue, id, 0, interval, run)
+}
+
+func (q *RootScheduler) SubmitPeriodicJobAfter(queue, id string, initialDelay, interval time.Duration, run func(ctx context.Context) error) {
+	q.submitPeriodic(queue, id, initialDelay, interval, run)
+}
+
+func (q *RootScheduler) submitPeriodic(queue, id string, initialDelay, interval time.Duration, run func(ctx context.Context) error) {
 	if q.ctx.Err() != nil || q.isDraining() {
 		return
 	}
@@ -238,7 +257,7 @@ func (q *RootScheduler) SubmitPeriodicJob(queue, id string, interval time.Durati
 	gen := q.periodicSeq
 	q.periodic[key] = gen
 	q.lock.Unlock()
-	q.armPeriodic(queue, id, key, gen, interval, run)
+	q.armPeriodic(queue, id, key, gen, initialDelay, interval, run)
 }
 
 // armPeriodic schedules one firing of a periodic chain and, once it has run,
@@ -246,8 +265,14 @@ func (q *RootScheduler) SubmitPeriodicJob(queue, id string, interval time.Durati
 // re-arm must not go back through that function's idempotency check: the chain
 // still owns its key while re-arming, so routing the re-arm through the public
 // entry point would make it a no-op and the chain would stop after one run.
-func (q *RootScheduler) armPeriodic(queue, id, key string, gen uint64, interval time.Duration, run func(ctx context.Context) error) {
-	delay := q.periodicDelay(key, interval)
+//
+// initialDelay only applies to a job with no recorded last run, and so is
+// passed as zero when re-arming.
+func (q *RootScheduler) armPeriodic(queue, id, key string, gen uint64, initialDelay, interval time.Duration, run func(ctx context.Context) error) {
+	delay := initialDelay
+	if remaining, stamped := q.periodicDelay(key, interval); stamped {
+		delay = remaining
+	}
 	submit := func() {
 		if !q.periodicCurrent(key, gen) {
 			return
@@ -264,7 +289,7 @@ func (q *RootScheduler) armPeriodic(queue, id, key string, gen uint64, interval 
 			// to wake and submit to a dead scheduler. The new pod's
 			// warmExistingRepos re-registers periodic jobs on startup.
 			go q.sleepThenSubmit(interval, func() {
-				q.armPeriodic(queue, id, key, gen, interval, run)
+				q.armPeriodic(queue, id, key, gen, 0, interval, run)
 			})
 			return errors.WithStack(err)
 		})
@@ -344,18 +369,22 @@ func (q *RootScheduler) sleepThenSubmit(d time.Duration, fn func()) {
 	}
 }
 
-func (q *RootScheduler) periodicDelay(key string, interval time.Duration) time.Duration {
+// periodicDelay returns how long is left of the interval since the job's last
+// recorded run, and whether such a run was recorded at all. An unrecorded job
+// has never run under a store that survives restarts, so callers decide for
+// themselves whether it should fire immediately.
+func (q *RootScheduler) periodicDelay(key string, interval time.Duration) (time.Duration, bool) {
 	if q.store == nil {
-		return 0
+		return 0, false
 	}
 	lastRun, ok, err := q.store.GetLastRun(key)
 	if err != nil || !ok {
-		return 0
+		return 0, false
 	}
 	if remaining := time.Until(lastRun.Add(interval)); remaining > 0 {
-		return remaining
+		return remaining, true
 	}
-	return 0
+	return 0, true
 }
 
 // Wait blocks until all worker goroutines have exited. The caller should
