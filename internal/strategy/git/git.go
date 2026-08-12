@@ -52,6 +52,7 @@ type Config struct {
 	MirrorSnapshotInterval time.Duration `hcl:"mirror-snapshot-interval,optional" help:"How often to generate mirror snapshots for pod bootstrap. 0 uses snapshot-interval. Defaults to 2h." default:"2h"`
 	RepackInterval         time.Duration `hcl:"repack-interval,optional" help:"How often to run full repack. 0 disables." default:"0"`
 	PruneInterval          time.Duration `hcl:"prune-interval,optional" help:"How often to reclaim objects no ref points at any more, which git fetch --prune orphans but never deletes. Unlike repack-interval's geometric roll-up this rewrites every pack, so it is far more expensive and belongs on a much longer interval. Runs while holding the fetch exclusion, so a mirror is not fetched or snapshotted during it. 0 disables pruning, and mirrors then grow monotonically with upstream ref churn." default:"0"`
+	StartupMaintenance     bool          `hcl:"startup-maintenance,optional" help:"Run one prune and repack over every mirror discovered at startup, immediately after its startup fetch, instead of waiting out prune-interval's per-mirror stagger. Each enabled operation still obeys its own interval switch, so this only moves the first run earlier and never enables an operation that is otherwise off. Intended for observing a change to the prune or repack path on a real mirror set: the periodic stagger exists to keep a restart from queueing a full-pack rewrite for every mirror at once, and this deliberately gives that up, so a large mirror set pays every mirror's rewrite in one window. Readiness is unaffected because the pass is queued rather than run inline, but it competes with client traffic for the same scheduler pool and holds each mirror's fetch exclusion while pruning it." default:"false"`
 	ZstdThreads            int           `hcl:"zstd-threads,optional" help:"Threads for zstd compression/decompression. 0 = all CPU cores; useful for short-lived CLI invocations but risky on a long-running server where multiple snapshot/restore operations can run concurrently." default:"4"`
 	BundleCacheTTL         time.Duration `hcl:"bundle-cache-ttl,optional" help:"TTL of cached server-side git bundles." default:"2h"`
 
@@ -111,29 +112,30 @@ func (s *swappableTransport) RoundTrip(req *http.Request) (*http.Response, error
 }
 
 type Strategy struct {
-	config              Config
-	cache               cache.Cache
-	cloneManager        *gitclone.Manager
-	transport           *swappableTransport
-	proxy               *httputil.ReverseProxy
-	ctx                 context.Context
-	scheduler           jobscheduler.Scheduler
-	spoolsMu            sync.Mutex
-	spools              map[string]*RepoSpools
-	serviceToken        func(ctx context.Context, org string) (string, error) // nil when no GitHub App is configured
-	snapshotMu          sync.Map                                              // keyed by upstream URL, values are *sync.Mutex
-	snapshotSpools      sync.Map                                              // keyed by upstream URL, values are *snapshotSpoolEntry
-	coldSnapshotMu      sync.Map                                              // keyed by upstream URL, values are *coldSnapshotEntry
-	deferredRestoreOnce sync.Map                                              // keyed by upstream URL, ensures at most one deferred restore per repo
-	forcedFetches       sync.Map                                              // keyed by upstream URL, ensures at most one cooldown-bypassing fetch is queued per repo
-	metrics             *gitMetrics
-	storage             *storageMetrics
-	repoCounts          *RepoCounts
-	snapshotCoord       *SnapshotCoordinator
-	metadataWired       chan struct{} // closed by SetMetadataStore; gates warm-up
-	wiredOnce           sync.Once
-	ready               atomic.Bool
-	authz               *repoauthz.Authorizer
+	config                    Config
+	cache                     cache.Cache
+	cloneManager              *gitclone.Manager
+	transport                 *swappableTransport
+	proxy                     *httputil.ReverseProxy
+	ctx                       context.Context
+	scheduler                 jobscheduler.Scheduler
+	spoolsMu                  sync.Mutex
+	spools                    map[string]*RepoSpools
+	serviceToken              func(ctx context.Context, org string) (string, error) // nil when no GitHub App is configured
+	snapshotMu                sync.Map                                              // keyed by upstream URL, values are *sync.Mutex
+	snapshotSpools            sync.Map                                              // keyed by upstream URL, values are *snapshotSpoolEntry
+	coldSnapshotMu            sync.Map                                              // keyed by upstream URL, values are *coldSnapshotEntry
+	deferredRestoreOnce       sync.Map                                              // keyed by upstream URL, ensures at most one deferred restore per repo
+	forcedFetches             sync.Map                                              // keyed by upstream URL, ensures at most one cooldown-bypassing fetch is queued per repo
+	pendingStartupMaintenance sync.Map                                              // keyed by upstream URL, present while a startup-maintenance pass is queued but not yet started
+	metrics                   *gitMetrics
+	storage                   *storageMetrics
+	repoCounts                *RepoCounts
+	snapshotCoord             *SnapshotCoordinator
+	metadataWired             chan struct{} // closed by SetMetadataStore; gates warm-up
+	wiredOnce                 sync.Once
+	ready                     atomic.Bool
+	authz                     *repoauthz.Authorizer
 }
 
 // validateAndDefaultConfig applies defaults and validates prerequisites (git,
@@ -361,38 +363,48 @@ func (s *Strategy) warmExistingRepos(ctx context.Context) error {
 	if err != nil {
 		return errors.Wrap(err, "discover existing clones")
 	}
+	// Warm-up failures are soft and scoped to one mirror: maintenance is local work
+	// that a mirror we could not fetch still needs, and a mirror we cannot reach
+	// says nothing about the mirrors after it.
 	for _, repo := range existing {
-		if !s.backgroundFetchAllowed(ctx, repo) {
-			logger.InfoContext(ctx, "Skipping startup fetch for existing repo", "upstream", repo.UpstreamURL())
-			s.scheduleMaintenanceJobs(repo)
-			continue
+		if err := s.startupFetch(ctx, repo); err != nil {
+			logger.ErrorContext(ctx, "Startup fetch failed for existing repo", "upstream", repo.UpstreamURL(),
+				"error", err)
 		}
-
-		logger.InfoContext(ctx, "Running startup fetch for existing repo", "upstream", repo.UpstreamURL())
-
-		preRefs, err := repo.GetLocalRefs(ctx)
-		if err != nil {
-			return errors.Wrapf(err, "get pre-fetch refs for %s", repo.UpstreamURL())
-		}
-
-		start := time.Now()
-		if err := repo.FetchLenient(ctx, s.cloneManager.Config().CloneTimeout); err != nil {
-			logger.ErrorContext(ctx, "Startup fetch failed for existing repo", "upstream", repo.UpstreamURL(), "error", err,
-				"duration", time.Since(start))
-			continue
-		}
-		logger.InfoContext(ctx, "Startup fetch completed for existing repo", "upstream", repo.UpstreamURL(),
-			"duration", time.Since(start))
-
-		postRefs, err := repo.GetLocalRefs(ctx)
-		if err != nil {
-			return errors.Wrapf(err, "get post-fetch refs for %s", repo.UpstreamURL())
-		}
-		maps.DeleteFunc(postRefs, func(k, v string) bool { return preRefs[k] == v })
-		logger.InfoContext(ctx, "Post-fetch changed refs for existing repo", "upstream", repo.UpstreamURL(), "refs", postRefs)
-
 		s.scheduleMaintenanceJobs(repo)
+		s.scheduleStartupMaintenance(repo)
 	}
+	return nil
+}
+
+func (s *Strategy) startupFetch(ctx context.Context, repo *gitclone.Repository) error {
+	logger := logging.FromContext(ctx)
+	if !s.backgroundFetchAllowed(ctx, repo) {
+		logger.InfoContext(ctx, "Skipping startup fetch for existing repo", "upstream", repo.UpstreamURL())
+		return nil
+	}
+
+	logger.InfoContext(ctx, "Running startup fetch for existing repo", "upstream", repo.UpstreamURL())
+
+	preRefs, err := repo.GetLocalRefs(ctx)
+	if err != nil {
+		return errors.Wrapf(err, "get pre-fetch refs for %s", repo.UpstreamURL())
+	}
+
+	start := time.Now()
+	if err := repo.FetchLenient(ctx, s.cloneManager.Config().CloneTimeout); err != nil {
+		return errors.Wrapf(err, "fetch %s after %s", repo.UpstreamURL(), time.Since(start))
+	}
+	logger.InfoContext(ctx, "Startup fetch completed for existing repo", "upstream", repo.UpstreamURL(),
+		"duration", time.Since(start))
+
+	postRefs, err := repo.GetLocalRefs(ctx)
+	if err != nil {
+		return errors.Wrapf(err, "get post-fetch refs for %s", repo.UpstreamURL())
+	}
+	maps.DeleteFunc(postRefs, func(k, v string) bool { return preRefs[k] == v })
+	logger.InfoContext(ctx, "Post-fetch changed refs for existing repo", "upstream", repo.UpstreamURL(), "refs", postRefs)
+
 	return nil
 }
 
@@ -421,10 +433,29 @@ var maintenanceJobIDs = []string{
 	pruneJobID,
 }
 
-func (s *Strategy) cancelMaintenanceJobs(repo *gitclone.Repository) {
+// cancelMaintenanceJobs stops repo's periodic maintenance chains and, if a
+// startup-maintenance pass is still queued for it and has not started, cancels
+// that too and reports it. Without this a pass queued but not yet running
+// survives eviction's own cancellation (it is not one of maintenanceJobIDs, and
+// QueueActive only reports work that is executing, not merely queued), so a
+// constrained worker pool can leave it pending on a queue eviction judges idle
+// and let it later run against the mirror's now-deleted path. A pass already
+// running is left alone: eviction checks QueueActive right after this call and
+// backs off while it is still in flight.
+//
+// Callers that back off from evicting the repo after calling this must
+// reschedule the startup pass (via scheduleStartupMaintenance) when this
+// returns true, or the cancelled pass is lost rather than merely deferred.
+func (s *Strategy) cancelMaintenanceJobs(repo *gitclone.Repository) bool {
+	upstream := repo.UpstreamURL()
 	for _, id := range maintenanceJobIDs {
-		s.scheduler.CancelPeriodicJob(repo.UpstreamURL(), id)
+		s.scheduler.CancelPeriodicJob(upstream, id)
 	}
+	if _, pending := s.pendingStartupMaintenance.LoadAndDelete(upstream); pending {
+		s.scheduler.CancelPeriodicJob(upstream, startupMaintenanceJobID)
+		return true
+	}
+	return false
 }
 
 // scheduleIdleMirrorEvictor registers the single process-wide job that deletes
@@ -450,10 +481,13 @@ func (s *Strategy) evictIdleMirrors(ctx context.Context, ttl time.Duration) erro
 		// Stop the maintenance chains before deleting, so nothing re-arms
 		// against a missing directory. If eviction then declines, the next
 		// request for this repository reschedules them.
-		s.cancelMaintenanceJobs(repo)
+		startupPending := s.cancelMaintenanceJobs(repo)
 		if s.scheduler.QueueActive(upstream) {
 			logger.InfoContext(ctx, "Skipping eviction, repository busy", "upstream", upstream)
 			s.scheduleMaintenanceJobs(repo)
+			if startupPending {
+				s.scheduleStartupMaintenance(repo)
+			}
 			continue
 		}
 		// Measured before eviction, because afterwards the directory is gone. A
@@ -469,6 +503,9 @@ func (s *Strategy) evictIdleMirrors(ctx context.Context, ttl time.Duration) erro
 		}
 		if !evicted {
 			s.scheduleMaintenanceJobs(repo)
+			if startupPending {
+				s.scheduleStartupMaintenance(repo)
+			}
 			continue
 		}
 		s.storage.recordMirrorEviction(ctx, mirrorEvictReasonIdle, size)

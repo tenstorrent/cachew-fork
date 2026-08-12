@@ -298,10 +298,13 @@ func (s *Strategy) reclaimMirrorsToFit(
 			// cannot be accounted for. Leave it for the next pass.
 			continue
 		}
-		s.cancelMaintenanceJobs(repo)
+		startupPending := s.cancelMaintenanceJobs(repo)
 		if s.scheduler.QueueActive(upstream) {
 			logger.InfoContext(ctx, "Skipping quota eviction, repository busy", "upstream", upstream)
 			s.scheduleMaintenanceJobs(repo)
+			if startupPending {
+				s.scheduleStartupMaintenance(repo)
+			}
 			continue
 		}
 		// Both halves of the result stay meaningful alongside an error. Unlinked
@@ -316,6 +319,9 @@ func (s *Strategy) reclaimMirrorsToFit(
 		}
 		if !result.Unlinked {
 			s.scheduleMaintenanceJobs(repo)
+			if startupPending {
+				s.scheduleStartupMaintenance(repo)
+			}
 			continue
 		}
 		if !result.Reclaimed {

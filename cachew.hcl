@@ -40,6 +40,12 @@ strategy git {
   #bundle-interval = "24h"
   snapshot-interval = "1h"
   repack-interval = "18h"
+  # Reclaim objects orphaned by fetch --prune. Rewrites every pack, so it belongs
+  # on a much longer interval than the geometric repack above.
+  #prune-interval = "24h"
+  # Prune and repack each mirror once at startup instead of waiting out
+  # prune-interval's per-mirror stagger, for observing a change to either path.
+  #startup-maintenance = true
   # Serve partial-clone snapshots for repos whose history dwarfs their checkout.
   #snapshot-filters = {
   #  "github.com/org/repo": "blob:none",

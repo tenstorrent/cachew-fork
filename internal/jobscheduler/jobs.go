@@ -458,21 +458,38 @@ func (q *RootScheduler) runJob(ctx context.Context, logger *slog.Logger, job que
 	q.metrics.jobDuration.Record(ctx, elapsed.Seconds(), metric.WithAttributes(jobAttrs...))
 }
 
+// job_type label values on cachew_scheduler_jobs_total and
+// cachew_scheduler_job_duration_seconds. Several double as the ID suffix they
+// are matched on. jobTypeStartupMaintenance mirrors the git strategy's
+// startupMaintenanceJobID, which this package cannot import without a cycle.
+const (
+	jobTypeClone              = "clone"
+	jobTypeFetch              = "fetch"
+	jobTypeSnapshot           = "snapshot"
+	jobTypeRepack             = "repack"
+	jobTypePrune              = "prune"
+	jobTypeStartupMaintenance = "startup-maintenance"
+	jobTypeOther              = "other"
+)
+
 // jobType extracts a normalised job type from the job ID for metric labels.
 func jobType(id string) string {
 	switch {
-	case strings.HasSuffix(id, "clone"):
-		return "clone"
-	case strings.HasSuffix(id, "deferred-mirror-restore"):
-		return "clone"
-	case strings.HasSuffix(id, "fetch"):
-		return "fetch"
-	case strings.HasSuffix(id, "snapshot-periodic"), strings.HasSuffix(id, "mirror-snapshot-periodic"):
-		return "snapshot"
+	case strings.HasSuffix(id, jobTypeClone), strings.HasSuffix(id, "deferred-mirror-restore"):
+		return jobTypeClone
+	case strings.HasSuffix(id, jobTypeFetch):
+		return jobTypeFetch
+	// Also matches mirror-snapshot-periodic and lfs-snapshot-periodic.
+	case strings.HasSuffix(id, "snapshot-periodic"):
+		return jobTypeSnapshot
 	case strings.HasSuffix(id, "repack-periodic"):
-		return "repack"
+		return jobTypeRepack
+	case strings.HasSuffix(id, "prune-periodic"):
+		return jobTypePrune
+	case strings.HasSuffix(id, jobTypeStartupMaintenance):
+		return jobTypeStartupMaintenance
 	default:
-		return "other"
+		return jobTypeOther
 	}
 }
 
