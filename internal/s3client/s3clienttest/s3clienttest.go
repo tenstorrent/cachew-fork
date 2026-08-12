@@ -2,6 +2,7 @@
 package s3clienttest
 
 import (
+	"context"
 	"os/exec"
 	"regexp"
 	"runtime"
@@ -14,6 +15,11 @@ import (
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 )
+
+// dockerProbeTimeout bounds the docker-availability check. It must stay well
+// under a `go test` default timeout, since it runs before any test-specific
+// deadline exists to bound it.
+const dockerProbeTimeout = 3 * time.Second
 
 const (
 	containerName = "minio-test"
@@ -35,6 +41,10 @@ var bucketNameRe = regexp.MustCompile(`[^a-z0-9-]`)
 // finishes normally.
 func Start(t *testing.T) string {
 	t.Helper()
+
+	if !dockerAvailable(t) {
+		t.Skip("docker is not available, skipping test that requires a MinIO container")
+	}
 
 	t.Setenv("AWS_ACCESS_KEY_ID", Username)
 	t.Setenv("AWS_SECRET_ACCESS_KEY", Password)
@@ -152,6 +162,18 @@ func startContainer(t *testing.T) {
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
+}
+
+// dockerAvailable reports whether the docker daemon can be reached, checked
+// with its own bounded timeout rather than left to minio-go: a client with no
+// server to talk to is a connection failure minio-go treats as retryable, so
+// [isHealthy] backs off and retries for far longer than it takes docker
+// itself to say there is nothing to connect to.
+func dockerAvailable(t *testing.T) bool {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), dockerProbeTimeout)
+	defer cancel()
+	return exec.CommandContext(ctx, "docker", "info").Run() == nil
 }
 
 func isHealthy(t *testing.T) bool {

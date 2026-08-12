@@ -348,7 +348,7 @@ func (s *diskMetaDB) walk(fn func(key Key, namespace Namespace, expiresAt, lastA
 			} else {
 				hexKey = k
 			}
-			if len(hexKey) != 64 {
+			if !isHexKey(string(hexKey)) {
 				return nil
 			}
 			if err := key.UnmarshalText(hexKey); err != nil {

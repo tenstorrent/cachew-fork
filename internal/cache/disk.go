@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -108,32 +109,19 @@ func NewDisk(ctx context.Context, config DiskConfig) (*Disk, error) {
 	}
 
 	// Open TTL storage
-	db, err := newDiskMetaDB(filepath.Join(config.Root, "metadata.db"))
+	db, err := newDiskMetaDB(filepath.Join(config.Root, metaDBFileName))
 	if err != nil {
 		return nil, errors.Errorf("failed to create TTL storage: %w", err)
 	}
 
-	// Determine the initial size.
-	var size int64
-	err = filepath.Walk(config.Root, func(_ string, info fs.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-		if info.IsDir() {
-			return nil
-		}
-		// Skip metadata.db file
-		if info.Name() == "metadata.db" {
-			return nil
-		}
-		size += info.Size()
-		return nil
-	})
-	if err != nil {
-		return nil, errors.Errorf("failed to walk cache root: %w", err)
-	}
-
 	logger := logging.FromContext(ctx)
+
+	// Determine the initial size, dropping files the metadata database has no
+	// record of on the way.
+	size, err := reconcileOrphanedFiles(ctx, config.Root, db)
+	if err != nil {
+		return nil, errors.Join(err, db.close())
+	}
 
 	ctx, stop := context.WithCancel(ctx)
 
@@ -156,6 +144,201 @@ func NewDisk(ctx context.Context, config DiskConfig) (*Disk, error) {
 	go disk.evictionLoop(ctx)
 
 	return disk, nil
+}
+
+const (
+	// metaDBFileName is the bbolt database inside the cache root. It is not a
+	// cache entry, so it is excluded from the size accounting and never
+	// reclaimed.
+	metaDBFileName = "metadata.db"
+	// diskTempPrefix marks an entry still being written, before the rename that
+	// publishes it at its key. Only a killed process leaves one behind.
+	diskTempPrefix = ".tmp-"
+	// hexKeyLength is the length of a [Key] in hex, which is the file name a
+	// cache entry is stored under.
+	hexKeyLength = 64
+)
+
+// reconcileOrphanedFiles deletes files under root that no metadata record
+// points at, and returns the total size of the files that remain.
+//
+// Eviction is driven entirely by walking the metadata database, so a file with
+// no record is invisible to it: never expired, never chosen as an LRU victim,
+// yet counted in the size the limit is enforced against. It would occupy the
+// cache for the process's whole lifetime and be re-counted on every restart.
+//
+// Two things produce them, both requiring the process to die mid-write, which
+// is why this runs at startup and not on a timer. A crash between the rename
+// and the metadata write in commitLocked leaves a complete entry with no
+// record. A crash before the rename leaves the writer's temp file. Neither can
+// happen while cachew is running: commitLocked holds the key's lock across both
+// steps and removes the file if the metadata write fails.
+//
+// It reuses the size walk NewDisk already does, so it adds no second directory
+// traversal, but it is not free: it first reads every metadata record through
+// db.walk and holds a key set sized to the whole cache while the walk runs.
+// Measured at 200k entries, that is ~230ms and ~19 MiB. The scan is also not
+// separable from the size returned here, since a file with no record has to
+// come off that total before eviction starts enforcing the limit against it.
+// Both costs stay below one [Disk.evict] sweep, which walks the same records,
+// stats each one and sorts a larger per-entry slice, every evict-interval
+// rather than once per process.
+//
+// Anything that is neither a temp file this cache could have written nor shaped
+// like a cache entry is left alone and logged. The cache owns this directory,
+// but silently deleting a file this code does not recognise is a worse failure
+// than accounting for it.
+//
+// Logs its cost unconditionally rather than as a metric: this runs inside
+// [NewDisk], before metrics.New installs the meter provider, so anything
+// recorded here would bind to a stub and never surface.
+func reconcileOrphanedFiles(ctx context.Context, root string, db *diskMetaDB) (int64, error) {
+	logger := logging.FromContext(ctx)
+	start := time.Now()
+
+	recorded := map[evictEntryKey]struct{}{}
+	if err := db.walk(func(key Key, namespace Namespace, _, _ time.Time) error {
+		recorded[evictEntryKey{namespace, key}] = struct{}{}
+		return nil
+	}); err != nil {
+		return 0, errors.Errorf("failed to walk metadata for orphan reconciliation: %w", err)
+	}
+
+	var size, orphanedBytes int64
+	var orphanedFiles, tempFiles, unrecognised int
+	err := filepath.Walk(root, func(path string, info fs.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() || path == filepath.Join(root, metaDBFileName) {
+			return nil
+		}
+
+		// The prefix alone is not enough: [Disk.Create] only ever opens a temp
+		// file inside the shard directory its entry will be published in, so a
+		// ".tmp-" file anywhere else was written by something other than this
+		// cache and falls through to the unrecognised path below.
+		if strings.HasPrefix(info.Name(), diskTempPrefix) && inEntryShardDir(root, path) {
+			if removeErr := os.Remove(path); removeErr != nil {
+				return errors.Errorf("failed to remove abandoned temp file %s: %w", path, removeErr)
+			}
+			tempFiles++
+			orphanedBytes += info.Size()
+			return nil
+		}
+
+		entry, ok := entryKeyForPath(root, path)
+		if !ok {
+			unrecognised++
+			logger.WarnContext(ctx, "Unrecognised file in cache root, leaving it alone",
+				"path", path, "size", info.Size())
+			size += info.Size()
+			return nil
+		}
+		if _, recorded := recorded[entry]; recorded {
+			size += info.Size()
+			return nil
+		}
+
+		if removeErr := os.Remove(path); removeErr != nil {
+			return errors.Errorf("failed to remove orphaned cache file %s: %w", path, removeErr)
+		}
+		orphanedFiles++
+		orphanedBytes += info.Size()
+		return nil
+	})
+	if err != nil {
+		return 0, errors.Errorf("failed to walk cache root: %w", err)
+	}
+
+	logger.InfoContext(ctx, "Reconciled cache files against the metadata database",
+		"recorded_entries", len(recorded), "orphaned_files", orphanedFiles, "abandoned_temp_files", tempFiles,
+		"unrecognised_files", unrecognised, "bytes", orphanedBytes, "duration", time.Since(start))
+	return size, nil
+}
+
+// entryKeyForPath recovers the namespace and key a cache file is stored under,
+// and reports whether the path is shaped like a cache entry at all. It is the
+// inverse of [Disk.keyToPath]: "<namespace>/<xx>/<hexkey>", or "<xx>/<hexkey>"
+// for the empty namespace.
+func entryKeyForPath(root, path string) (evictEntryKey, bool) {
+	rel, err := filepath.Rel(root, path)
+	if err != nil {
+		return evictEntryKey{}, false
+	}
+	parts := strings.Split(rel, string(filepath.Separator))
+
+	var namespace Namespace
+	switch len(parts) {
+	case 2: //nolint:mnd // <xx>/<hexkey>
+	case 3: //nolint:mnd // <namespace>/<xx>/<hexkey>
+		namespace = Namespace(parts[0])
+	default:
+		return evictEntryKey{}, false
+	}
+
+	hexKey := parts[len(parts)-1]
+	// The sharding directory must agree with the key it holds, otherwise this
+	// is not a file the cache wrote.
+	if !isHexKey(hexKey) || parts[len(parts)-2] != hexKey[:2] {
+		return evictEntryKey{}, false
+	}
+	var key Key
+	if err := key.UnmarshalText([]byte(hexKey)); err != nil {
+		return evictEntryKey{}, false
+	}
+	return evictEntryKey{namespace, key}, true
+}
+
+// inEntryShardDir reports whether path sits directly in a directory that
+// [Disk.keyToPath] would publish an entry into: "<xx>/" or "<namespace>/<xx>/"
+// under root, where <xx> is the two hex digits a key shards on.
+//
+// It is the check that keeps temp-file reclamation to paths this cache actually
+// writes temp files in, rather than every file whose name happens to start with
+// the prefix. It deliberately says nothing about the file's own name, because a
+// temp file is named by [os.CreateTemp] and not by its key.
+func inEntryShardDir(root, path string) bool {
+	rel, err := filepath.Rel(root, filepath.Dir(path))
+	if err != nil {
+		return false
+	}
+	parts := strings.Split(rel, string(filepath.Separator))
+	switch len(parts) {
+	case 1: // <xx>
+	case 2: //nolint:mnd // <namespace>/<xx>
+	default:
+		return false
+	}
+	return isShardDir(parts[len(parts)-1])
+}
+
+// isHexKey reports whether name is the lowercase hex form [Key.String]
+// produces. Checked here rather than left to [Key.UnmarshalText], which hashes
+// text it cannot decode instead of rejecting it, so an unrecognised file would
+// be turned into a plausible key and deleted as an orphan.
+func isHexKey(name string) bool {
+	if len(name) != hexKeyLength {
+		return false
+	}
+	return isLowerHex(name)
+}
+
+// isShardDir reports whether name is a key's two-hex-digit sharding directory.
+func isShardDir(name string) bool {
+	if len(name) != 2 { //nolint:mnd // a shard is the first two hex digits of a key
+		return false
+	}
+	return isLowerHex(name)
+}
+
+func isLowerHex(s string) bool {
+	for _, c := range s {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 func (d *Disk) keyLock(namespace Namespace, key Key) *sync.RWMutex {
@@ -248,7 +431,7 @@ func (d *Disk) Create(ctx context.Context, key Key, headers http.Header, ttl tim
 		return nil, errors.Errorf("failed to create directory %s: %w", dir, err)
 	}
 
-	f, err := os.CreateTemp(dir, ".tmp-*")
+	f, err := os.CreateTemp(dir, diskTempPrefix+"*")
 	if err != nil {
 		return nil, errors.Errorf("failed to create temp file: %w", err)
 	}

@@ -1,12 +1,18 @@
 # Runtime image - binaries are pre-built on the host
-FROM alpine:3.23
+FROM alpine:3.24
 
 ARG TARGETARCH
 
 SHELL ["/bin/sh", "-o", "pipefail", "-c"]
 
-# Install runtime dependencies for git operations and TLS
-RUN apk add --no-cache ca-certificates curl git git-daemon git-lfs tzdata zstd && \
+# git is pinned rather than left floating on whatever alpine:3.24/main
+# resolves to at build time: cachew shells out to git directly, so a silent
+# minor-version bump can change git's own defaults underneath it (this is how
+# git 2.51's maintenance.auto went unnoticed until it raced cachew's own
+# repacks). Bump this deliberately, checking release notes, rather than
+# letting it drift. Currently the latest git in alpine:3.24/main for both
+# x86_64 and aarch64.
+RUN apk add --no-cache ca-certificates curl git=2.54.0-r0 git-daemon git-lfs tzdata zstd && \
     addgroup -g 1000 cachew && \
     adduser -D -u 1000 -G cachew cachew
 

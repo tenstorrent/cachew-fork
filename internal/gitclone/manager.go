@@ -2,7 +2,6 @@ package gitclone
 
 import (
 	"context"
-	"encoding/hex"
 	"io/fs"
 	"maps"
 	"net/url"
@@ -38,6 +37,10 @@ const (
 // killed process) can leave these behind, so they are skipped and removed by
 // DiscoverExisting on startup.
 const cloneTempPrefix = ".clone-"
+
+// bytesPerMB matches how the rest of cachew reads a megabyte config value,
+// which is mebibytes despite the name.
+const bytesPerMB = 1024 * 1024
 
 const (
 	// DefaultFetchInterval is the cadence used when Config.FetchInterval is
@@ -82,17 +85,22 @@ type Config struct {
 	MirrorRoot       string        `hcl:"mirror-root,optional" help:"Directory to store git clones." default:"${CACHEW_STATE}/git-mirrors"`
 	FetchInterval    time.Duration `hcl:"fetch-interval,optional" help:"How often to fetch from upstream in minutes." default:"15m"`
 	RefCheckInterval time.Duration `hcl:"ref-check-interval,optional" help:"How long to cache ref checks." default:"10s"`
-	Maintenance      bool          `hcl:"maintenance,optional" help:"Enable git maintenance scheduling for mirror repos." default:"false"`
+	Maintenance      bool          `hcl:"maintenance,optional" help:"Enable git maintenance scheduling for mirror repos. Its tasks run outside this process and take the same locks the git commands here do, so enabling it also gives up the cleanup of locks left by a killed command." default:"false"`
 	PackThreads      int           `hcl:"pack-threads,optional" help:"Threads for git pack operations (0 = all CPU cores)." default:"0"`
 	CloneTimeout     time.Duration `hcl:"clone-timeout,optional" help:"Upper bound for 'git clone --mirror'. Generous by default since large repos can take 30+ minutes." default:"1h"`
 	FetchTimeout     time.Duration `hcl:"fetch-timeout,optional" help:"Upper bound for 'git fetch' so a slow upstream cannot block the fetch path indefinitely." default:"5m"`
 	LsRemoteTimeout  time.Duration `hcl:"ls-remote-timeout,optional" help:"Upper bound for 'git ls-remote' so a slow upstream cannot block the request path indefinitely." default:"1m"`
 	RepackTimeout    time.Duration `hcl:"repack-timeout,optional" help:"Upper bound for 'git repack' so a slow repack on a large repository cannot block the scheduler queue indefinitely." default:"10m"`
 	PruneTimeout     time.Duration `hcl:"prune-timeout,optional" help:"Upper bound for the pruning repack, which rewrites every pack and so takes much longer than the geometric repack that repack-timeout bounds." default:"1h"`
-	PruneGrace       time.Duration `hcl:"prune-grace,optional" help:"How long an object must have been unreachable before the pruning repack deletes it. The first prune to see an object unreachable quarantines it as a loose file and starts the window; a later prune deletes it once the window has elapsed. This keeps a force-push from dropping an object a client is still mid-transfer on, since upload-pack serves the mirror without a lock. 0 deletes every unreachable object on the first prune that sees it." default:"24h"`
-	RepackThreads    int           `hcl:"repack-threads,optional" help:"Threads for git repack operations. Limits memory since windowMemory and deltaCacheSize are per-thread. 0 = pack-threads." default:"4"`
-	MirrorTTL        time.Duration `hcl:"mirror-ttl,optional" help:"Delete a mirrored repository that no client has requested for this long. Its next request re-clones it, so keep this well above mirror-snapshot-interval or eviction turns a warm serve into a cold one. 0 disables idle eviction." default:"0"`
-	MirrorEvictScan  time.Duration `hcl:"mirror-evict-scan,optional" help:"How often to scan mirrors for idle eviction. Ignored when mirror-ttl is 0." default:"1h"`
+	PruneGrace       time.Duration `hcl:"prune-grace,optional" help:"How long an unreachable object is kept before the pruning repack deletes it, measured from when the object was last packed rather than from when it stopped being reachable, since that is the only date git records. The first prune to see it unreachable moves it into a cruft pack and a later prune deletes it once the window has elapsed, which keeps a force-push from dropping an object a client is still mid-transfer on: upload-pack serves the mirror without a lock. An object written before the window and orphaned inside it is reclaimed immediately. 0 deletes every unreachable object on the first prune that sees it." default:"24h"`
+	MaxCruftSizeMB   int           `hcl:"max-cruft-size-mb,optional" help:"Largest cruft pack the pruning repack will write, in megabytes. Above this git splits the unreachable objects across several cruft packs, which bounds the size of any one pack and of the memory the write needs. On its own it does not bound the work a prune does: because every prune expires objects, git still reads and rewrites every existing cruft pack on every run, so by itself this is not an I/O bound on a large unreachable set. Setting prune-expire-interval as well makes most prunes skip the expiration, which is what lets git leave the cruft packs that have reached this size alone. Requires git 2.43 or newer, which added --max-cruft-size; older git fails the prune. 0 writes a single cruft pack." default:"0"`
+	// Inert without MaxCruftSizeMB: the repack it selects saves work only by
+	// leaving cruft packs that have reached a size alone, and that is the
+	// setting which supplies the size. See cruftExpireDue.
+	PruneExpireInterval time.Duration `hcl:"prune-expire-interval,optional" help:"How long between the prunes that actually delete expired unreachable objects. Takes effect only alongside max-cruft-size-mb: set on its own it changes nothing, because the cheaper repack it selects saves work by leaving cruft packs that have reached max-cruft-size-mb untouched, and there is no such size to leave alone. With both set, a prune that comes round before this interval has elapsed only combines the cruft packs below that size and deletes nothing, and the full rewrite that expires objects is paid for once per interval instead of once per prune-interval. The tradeoff is delete latency: an unreachable object can now outlive prune-grace by up to this interval before it is physically removed. Storage is still bounded meanwhile, since the combining prune keeps consolidating fresh cruft; the objects are just not deleted until the next expiring prune. Requires git 2.50 or newer, which added --combine-cruft-below-size; older git fails the combining prune. 0 expires on every prune." default:"0"`
+	RepackThreads       int           `hcl:"repack-threads,optional" help:"Threads for git repack operations. Limits memory since windowMemory and deltaCacheSize are per-thread. 0 = pack-threads." default:"4"`
+	MirrorTTL           time.Duration `hcl:"mirror-ttl,optional" help:"Delete a mirrored repository that no client has requested for this long. Its next request re-clones it, so keep this well above mirror-snapshot-interval or eviction turns a warm serve into a cold one. 0 disables idle eviction." default:"0"`
+	MirrorEvictScan     time.Duration `hcl:"mirror-evict-scan,optional" help:"How often to scan mirrors for idle eviction. Ignored when mirror-ttl is 0." default:"1h"`
 }
 
 // CredentialProvider provides credentials for git operations.
@@ -110,6 +118,7 @@ type Repository struct {
 	upstreamURL        string
 	lastFetch          time.Time
 	lastFetchAttempt   time.Time // set when a git fetch starts, including failures; gates NeedsFetch
+	lastCruftExpireAt  time.Time // set when a prune expires objects rather than only combining cruft; gates cruftExpireDue
 	lastRefCheck       time.Time
 	refCheckValid      bool
 	refCheckStale      bool
@@ -854,8 +863,14 @@ func mirrorConfigSettings(packThreads int) [][2]string {
 		// Keep fetched objects as packs
 		{"transfer.unpackLimit", "1"},
 		{"fetch.unpackLimit", "1"},
-		// Disable auto GC
+		// Disable auto GC. gc.auto stops git gc; maintenance.auto stops the
+		// detached "git maintenance run --auto" that git 2.51+ fires after a
+		// fetch, whose geometric-repack task gc.auto does not gate. Left on, it
+		// repacks concurrently with our own repack and prune, and whichever
+		// process loses the race dies on the other's half-written temp pack.
+		// git maintenance register sets the same key for the same reason.
 		{"gc.auto", "0"},
+		{"maintenance.auto", "false"},
 		// Pack performance
 		{"pack.threads", strconv.Itoa(packThreads)},
 		{"pack.deltaCacheSize", "512m"},
@@ -1104,6 +1119,14 @@ func (r *Repository) executeFetch(ctx context.Context, enforceSpeedLimit bool) e
 	}
 	output, err := cmd.CombinedOutput()
 	if err != nil {
+		// A fetch is the command whose deadline actually fires in production,
+		// and it is killed mid ref update: without this, one slow upstream
+		// leaves a packed-refs.lock or a loose ref lock that makes every later
+		// fetch fail to update the refs it just downloaded. Safe here because
+		// the caller holds fetchSem and prune holds it too, so no other writer
+		// in this process can own these locks; the out-of-process case is
+		// [Repository.clearStaleLocks]'s to refuse.
+		r.clearStaleLocks(ctx, "fetch", r.refUpdateLockPaths())
 		r.recordFetchOutcome(false)
 		return errors.Wrapf(err, "git fetch: %s", string(output))
 	}
@@ -1447,31 +1470,64 @@ func (r *Repository) Repack(ctx context.Context) error {
 // A plain git prune would reclaim nothing. Mirrors set transfer.unpackLimit=1
 // so fetched objects always land in a pack, and prune only deletes loose
 // objects; dropping a packed one takes a repack that leaves it out. That is why
-// this passes -A instead of the --geometric roll-up [Repository.Repack] uses,
-// which combines packs wholesale and so carries unreachable objects forward
-// indefinitely. The cost is that every pack is rewritten, making this far more
-// expensive than the geometric repack.
-//
-// It takes two commands, the same pair git gc runs. repack -A does not delete
-// the objects it drops from a pack, it rewrites them as loose files; git prune
-// is what removes them, and only once they are older than --expire.
+// this repacks rather than reusing the --geometric roll-up [Repository.Repack]
+// uses, which combines packs wholesale and so carries unreachable objects
+// forward indefinitely. The cost is that every pack is rewritten, making this
+// far more expensive than the geometric repack.
 //
 // git dates an object by when it was written, never by when it stopped being
-// reachable: a packed object inherits the mtime of the pack holding it, and
-// that mtime is preserved when repack loosens it. Handing --expire that date
-// directly cannot express a grace period, because a commit written months ago
-// and orphaned by a force-push a second later already reads as ancient. So the
-// mirror records the missing timestamp itself: objects this prune loosened are
-// the ones observed unreachable for the first time, and their mtime is stamped
-// to now, starting the window. A later prune leaves those already-loose objects
-// alone, so the clock keeps running, and deletes them once it has elapsed.
+// reachable: a packed object inherits the mtime of the pack holding it. Handing
+// --expire that date directly cannot express a grace period, because a commit
+// written months ago and orphaned by a force-push a second later already reads
+// as ancient. Somebody has to record the missing timestamp.
 //
-// prune-grace therefore means time since the object stopped being reachable,
-// which is the guarantee readers need: upload-pack serves the mirror without a
-// lock (mirrors set uploadpack.allowAnySHA1InWant, so unreachable objects are
-// serveable), and a client mid-clone must not have one deleted underneath it
-// just because a force-push landed. A zero grace disables the quarantine and
-// deletes every unreachable object on the first prune that sees it.
+// A cruft pack is the closest git gets. It is an ordinary pack plus a .mtimes
+// sidecar giving a per-object time, and once an object is in one that time is
+// preserved by every later cruft repack, so the clock keeps running across
+// prunes and --cruft-expiration deletes the object when the window elapses.
+//
+// The timestamp an object gets on the way in, though, is the mtime of the pack
+// it came out of. So prune-grace means time since the object was last packed,
+// not time since it stopped being reachable, and an object written long ago and
+// orphaned a second later is reclaimed by the first prune that sees it. That is
+// a deliberate limit, not an oversight, and it is what keeps this affordable:
+// the only way to make git record the timestamp we actually want is to loosen
+// every unreachable object so its mtime can be stamped, and a loose object is
+// zlib-compressed on its own with no delta against its neighbours. Measured on a
+// mirror whose whole history had just been orphaned, quarantining that way took
+// the object store from 108 KiB to 2564 KiB where the cruft pack held the same
+// objects in 144 KiB: a prune that grows the repository 23x instead of shrinking
+// it. A mirror carrying a few hundred thousand unreachable objects, which is
+// what upstream PR-branch churn produces, cannot pay that, and the objects the
+// shortfall applies to are not that churn -- those were fetched recently and so
+// sit in recent packs.
+//
+// What the window still buys is the thing that matters: upload-pack serves the
+// mirror without a lock (mirrors set uploadpack.allowAnySHA1InWant, so
+// unreachable objects are serveable), and an in-flight fetch measured in minutes
+// must not have an object deleted underneath it because a force-push landed. A
+// zero grace dates the cutoff at now and reclaims everything unreachable.
+//
+// git prune still runs. Nothing here loosens objects any more, but a mirror
+// pruned by an earlier build is still carrying the loose set that build made,
+// with the quarantine stamps it wrote, and only git prune will clear it.
+//
+// Packing refs is the last thing git gc does that still applies here. Nothing
+// else in cachew ever does it, so loose refs accumulate one file per ref until
+// some unrelated fetch happens to rewrite packed-refs. Reflogs, the other thing
+// gc expires, do not exist in these mirrors: they are bare and never set
+// core.logAllRefUpdates, so no reflog can pin an unreachable object.
+//
+// Not every call expires. A repack that applies --cruft-expiration has to read
+// and rewrite every existing cruft pack to do it, so its cost tracks the whole
+// unreachable set rather than the churn since the last prune, and on a mirror
+// carrying hundreds of thousands of unreachable objects that is the dominant
+// cost of the job. Where max-cruft-size-mb and prune-expire-interval are both
+// set, most calls therefore run a repack that only combines the cruft packs
+// below that size and deletes nothing, and the expiring repack runs once per
+// prune-expire-interval. Deletion is late by up to that interval as a result,
+// which is the tradeoff both settings document. Neither set means every call
+// expires, which is what a deployment that has not opted in keeps getting.
 //
 // Holds the fetch exclusion throughout, because a fetch writes objects before
 // it writes the refs that make them reachable, and a prune overlapping that
@@ -1492,44 +1548,33 @@ func (r *Repository) PruneUnreachable(ctx context.Context) (int64, error) {
 			before = 0
 		}
 
-		grace := max(r.config.PruneGrace, 0)
-
-		// One budget for both commands: the repack dominates, and prune has
+		// One budget for every command: the repack dominates, and the rest have
 		// nothing to do if it did not finish.
 		pruneCtx, cancel := context.WithTimeout(ctx, r.config.PruneTimeout)
 		defer cancel()
 
-		quarantined, looseErr := looseObjects(r.path)
-		if looseErr != nil {
-			return looseErr
-		}
-
-		// No --unpack-unreachable: that flag would delete the objects git reads
-		// as older than the cutoff instead of loosening them, which is exactly
-		// the case grace has to cover. Bare -A loosens every unreachable object.
-		if err := r.runRepack(pruneCtx, "-A", "-d", "--write-midx", "--write-bitmap-index"); err != nil {
-			return err
-		}
-
-		// Stamped before the cutoff is taken so a zero grace still expires them.
-		if grace > 0 {
-			if err := startQuarantine(r.path, quarantined, time.Now()); err != nil {
-				return err
-			}
-		}
-
 		// Measured after the wait for the exclusion, so the window is grace
 		// from when the prune runs rather than from when it was queued.
-		cutoff := time.Now().Add(-grace).Format(time.RFC3339)
+		cutoff := time.Now().Add(-max(r.config.PruneGrace, 0)).Format(time.RFC3339)
 
-		// #nosec G204 - r.path is controlled by us and cutoff is a formatted timestamp
-		cmd := exec.CommandContext(pruneCtx, "git", "-C", r.path, "prune", "--expire="+cutoff)
-		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-		cmd.Cancel = func() error {
-			return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		// The loose prune and packRefs below stay on every tick either way:
+		// they cost the same whichever repack ran, and holding the deletion of
+		// loose objects back to the expiring cadence would buy nothing.
+		expire := r.cruftExpireDue()
+		if err := r.runRepack(pruneCtx, pruneRepackArgs(cutoff, r.config.MaxCruftSizeMB, expire)...); err != nil {
+			return err
 		}
-		if output, err := cmd.CombinedOutput(); err != nil {
-			return errors.Wrapf(err, "git prune: %s", string(output))
+		if expire {
+			r.mu.Lock()
+			r.lastCruftExpireAt = time.Now()
+			r.mu.Unlock()
+		}
+
+		if err := r.runGit(pruneCtx, "prune", "--expire="+cutoff); err != nil {
+			return err
+		}
+		if err := r.packRefs(pruneCtx); err != nil {
+			return err
 		}
 
 		if before > 0 {
@@ -1545,59 +1590,136 @@ func (r *Repository) PruneUnreachable(ctx context.Context) (int64, error) {
 	return reclaimed, nil
 }
 
-// looseObjects returns the path of every loose object in the mirror, which is
-// how a prune tells the objects it just loosened from those an earlier prune
-// already quarantined and whose grace window is therefore already running.
-func looseObjects(repoPath string) (map[string]struct{}, error) {
-	objectsDir := filepath.Join(repoPath, "objects")
-	fanouts, err := os.ReadDir(objectsDir)
-	if err != nil {
-		return nil, errors.Wrapf(err, "read %s", objectsDir)
+// cruftExpireDue reports whether this prune is the one that expires unreachable
+// objects, rather than only rolling the small cruft packs together.
+//
+// True unless the deployment has opted into the split by setting both knobs.
+// prune-expire-interval alone cannot buy anything: the combining repack saves
+// work only by leaving cruft packs that have reached a size alone, and
+// max-cruft-size-mb is what sets that size. A repository that has never expired
+// in this process is due, so a restart cannot indefinitely postpone deletion.
+func (r *Repository) cruftExpireDue() bool {
+	if r.config.MaxCruftSizeMB <= 0 || r.config.PruneExpireInterval <= 0 {
+		return true
 	}
-
-	loose := make(map[string]struct{})
-	for _, fanout := range fanouts {
-		// objects/ also holds pack/ and info/; only the two-hex-digit fanout
-		// directories hold loose objects.
-		if !fanout.IsDir() || len(fanout.Name()) != 2 {
-			continue
-		}
-		if _, err := hex.DecodeString(fanout.Name()); err != nil {
-			continue
-		}
-		dir := filepath.Join(objectsDir, fanout.Name())
-		entries, err := os.ReadDir(dir)
-		if err != nil {
-			if os.IsNotExist(err) {
-				continue
-			}
-			return nil, errors.Wrapf(err, "read %s", dir)
-		}
-		for _, entry := range entries {
-			loose[filepath.Join(dir, entry.Name())] = struct{}{}
-		}
-	}
-	return loose, nil
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return time.Since(r.lastCruftExpireAt) >= r.config.PruneExpireInterval
 }
 
-// startQuarantine stamps every loose object that alreadyLoose does not cover
-// with now, recording when the mirror first observed it unreachable. git
-// carries the original write time across the loosening, so without this the
-// grace window would be measured from when the object was written.
-func startQuarantine(repoPath string, alreadyLoose map[string]struct{}, now time.Time) error {
-	current, err := looseObjects(repoPath)
-	if err != nil {
-		return err
+// pruneRepackArgs builds the repack that moves unreachable objects into a cruft
+// pack, and, when expire is set, deletes the ones that sat there past the grace
+// window.
+//
+// --cruft already implies -a for the reachable objects, and git rejects it
+// alongside -A outright. Either way the unreachable objects reachable only from
+// the packs being rewritten end up in a cruft pack rather than loose.
+//
+// The two branches exist because git will not do both jobs at once.
+// --combine-cruft-below-size is what lets a repack leave a mature cruft pack on
+// disk instead of reading and rewriting it, and git takes that path only when
+// no expiration was asked for (builtin/repack.c consults it under
+// cruft_expiration being unset). An expiring repack therefore rewrites every
+// existing cruft pack however large the unreachable set has grown, which is the
+// cost prune-expire-interval exists to pay less often.
+//
+// When expiring, maxCruftSizeMB caps the size of each cruft pack the run writes
+// and nothing else: git implements it as --max-pack-size for the cruft
+// pack-objects. When combining, it is instead the threshold at or above which
+// an existing cruft pack is left alone, and the caller only takes this branch
+// when it is positive, since combining below zero bytes would rewrite nothing
+// and combining below every size would rewrite everything.
+func pruneRepackArgs(cutoff string, maxCruftSizeMB int, expire bool) []string {
+	if !expire {
+		return []string{
+			"-d", "--cruft",
+			"--combine-cruft-below-size=" + strconv.Itoa(maxCruftSizeMB*bytesPerMB),
+			"--write-midx", "--write-bitmap-index",
+		}
 	}
-	for path := range current {
-		if _, quarantined := alreadyLoose[path]; quarantined {
+	args := []string{"-d", "--cruft", "--cruft-expiration=" + cutoff, "--write-midx", "--write-bitmap-index"}
+	if maxCruftSizeMB > 0 {
+		args = append(args, "--max-cruft-size="+strconv.Itoa(maxCruftSizeMB*bytesPerMB))
+	}
+	return args
+}
+
+// clearStaleLocks removes the lock files a git command would have removed
+// itself had it not been killed, and reports which ones it took.
+//
+// Every git subprocess in this package is started in its own process group and
+// cancelled with SIGKILL, so a deadline or a cancelled context takes the
+// process out before it can run the atexit handler that releases its locks.
+// Git never breaks a stale lock on its own: it retries for a bounded time
+// (core.packedRefsTimeout is 1s, core.filesRefLockTimeout 100ms) and then
+// fails. One killed command would therefore make every later command that
+// needs the same lock fail forever, which for a mirror means fetches that can
+// no longer update refs, or repacks that can no longer rebuild the multi-pack
+// index.
+//
+// Safe only because the caller passes the locks its own command takes, and
+// only runs while it holds the exclusion that keeps another writer off them:
+// fetchSem serialises fetches, and prune holds it across the whole sequence.
+// It is not a sweep of the repository.
+//
+// That reasoning covers this process only, so config.Maintenance disables the
+// cleanup outright: it registers the mirror with the scheduled git maintenance
+// on the host, whose pack-refs, prefetch and incremental-repack tasks take
+// exactly these locks from another process and at a time no exclusion here can
+// constrain. A lock held by a live process is indistinguishable from one left
+// by a dead one, and unlinking a live one corrupts the run that owns it, which
+// is worse than the stalled ref updates this repairs.
+func (r *Repository) clearStaleLocks(ctx context.Context, command string, lockPaths []string) {
+	if r.config.Maintenance {
+		logging.FromContext(ctx).WarnContext(ctx,
+			"Left any stale git locks in place because scheduled maintenance may hold them",
+			"command", command, "upstream", r.upstreamURL)
+		return
+	}
+	for _, lockPath := range lockPaths {
+		if err := os.Remove(lockPath); err != nil {
 			continue
 		}
-		// A concurrent reader cannot delete these, but a crashed prune may have
-		// left a stale entry, so a vanished object is not an error.
-		if err := os.Chtimes(path, now, now); err != nil && !os.IsNotExist(err) {
-			return errors.Wrapf(err, "stamp quarantine on %s", path)
+		logging.FromContext(ctx).WarnContext(ctx, "Removed a stale git lock left by a failed command",
+			"command", command, "lock", lockPath, "upstream", r.upstreamURL)
+	}
+}
+
+// refUpdateLockPaths lists the locks a command that writes refs can be killed
+// holding: the packed-refs lock, the FETCH_HEAD lock, and one per loose ref
+// that was mid-update. Existence is not checked, because [clearStaleLocks]
+// ignores the ones that are not there.
+func (r *Repository) refUpdateLockPaths() []string {
+	paths := []string{
+		filepath.Join(r.path, "packed-refs.lock"),
+		filepath.Join(r.path, "FETCH_HEAD.lock"),
+	}
+	// Loose ref locks are named after the ref, so they have to be found rather
+	// than listed. A failed walk costs the cleanup, not the caller's error.
+	refsDir := filepath.Join(r.path, "refs")
+	_ = filepath.WalkDir(refsDir, func(path string, d fs.DirEntry, err error) error { //nolint:errcheck // best-effort: an unreadable refs dir just means no loose locks to clear
+		if err != nil {
+			return nil //nolint:nilerr // best-effort: skip unreadable entries
 		}
+		if !d.IsDir() && strings.HasSuffix(path, ".lock") {
+			paths = append(paths, path)
+		}
+		return nil
+	})
+	return paths
+}
+
+// runGit invokes git in the mirror, in its own process group so a cancelled
+// context kills any child it spawned rather than leaving it holding a lock.
+func (r *Repository) runGit(ctx context.Context, args ...string) error {
+	// #nosec G204 - r.path is controlled by us, as are the caller's arguments
+	cmd := exec.CommandContext(ctx, "git", append([]string{"-C", r.path}, args...)...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return errors.Wrapf(err, "git %s: %s", strings.Join(args, " "), string(output))
 	}
 	return nil
 }
@@ -1654,16 +1776,30 @@ func (r *Repository) runRepack(ctx context.Context, repackArgs ...string) error 
 	}
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		// When git repack is killed (e.g. by our timeout), it cannot clean up
-		// the multi-pack-index.lock it holds. A stale lock blocks all future
-		// repacks, causing pack fragmentation that eventually degrades snapshot
-		// serving performance. Remove it so the next attempt can proceed.
-		lockPath := filepath.Join(r.path, "objects", "pack", "multi-pack-index.lock")
-		if rmErr := os.Remove(lockPath); rmErr == nil {
-			logging.FromContext(ctx).WarnContext(ctx,
-				"Removed stale multi-pack-index.lock after repack failure", "upstream", r.upstreamURL)
-		}
+		// A stale multi-pack-index.lock blocks all future repacks, causing pack
+		// fragmentation that eventually degrades snapshot serving performance.
+		// Only this lock: Repack runs without the fetch exclusion, so a fetch
+		// may be updating refs alongside it and its ref locks are live.
+		r.clearStaleLocks(ctx, "repack", []string{
+			filepath.Join(r.path, "objects", "pack", "multi-pack-index.lock"),
+		})
 		return errors.Wrapf(err, "git repack: %s", string(output))
+	}
+	return nil
+}
+
+// packRefs folds loose refs into packed-refs, cleaning up the locks it holds if
+// the process is killed.
+//
+// A killed pack-refs cannot remove the packed-refs.lock it holds, and a stale
+// lock makes every later ref packing fail, so loose refs would accumulate with
+// nothing able to fold them away again. --prune also locks each loose ref it
+// deletes, so those are cleared too. Callers run under the fetch exclusion,
+// which is what makes taking them safe.
+func (r *Repository) packRefs(ctx context.Context) error {
+	if err := r.runGit(ctx, "pack-refs", "--all", "--prune"); err != nil {
+		r.clearStaleLocks(ctx, "pack-refs", r.refUpdateLockPaths())
+		return err
 	}
 	return nil
 }

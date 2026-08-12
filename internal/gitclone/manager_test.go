@@ -762,6 +762,28 @@ func TestRepository_CloneSetsMirrorConfig(t *testing.T) {
 	}
 }
 
+func TestMirrorConfigDisablesAutomaticMaintenance(t *testing.T) {
+	settings := map[string]string{}
+	for _, kv := range mirrorConfigSettings(4) {
+		settings[kv[0]] = kv[1]
+	}
+
+	for _, test := range []struct {
+		name  string
+		key   string
+		value string
+	}{
+		{"GarbageCollection", "gc.auto", "0"},
+		{"DetachedMaintenanceRun", "maintenance.auto", "false"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			assert.Equal(t, test.value, settings[test.key],
+				"a mirror we repack on our own schedule must not also repack on git's: "+
+					"concurrent repacks fail on each other's half-written temp packs")
+		})
+	}
+}
+
 func TestRepository_CloneFailedLeavesNoDebris(t *testing.T) {
 	ctx := context.Background()
 	tmpDir := t.TempDir()
