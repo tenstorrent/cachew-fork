@@ -144,9 +144,15 @@ func main() {
 		return
 	}
 
-	mux, err := newMux(ctx, &shuttingDown, cr, mr, sr, providersConfigHCL, envars)
-	fatalIfError(ctx, logger, err, "Failed to load config")
-
+	// Before newMux, because that is what constructs the strategies, and a
+	// strategy may record a measurement as soon as it is built. Synchronous
+	// instruments created against the global provider before a real one is
+	// installed are delegating stubs that DROP writes with no error (see
+	// internal/metrics.NewConstGauge), so anything recorded ahead of this call is
+	// lost. The git strategy's storage sampler does exactly that: it takes its
+	// first sample immediately, which left cachew_storage_bytes and its
+	// capacity/per-repo companions missing until the first storage-scan-interval
+	// tick — 15 minutes of blank storage panels after every restart.
 	metricsClient, err := metrics.New(ctx, globalConfig.MetricsConfig)
 	fatalIfError(ctx, logger, err, "Failed to create metrics client")
 	defer func() {
@@ -154,6 +160,9 @@ func main() {
 			logger.ErrorContext(ctx, "Failed to close metrics client", "error", err)
 		}
 	}()
+
+	mux, err := newMux(ctx, &shuttingDown, cr, mr, sr, providersConfigHCL, envars)
+	fatalIfError(ctx, logger, err, "Failed to load config")
 
 	// One compiled policy gates both listeners, so the metrics port cannot end
 	// up on a different (or no) policy from the main mux.

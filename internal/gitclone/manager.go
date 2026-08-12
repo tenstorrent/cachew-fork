@@ -1540,6 +1540,15 @@ func (r *Repository) Repack(ctx context.Context) error {
 // between them and hide the reclamation. It is a walk of the mirror directory
 // because the object count git reports says nothing about the bytes those
 // objects occupied. Best-effort: a failed walk costs the number, not the prune.
+//
+// It is a net delta of the whole directory, so it can legitimately come back
+// NEGATIVE: the same repack writes a multi-pack-index and its bitmap, and on a
+// mirror that has never had them the pair is tens of kilobytes of new files
+// that can exceed what the prune actually reclaimed. Observed on a real mirror
+// set as 16 of 55 first prunes reporting a small negative. It is a first-prune
+// artifact — later prunes rewrite those files rather than create them — and the
+// caller drops non-positive values rather than adding them to the reclaimed
+// counter, so a negative here understates reclamation but never corrupts it.
 func (r *Repository) PruneUnreachable(ctx context.Context) (int64, error) {
 	var reclaimed int64
 	err := r.WithFetchExclusion(ctx, func() error {
