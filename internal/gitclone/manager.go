@@ -249,7 +249,7 @@ func (m *Manager) Config() Config {
 	return m.config
 }
 
-func (m *Manager) GetOrCreate(_ context.Context, upstreamURL string) (*Repository, error) {
+func (m *Manager) GetOrCreate(ctx context.Context, upstreamURL string) (*Repository, error) {
 	m.clonesMu.RLock()
 	repo, exists := m.clones[upstreamURL]
 	m.clonesMu.RUnlock()
@@ -270,19 +270,34 @@ func (m *Manager) GetOrCreate(_ context.Context, upstreamURL string) (*Repositor
 		return nil, err
 	}
 
+	// Checked before the repository is built: whether the mirror is already on
+	// disk decides both its initial state and whether its idle clock is
+	// persisted.
+	_, headErr := os.Stat(filepath.Join(clonePath, "HEAD"))
+	onDisk := headErr == nil
+
+	state := StateEmpty
+	if onDisk {
+		state = StateReady
+	}
+
+	// A failed write leaves the mirrors intact; the only consequence is that
+	// the next restart re-seeds this one, so serving continues.
+	lastServed, err := m.seedLastServed(upstreamURL, onDisk)
+	if err != nil {
+		logging.FromContext(ctx).WarnContext(ctx,
+			"Failed to persist initial last-served time, idle eviction will restart the clock for this mirror",
+			"upstream", upstreamURL, "error", err)
+	}
+
 	repo = &Repository{
-		state:              StateEmpty,
+		state:              state,
 		config:             m.config,
 		path:               clonePath,
 		upstreamURL:        upstreamURL,
 		fetchSem:           make(chan struct{}, 1),
 		credentialProvider: m.credentialProvider,
-		lastServed:         m.seedLastServed(upstreamURL),
-	}
-
-	headFile := filepath.Join(clonePath, "HEAD")
-	if _, err := os.Stat(headFile); err == nil {
-		repo.state = StateReady
+		lastServed:         lastServed,
 	}
 
 	repo.fetchSem <- struct{}{}
@@ -313,11 +328,27 @@ func (m *Manager) All() []*Repository {
 // freshly served is the safe default: mirrors that predate the record, or
 // whose record was lost, then get a full idle period before they can be
 // evicted rather than being deleted the first time the evictor runs.
-func (m *Manager) seedLastServed(upstreamURL string) time.Time {
+//
+// onDisk marks a mirror that already exists, whose invented time is persisted
+// so the idle clock runs from first observation and survives a restart.
+// Re-seeding it to now on every start would hand it a fresh idle period each
+// time, and a pod redeployed more often than mirror-ttl would never evict it.
+// Nothing is persisted for a repository with no mirror yet: it is about to be
+// served, and MarkServed records that.
+//
+// The returned time is usable even when persisting it fails, so callers decide
+// whether that failure is worth reporting.
+func (m *Manager) seedLastServed(upstreamURL string, onDisk bool) (time.Time, error) {
 	if recorded := m.lastServed.get(upstreamURL); !recorded.IsZero() {
-		return recorded
+		return recorded, nil
 	}
-	return time.Now()
+	now := time.Now()
+	if onDisk {
+		if err := m.lastServed.seedMissing([]string{upstreamURL}, now); err != nil {
+			return now, errors.Wrap(err, "persist initial last-served time")
+		}
+	}
+	return now, nil
 }
 
 // MarkServed records that a client has just been served from this repository.
@@ -556,7 +587,13 @@ func (m *Manager) evictAt(ctx context.Context, repo *Repository, cutoff time.Tim
 
 func (m *Manager) DiscoverExisting(ctx context.Context) ([]*Repository, error) {
 	var discovered []*Repository
-	err := filepath.Walk(m.config.MirrorRoot, func(path string, info os.FileInfo, err error) error {
+	// One instant shared by every mirror seeded on this pass, so the times held
+	// in memory and the times written below cannot disagree. Seeds are collected
+	// during the walk and flushed after it: writing the record file inside the
+	// walk would create and delete files in the directory being walked.
+	seededAt := time.Now()
+	var seeds []string
+	walkErr := filepath.Walk(m.config.MirrorRoot, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
@@ -594,6 +631,14 @@ func (m *Manager) DiscoverExisting(ctx context.Context) ([]*Repository, error) {
 		}
 		upstreamURL := "https://" + host + "/" + repoPath
 
+		// A mirror with no record has never been served. Its clock starts now
+		// and is persisted after the walk, so restarts do not keep resetting it.
+		lastServed := m.lastServed.get(upstreamURL)
+		if lastServed.IsZero() {
+			lastServed = seededAt
+			seeds = append(seeds, upstreamURL)
+		}
+
 		repo := &Repository{
 			state:              StateReady,
 			config:             m.config,
@@ -601,7 +646,7 @@ func (m *Manager) DiscoverExisting(ctx context.Context) ([]*Repository, error) {
 			upstreamURL:        upstreamURL,
 			fetchSem:           make(chan struct{}, 1),
 			credentialProvider: m.credentialProvider,
-			lastServed:         m.seedLastServed(upstreamURL),
+			lastServed:         lastServed,
 		}
 		repo.fetchSem <- struct{}{}
 
@@ -624,8 +669,20 @@ func (m *Manager) DiscoverExisting(ctx context.Context) ([]*Repository, error) {
 		return fs.SkipDir
 	})
 
-	if err != nil {
-		return nil, errors.Wrap(err, "walk root directory")
+	// Persisted even when the walk failed part-way: the mirrors it did reach are
+	// already registered with an in-memory seed, and startup carries on after
+	// logging the warm-up error, so leaving those seeds unwritten would let a
+	// restart keep resetting their idle clocks.
+	if len(seeds) > 0 {
+		if err := m.lastServed.seedMissing(seeds, seededAt); err != nil {
+			logging.FromContext(ctx).WarnContext(ctx,
+				"Failed to persist initial last-served times, idle eviction will restart the clock for these mirrors",
+				"upstreams", seeds, "error", err)
+		}
+	}
+
+	if walkErr != nil {
+		return nil, errors.Wrap(walkErr, "walk root directory")
 	}
 
 	return discovered, nil

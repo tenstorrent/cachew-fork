@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/alecthomas/errors"
+	"go.opentelemetry.io/otel/metric"
 
 	"github.com/tenstorrent/internal-cachew/internal/httputil"
 	"github.com/tenstorrent/internal-cachew/internal/logging"
@@ -53,6 +54,12 @@ type Disk struct {
 	// must share one mutable limit.
 	limit   *atomic.Int64
 	metrics *cacheMetrics
+	// sizeLimitMetric is the callback publishing limit. Held so [Disk.Close]
+	// can unregister it: an observable callback outlives its registrar, so a
+	// closed cache would keep reporting a limit nothing is enforcing, and a
+	// cache reopened over the same root would publish a second value for the
+	// same series.
+	sizeLimitMetric metric.Registration
 	// runEviction is buffered so a request made during a sweep is queued
 	// instead of dropped; that sweep may already have read the old limit.
 	runEviction  chan struct{}
@@ -140,6 +147,9 @@ func NewDisk(ctx context.Context, config DiskConfig) (*Disk, error) {
 	}
 	disk.size.Store(size)
 	disk.limit.Store(int64(config.LimitMB) * 1024 * 1024)
+	// Registered after the limit is stored so the first collection cannot
+	// observe a zero ceiling.
+	disk.sizeLimitMetric = disk.metrics.registerSizeLimit(disk.limit.Load)
 
 	go disk.evictionLoop(ctx)
 
@@ -353,10 +363,16 @@ func (d *Disk) String() string { return "disk:" + d.config.Root }
 func (d *Disk) Close() error {
 	d.stop()
 	<-d.evictionDone
-	if d.db != nil {
-		return d.db.close()
+	var err error
+	if d.sizeLimitMetric != nil {
+		if unregErr := d.sizeLimitMetric.Unregister(); unregErr != nil {
+			err = errors.Errorf("failed to unregister size limit metric: %w", unregErr)
+		}
 	}
-	return nil
+	if d.db != nil {
+		err = errors.Join(err, d.db.close())
+	}
+	return err
 }
 
 func (d *Disk) Size() int64 {
@@ -374,7 +390,10 @@ func (d *Disk) SizeLimit() int64 {
 // The configured limit-mb is the maximum: a caller sharing a storage budget can
 // give the cache less space than the operator allowed, never more. A
 // non-positive limit is ignored, because a zero-sized cache misses everything.
-func (d *Disk) SetSizeLimit(ctx context.Context, limitBytes int64) {
+//
+// The limit is published by the observable gauge registered in [NewDisk], not
+// from here, so the series reports the steady state as well as changes to it.
+func (d *Disk) SetSizeLimit(_ context.Context, limitBytes int64) {
 	configured := int64(d.config.LimitMB) * 1024 * 1024
 	if limitBytes <= 0 {
 		return
@@ -383,7 +402,6 @@ func (d *Disk) SetSizeLimit(ctx context.Context, limitBytes int64) {
 	if d.limit.Swap(limitBytes) == limitBytes {
 		return
 	}
-	d.metrics.recordSizeLimit(ctx, limitBytes)
 	d.TriggerEviction()
 }
 

@@ -3,6 +3,7 @@ package metrics_test
 import (
 	"os"
 	"os/exec"
+	"sync/atomic"
 	"testing"
 
 	"github.com/alecthomas/assert/v2"
@@ -52,6 +53,41 @@ func TestNewConstGaugeSurvivesRegistrationBeforeSetMeterProvider(t *testing.T) {
 	}
 }
 
+func TestRegisterObservableGaugeSurvivesRegistrationBeforeSetMeterProvider(t *testing.T) {
+	if os.Getenv(pristineProcessEnv) == "" {
+		rerunInPristineProcess(t)
+		return
+	}
+
+	prevProvider := otel.GetMeterProvider()
+	t.Cleanup(func() { otel.SetMeterProvider(prevProvider) })
+
+	var limit atomic.Int64
+	limit.Store(64)
+	registration := metrics.RegisterObservableGauge(otel.Meter("cachew.test"), "cachew.test.limit_bytes", "By",
+		"Limit currently enforced", limit.Load, attribute.String("backend", "disk"))
+
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	t.Cleanup(func() { assert.NoError(t, provider.Shutdown(t.Context())) })
+	otel.SetMeterProvider(provider)
+
+	var rm metricdata.ResourceMetrics
+	assert.NoError(t, reader.Collect(t.Context(), &rm))
+	assert.Equal(t, int64(64), gaugeValue(t, &rm, "cachew.test.limit_bytes"))
+
+	limit.Store(32)
+	rm = metricdata.ResourceMetrics{}
+	assert.NoError(t, reader.Collect(t.Context(), &rm))
+	assert.Equal(t, int64(32), gaugeValue(t, &rm, "cachew.test.limit_bytes"))
+
+	assert.NoError(t, registration.Unregister())
+	rm = metricdata.ResourceMetrics{}
+	assert.NoError(t, reader.Collect(t.Context(), &rm))
+	assert.False(t, hasMetric(&rm, "cachew.test.limit_bytes"),
+		"an unregistered gauge kept publishing a value its owner no longer maintains")
+}
+
 func rerunInPristineProcess(t *testing.T) {
 	t.Helper()
 	cmd := exec.Command(os.Args[0], "-test.run=^"+t.Name()+"$", "-test.v")
@@ -76,4 +112,15 @@ func gaugeValue(t *testing.T, rm *metricdata.ResourceMetrics, name string) int64
 	}
 	t.Fatalf("gauge %s not collected", name)
 	return 0
+}
+
+func hasMetric(rm *metricdata.ResourceMetrics, name string) bool {
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name == name {
+				return true
+			}
+		}
+	}
+	return false
 }

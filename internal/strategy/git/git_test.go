@@ -208,8 +208,13 @@ func TestNewWithExistingCloneOnDisk(t *testing.T) {
 		MirrorRoot:    tmpDir,
 		FetchInterval: 15,
 	}, nil)
-	_, err = git.New(ctx, git.Config{}, newTestScheduler(ctx, t), nil, mux, cm, func() (*githubapp.TokenManager, error) { return nil, nil }, nil) //nolint:nilnil
+	s, err := git.New(ctx, git.Config{}, newTestScheduler(ctx, t), nil, mux, cm, func() (*githubapp.TokenManager, error) { return nil, nil }, nil) //nolint:nilnil
 	assert.NoError(t, err)
+
+	// Warm-up discovers the mirror on a background goroutine and writes the
+	// idle-clock record into the mirror root. Without waiting, that write races
+	// t.TempDir's cleanup.
+	waitForReady(t, s)
 }
 
 // TestNewIsReadyAfterWarm verifies that startup warm-up runs in the background

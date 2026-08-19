@@ -66,11 +66,60 @@ func (s *lastServedStore) get(upstreamURL string) time.Time {
 func (s *lastServedStore) record(upstreamURL string, now time.Time) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if previous, ok := s.times[upstreamURL]; ok && now.Sub(previous) < lastServedGranularity {
+	previous, existed := s.times[upstreamURL]
+	if existed && now.Sub(previous) < lastServedGranularity {
 		return false, nil
 	}
 	s.times[upstreamURL] = now
-	return true, s.flushLocked()
+	if err := s.flushLocked(); err != nil {
+		// The in-memory time is only there to throttle writes, so keeping one
+		// that never reached disk would suppress the next write too.
+		if existed {
+			s.times[upstreamURL] = previous
+		} else {
+			delete(s.times, upstreamURL)
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+// seedMissing records now for each URL that has no record yet, fixing those
+// mirrors' idle clocks at the moment cachew first observed them. URLs that
+// already have a record are left alone, so a real serve time is never
+// overwritten and an unserved mirror keeps ageing across restarts.
+//
+// Persisting the invented time is what makes the clock survive a restart. A
+// mirror discovered on disk with no record would otherwise be re-seeded to now
+// on every process start, so a deployment cadence shorter than mirror-ttl would
+// keep resetting it and it could never be evicted.
+//
+// Takes a batch and flushes at most once: startup discovery seeds every mirror
+// on the volume at the same instant, and a flush rewrites the whole file.
+func (s *lastServedStore) seedMissing(upstreamURLs []string, now time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var added []string
+	for _, url := range upstreamURLs {
+		if _, ok := s.times[url]; ok {
+			continue
+		}
+		s.times[url] = now
+		added = append(added, url)
+	}
+	if len(added) == 0 {
+		return nil
+	}
+	if err := s.flushLocked(); err != nil {
+		// Keeping unpersisted seeds in memory would make a later seeding attempt
+		// skip them, and record() would throttle against a time that was never
+		// written, so a transient failure would suppress both until restart.
+		for _, url := range added {
+			delete(s.times, url)
+		}
+		return err
+	}
+	return nil
 }
 
 // forget drops upstreamURL, so an evicted repository does not linger in the

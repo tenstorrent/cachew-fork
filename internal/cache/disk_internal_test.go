@@ -1,6 +1,7 @@
 package cache
 
 import (
+	"net/http"
 	"testing"
 	"time"
 
@@ -48,6 +49,122 @@ func TestDiskRecordReadThrottlesAccessWrites(t *testing.T) {
 	bumped, err := d.db.getEntry(d.namespace, key)
 	assert.NoError(t, err)
 	assert.True(t, bumped.lastAccessedAt.After(written.lastAccessedAt), "a read past the window did not bump the stamp")
+}
+
+func TestDiskOverwriteDoesNotExtendExpiry(t *testing.T) {
+	_, ctx, _ := logging.Configure(t.Context(), logging.Config{Level: "debug"})
+
+	d, err := NewDisk(ctx, DiskConfig{
+		Root:          t.TempDir(),
+		LimitMB:       10,
+		MaxTTL:        time.Hour,
+		EvictInterval: time.Minute,
+	})
+	assert.NoError(t, err)
+	defer d.Close()
+
+	key := NewKey("regenerated")
+	write := func(payload string) diskEntryMeta {
+		t.Helper()
+		w, err := d.Create(ctx, key, nil, time.Hour)
+		assert.NoError(t, err)
+		_, err = w.Write([]byte(payload))
+		assert.NoError(t, err)
+		assert.NoError(t, w.Close())
+		meta, err := d.db.getEntry(d.namespace, key)
+		assert.NoError(t, err)
+		return meta
+	}
+
+	first := write("v1")
+	// A later write with the same TTL computes a later expiry, which must be
+	// discarded in favour of the one already recorded.
+	time.Sleep(10 * time.Millisecond)
+	second := write("v2")
+	assert.Equal(t, first.expiresAt, second.expiresAt, "an overwrite extended the entry's TTL")
+
+	// The base TTL still tracks what the entry was written with, so a read can
+	// still slide expiry forward by it.
+	assert.Equal(t, time.Hour, second.baseTTL)
+
+	// The access stamp is not an expiry and must still move, or eviction ranks a
+	// freshly written entry as the coldest thing in the cache.
+	assert.True(t, second.lastAccessedAt.After(first.lastAccessedAt))
+}
+
+func TestDiskMetaDBSetKeepsTheEarlierExpiry(t *testing.T) {
+	_, ctx, _ := logging.Configure(t.Context(), logging.Config{Level: "debug"})
+
+	d, err := NewDisk(ctx, DiskConfig{
+		Root:          t.TempDir(),
+		LimitMB:       10,
+		MaxTTL:        2 * time.Hour,
+		EvictInterval: time.Minute,
+	})
+	assert.NoError(t, err)
+	defer d.Close()
+
+	key := NewKey("explicit")
+	now := time.Now()
+	early := now.Add(30 * time.Minute)
+
+	assert.NoError(t, d.db.set(key, d.namespace, early, now, 30*time.Minute, http.Header{"A": {"1"}}))
+
+	late := now.Add(90 * time.Minute)
+	later := now.Add(time.Minute)
+	assert.NoError(t, d.db.set(key, d.namespace, late, later, 90*time.Minute, http.Header{"A": {"2"}}))
+
+	meta, err := d.db.getEntry(d.namespace, key)
+	assert.NoError(t, err)
+	assert.Equal(t, early.Unix(), meta.expiresAt.Unix(), "set accepted an expiry later than the one recorded")
+	assert.Equal(t, later.Unix(), meta.lastAccessedAt.Unix(), "the access stamp should follow the write")
+	assert.Equal(t, 90*time.Minute, meta.baseTTL, "the base TTL should follow the write")
+	assert.Equal(t, "2", meta.headers.Get("A"), "headers should follow the write")
+
+	// Symmetrically, an expiry EARLIER than the recorded one is accepted: the
+	// rule is that a write never lengthens an entry's life, not that expiry is
+	// frozen.
+	earliest := now.Add(5 * time.Minute)
+	assert.NoError(t, d.db.set(key, d.namespace, earliest, later, 5*time.Minute, nil))
+	shortened, err := d.db.getEntry(d.namespace, key)
+	assert.NoError(t, err)
+	assert.Equal(t, earliest.Unix(), shortened.expiresAt.Unix(), "a write should be able to shorten expiry")
+}
+
+func TestDiskOverwriteOfExpiredEntryGetsFreshTTL(t *testing.T) {
+	_, ctx, _ := logging.Configure(t.Context(), logging.Config{Level: "debug"})
+
+	d, err := NewDisk(ctx, DiskConfig{
+		Root:          t.TempDir(),
+		LimitMB:       10,
+		MaxTTL:        time.Hour,
+		EvictInterval: time.Minute,
+	})
+	assert.NoError(t, err)
+	defer d.Close()
+
+	key := NewKey("lapsed")
+	w, err := d.Create(ctx, key, nil, time.Millisecond)
+	assert.NoError(t, err)
+	_, err = w.Write([]byte("v1"))
+	assert.NoError(t, err)
+	assert.NoError(t, w.Close())
+
+	expired, err := d.db.getEntry(d.namespace, key)
+	assert.NoError(t, err)
+	time.Sleep(5 * time.Millisecond)
+	assert.True(t, time.Now().After(expired.expiresAt), "entry should have lapsed")
+
+	w, err = d.Create(ctx, key, nil, time.Hour)
+	assert.NoError(t, err)
+	_, err = w.Write([]byte("v2"))
+	assert.NoError(t, err)
+	assert.NoError(t, w.Close())
+
+	fresh, err := d.db.getEntry(d.namespace, key)
+	assert.NoError(t, err)
+	assert.True(t, fresh.expiresAt.After(time.Now().Add(30*time.Minute)),
+		"rewriting a lapsed entry must not inherit its dead expiry")
 }
 
 // A throttled read skips the write but must not be lost. Eviction can run at

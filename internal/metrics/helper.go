@@ -99,12 +99,31 @@ func NewHistogram(meter metric.Meter, path, unit, description string, buckets []
 func NewConstGauge(
 	meter metric.Meter, path, unit, description string, value int64, attrs ...attribute.KeyValue,
 ) metric.Int64ObservableGauge {
+	return NewObservableGauge(meter, path, unit, description, func() int64 { return value }, attrs...)
+}
+
+// NewObservableGauge publishes whatever observe returns, re-read on every
+// collection.
+//
+// Prefer this over an Int64Gauge for any "current value of X" series. A
+// synchronous gauge only appears in the exporter's output once something calls
+// Record, so a value that is correct from startup and rarely changes is either
+// missing entirely or stale: a caller that skips the write when the value is
+// unchanged never publishes the steady state at all. Observing at collection
+// time also means the series survives being constructed before
+// otel.SetMeterProvider installs a real provider, for the reason described on
+// [NewConstGauge].
+//
+// observe is called on the collection path, so it must not block.
+func NewObservableGauge(
+	meter metric.Meter, path, unit, description string, observe func() int64, attrs ...attribute.KeyValue,
+) metric.Int64ObservableGauge {
 	g, err := meter.Int64ObservableGauge(
 		path,
 		metric.WithUnit(unit),
 		metric.WithDescription(description),
 		metric.WithInt64Callback(func(_ context.Context, o metric.Int64Observer) error {
-			o.Observe(value, metric.WithAttributes(attrs...))
+			o.Observe(observe(), metric.WithAttributes(attrs...))
 			return nil
 		}),
 	)
@@ -112,6 +131,33 @@ func NewConstGauge(
 		panic(err)
 	}
 	return g
+}
+
+// RegisterObservableGauge is [NewObservableGauge] for a value owned by
+// something with a lifetime shorter than the process, returning a registration
+// the owner unregisters when it closes.
+//
+// A callback attached to the instrument itself cannot be detached, so a closed
+// owner would keep being observed: its stale value would be published forever,
+// and reopening the owner would publish a second measurement with the same
+// attributes for the same series.
+//
+// observe is called on the collection path, so it must not block.
+func RegisterObservableGauge(
+	meter metric.Meter, path, unit, description string, observe func() int64, attrs ...attribute.KeyValue,
+) metric.Registration {
+	g, err := meter.Int64ObservableGauge(path, metric.WithUnit(unit), metric.WithDescription(description))
+	if err != nil {
+		panic(err)
+	}
+	registration, err := meter.RegisterCallback(func(_ context.Context, o metric.Observer) error {
+		o.ObserveInt64(g, observe(), metric.WithAttributes(attrs...))
+		return nil
+	}, g)
+	if err != nil {
+		panic(err)
+	}
+	return registration
 }
 
 func NewMetric[OM any](meter metric.Meter, path, unit, description string) OM {

@@ -145,30 +145,44 @@ func (s *diskMetaDB) recordAccess(namespace Namespace, key Key, expiresAt, acces
 	return nil
 }
 
+// storedTime decodes a time recorded in raw, reporting false when there is
+// none or it cannot be parsed.
+func storedTime(raw []byte) (time.Time, bool) {
+	if len(raw) == 0 {
+		return time.Time{}, false
+	}
+	var stored time.Time
+	if err := stored.UnmarshalBinary(raw); err != nil {
+		return time.Time{}, false
+	}
+	return stored, true
+}
+
 // storedTimeIsBefore reports whether the time recorded in raw is older than t,
 // and so whether writing t moves the value forward.
 //
 // Absent or unparseable bytes count as older: there is nothing worth keeping.
 func storedTimeIsBefore(raw []byte, t time.Time) bool {
-	if len(raw) == 0 {
-		return true
-	}
-	var stored time.Time
-	if err := stored.UnmarshalBinary(raw); err != nil {
+	stored, ok := storedTime(raw)
+	if !ok {
 		return true
 	}
 	return stored.Before(t)
 }
 
+// set records an entry's metadata, publishing it at key.
+//
+// now is the moment of the write, used both as the entry's access stamp and to
+// tell a live expiry from one already passed.
 func (s *diskMetaDB) set(
-	key Key, namespace Namespace, expiresAt, accessedAt time.Time, baseTTL time.Duration, headers http.Header,
+	key Key, namespace Namespace, expiresAt, now time.Time, baseTTL time.Duration, headers http.Header,
 ) error {
 	ttlBytes, err := expiresAt.MarshalBinary()
 	if err != nil {
 		return errors.Errorf("failed to marshal TTL: %w", err)
 	}
 
-	accessedBytes, err := accessedAt.MarshalBinary()
+	accessedBytes, err := now.MarshalBinary()
 	if err != nil {
 		return errors.Errorf("failed to marshal last accessed time: %w", err)
 	}
@@ -186,7 +200,28 @@ func (s *diskMetaDB) set(
 	dbKey := compositeKey(namespace, key)
 	err = s.db.Update(func(tx *bbolt.Tx) error {
 		ttlBucket := tx.Bucket(ttlBucketName)
-		if err := ttlBucket.Put(dbKey, ttlBytes); err != nil {
+		// Rewriting a key must not extend its life. A TTL bounds how long an
+		// entry may live without being wanted, and a write is supply rather
+		// than demand — only a read slides expiry forward, in recordAccess.
+		// Resetting expiry here made the TTL unreachable for any key
+		// regenerated on a schedule shorter than the TTL, which is every
+		// snapshot: their cache key carries no commit, so each regeneration
+		// overwrites the same key and pushed expiry out again.
+		//
+		// An expiry already in the past is not preserved. That entry is
+		// logically gone even if a sweep has not collected it yet, so this
+		// write is a new entry and earns the full TTL. Done inside the
+		// transaction so two writers racing on one key cannot both read the
+		// old expiry and then lose one another's decision.
+		put := ttlBytes
+		if stored, ok := storedTime(ttlBucket.Get(dbKey)); ok && stored.After(now) && stored.Before(expiresAt) {
+			preserved, marshalErr := stored.MarshalBinary()
+			if marshalErr != nil {
+				return errors.Errorf("failed to marshal preserved TTL: %w", marshalErr)
+			}
+			put = preserved
+		}
+		if err := ttlBucket.Put(dbKey, put); err != nil {
 			return errors.WithStack(err)
 		}
 
