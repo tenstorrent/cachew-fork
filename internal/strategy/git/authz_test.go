@@ -334,6 +334,12 @@ type capturingScheduler struct {
 
 func (c *capturingScheduler) WithQueuePrefix(string) jobscheduler.Scheduler { return c }
 
+// TrySubmit records jobs so authorization tests can detect unintended background work.
+func (c *capturingScheduler) TrySubmit(queue, id string, _ int, run func(ctx context.Context) error) bool {
+	c.Submit(queue, id, run)
+	return true
+}
+
 func (c *capturingScheduler) Submit(_, id string, run func(ctx context.Context) error) {
 	c.SubmitPeriodicJob("", id, 0, run)
 }

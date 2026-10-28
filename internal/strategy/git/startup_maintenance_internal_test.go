@@ -252,6 +252,12 @@ type queueCapturingScheduler struct {
 
 func (q *queueCapturingScheduler) WithQueuePrefix(string) jobscheduler.Scheduler { return q }
 
+// TrySubmit records jobs so maintenance tests can inspect background scheduling.
+func (q *queueCapturingScheduler) TrySubmit(queue, id string, _ int, run func(ctx context.Context) error) bool {
+	q.Submit(queue, id, run)
+	return true
+}
+
 func (q *queueCapturingScheduler) Submit(queue, id string, run func(ctx context.Context) error) {
 	if q.submitted == nil {
 		q.submitted = map[string]string{}

@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"io"
 	"maps"
+	"math/rand/v2"
 	"net/http"
 	"net/http/httputil"
 	"os"
@@ -23,6 +24,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
+	"golang.org/x/mod/semver"
 
 	"github.com/tenstorrent/internal-cachew/internal/cache"
 	"github.com/tenstorrent/internal-cachew/internal/gitclone"
@@ -39,6 +41,11 @@ import (
 
 //nolint:gochecknoglobals // OTel tracer instances are package-scoped by convention
 var tracer = otel.Tracer("github.com/tenstorrent/internal-cachew/internal/strategy/git")
+
+const minimumGitLFSVersion = "v3.8.1"
+
+//nolint:gochecknoglobals // The executable and its version are process-wide.
+var gitLFSVersionCheck = sync.OnceValue(checkGitLFSVersion)
 
 func Register(r *strategy.Registry, scheduler jobscheduler.Provider, cloneManagerProvider gitclone.ManagerProvider, tokenManagerProvider githubapp.TokenManagerProvider, authz *repoauthz.Authorizer) {
 	strategy.Register(r, "git", "Caches Git repositories, including tarball snapshots.", func(ctx context.Context, config Config, cache cache.Cache, mux strategy.Mux) (*Strategy, error) {
@@ -128,6 +135,11 @@ type Strategy struct {
 	deferredRestoreOnce       sync.Map                                              // keyed by upstream URL, ensures at most one deferred restore per repo
 	forcedFetches             sync.Map                                              // keyed by upstream URL, ensures at most one cooldown-bypassing fetch is queued per repo
 	pendingStartupMaintenance sync.Map                                              // keyed by upstream URL, present while a startup-maintenance pass is queued but not yet started
+	bundleBuilds              sync.Map
+	snapshotJobsScheduled     sync.Map
+	repackJobsScheduled       sync.Map
+	mirrorPreparations        sync.Map
+	coldPreparationDelay      func() time.Duration
 	metrics                   *gitMetrics
 	storage                   *storageMetrics
 	repoCounts                *RepoCounts
@@ -197,8 +209,8 @@ func New(
 
 	logger := logging.FromContext(ctx)
 
-	if _, err := exec.LookPath("git-lfs"); err != nil {
-		return nil, errors.New("git-lfs is required but not found in PATH")
+	if err := gitLFSVersionCheck(); err != nil {
+		return nil, err
 	}
 
 	// Get GitHub App token manager if configured
@@ -253,6 +265,9 @@ func New(
 		metrics:       m,
 		storage:       newStorageMetrics(),
 		metadataWired: make(chan struct{}),
+		coldPreparationDelay: func() time.Duration {
+			return rand.N(coldPreparationSpread) //nolint:gosec // The delay does not protect sensitive data.
+		},
 	}
 	if tokenManager != nil {
 		s.serviceToken = tokenManager.GetTokenForOrg
@@ -320,6 +335,33 @@ func New(
 		"incremental_fetch_timeout", config.IncrementalFetchTimeout)
 
 	return s, nil
+}
+
+func gitLFSVersionSupported(output []byte) bool {
+	_, versionText, ok := strings.Cut(string(output), "git-lfs/")
+	if !ok {
+		return false
+	}
+	fields := strings.Fields(versionText)
+	if len(fields) == 0 {
+		return false
+	}
+	version := "v" + fields[0]
+	return semver.IsValid(version) && semver.Compare(version, minimumGitLFSVersion) >= 0
+}
+
+func checkGitLFSVersion() error {
+	if _, err := exec.LookPath("git-lfs"); err != nil {
+		return errors.New("git-lfs is required but not found in PATH")
+	}
+	gitLFSVersion, err := exec.CommandContext(context.Background(), "git-lfs", "version").CombinedOutput()
+	if err != nil {
+		return errors.Wrapf(err, "run git-lfs version: %s", string(gitLFSVersion))
+	}
+	if !gitLFSVersionSupported(gitLFSVersion) {
+		return errors.Errorf("git-lfs %s or newer is required", strings.TrimPrefix(minimumGitLFSVersion, "v"))
+	}
+	return nil
 }
 
 var _ strategy.Strategy = (*Strategy)(nil)
@@ -448,6 +490,8 @@ var maintenanceJobIDs = []string{
 // returns true, or the cancelled pass is lost rather than merely deferred.
 func (s *Strategy) cancelMaintenanceJobs(repo *gitclone.Repository) bool {
 	upstream := repo.UpstreamURL()
+	s.snapshotJobsScheduled.Delete(upstream)
+	s.repackJobsScheduled.Delete(upstream)
 	for _, id := range maintenanceJobIDs {
 		s.scheduler.CancelPeriodicJob(upstream, id)
 	}
@@ -478,6 +522,9 @@ func (s *Strategy) evictIdleMirrors(ctx context.Context, ttl time.Duration) erro
 	logger := logging.FromContext(ctx)
 	for _, repo := range s.cloneManager.IdleMirrors(ttl) {
 		upstream := repo.UpstreamURL()
+		if _, preparing := s.mirrorPreparations.Load(upstream); preparing {
+			continue
+		}
 		// Stop the maintenance chains before deleting, so nothing re-arms
 		// against a missing directory. If eviction then declines, the next
 		// request for this repository reschedules them.
@@ -670,47 +717,52 @@ func (s *Strategy) handleGitRequest(w http.ResponseWriter, r *http.Request, host
 	}
 }
 
+func (s *Strategy) handleRefDiscovery(w http.ResponseWriter, r *http.Request, repo *gitclone.Repository, host, pathValue string, isInfoRefs bool) (bool, error) {
+	ctx := r.Context()
+	logger := logging.FromContext(ctx)
+	isDiscovery := isInfoRefs
+	if !isDiscovery {
+		var err error
+		isDiscovery, err = requestIsLsRefs(pathValue, r)
+		if err != nil {
+			return false, errors.Wrap(err, "inspect ls-refs request")
+		}
+	}
+	if isDiscovery {
+		stale, err := s.checkRefsStale(ctx, repo)
+		if err != nil {
+			logger.DebugContext(ctx, "Ref staleness check failed, serving mirror",
+				"upstream", repo.UpstreamURL(), "error", err)
+		} else if stale {
+			logger.InfoContext(ctx, "Refs stale, forwarding to upstream and fetching in background", "upstream", repo.UpstreamURL())
+			s.submitFetch(repo)
+			s.forwardToUpstream(w, r, host, pathValue)
+			return true, nil
+		}
+	}
+
+	return false, nil
+}
+
 func (s *Strategy) serveReadyRepo(w http.ResponseWriter, r *http.Request, repo *gitclone.Repository, host, pathValue string, isInfoRefs bool) error {
 	ctx := r.Context()
 	// Started at handler entry so the incremental duration metric covers the whole
 	// latency this handler adds on the request path.
 	incrementalStart := time.Now()
+	logger := logging.FromContext(ctx)
 
-	if isInfoRefs {
-		stale, err := s.checkRefsStale(ctx, repo)
-		if err != nil {
-			// A failed check is treated as "not stale" so a flaky ls-remote cannot
-			// take the mirror out of service. Logged at debug only: this runs on
-			// every info/refs request, so an unreachable upstream would otherwise
-			// emit a warning per request.
-			logging.FromContext(ctx).DebugContext(ctx, "Ref staleness check failed, treating mirror as fresh",
-				"upstream", repo.UpstreamURL(), "error", errors.Wrap(err, "check upstream refs"))
-		} else if stale {
-			// Mirror is behind upstream. Forward to upstream so the client gets
-			// fresh refs immediately, and kick off a background fetch so the
-			// mirror catches up for subsequent requests.
-			logging.FromContext(ctx).InfoContext(ctx, "Refs stale, forwarding to upstream and fetching in background", "upstream", repo.UpstreamURL())
-			s.submitFetch(repo)
-			s.forwardToUpstream(w, r, host, pathValue)
-			return nil
-		}
+	if handled, err := s.handleRefDiscovery(w, r, repo, host, pathValue, isInfoRefs); handled || err != nil {
+		return err
 	}
 
-	// Buffer the request body so it can be replayed if serveFromBackend
-	// signals a fallback to upstream (e.g. on "not our ref").
-	var bodyBytes []byte
-	if r.Body != nil && r.Body != http.NoBody {
-		var readErr error
-		bodyBytes, readErr = io.ReadAll(r.Body)
-		if readErr != nil {
-			var maxErr *http.MaxBytesError
-			if errors.As(readErr, &maxErr) {
-				cachewhttputil.ErrorResponse(w, r, http.StatusRequestEntityTooLarge, "request body too large")
-				return nil
-			}
-			return errors.Wrap(readErr, "read request body")
+	bodyBytes, err := bufferRequestBody(r)
+	if err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			cachewhttputil.ErrorResponse(w, r, http.StatusRequestEntityTooLarge, "request body too large")
+			return nil
 		}
-		replayRequestBody(r, bodyBytes)
+		return err
 	}
 
 	// incrementalParse has no side effects, so wants are computed even when the
@@ -772,20 +824,47 @@ func (s *Strategy) serveReadyRepo(w http.ResponseWriter, r *http.Request, repo *
 		}
 	}
 
-	if s.serveFromBackend(w, r, repo) {
-		// The mirror is missing the requested object — most likely a commit
-		// that was advertised before a concurrent force-push fetch orphaned
-		// it. Fall back to upstream so the client is not left with an error.
+	if !s.serveFromBackend(w, r, repo) {
 		if incrementalOutcome != "" {
-			incrementalOutcome = incrementalOutcomeAfterNotOurRef(incrementalOutcome)
+			recordIncremental(incrementalOutcome)
 		}
-		logging.FromContext(ctx).InfoContext(ctx, "Falling back to upstream due to 'not our ref'", "path", pathValue)
-		s.forwardWithBody(w, r, host, pathValue, bodyBytes)
+		return nil
+	}
+	// The missing object is usually a commit the stale mirror has not fetched
+	// yet; fetching is far cheaper than proxying the whole pack from upstream.
+	if _, err := s.doFetchReporting(ctx, repo); err != nil {
+		logger.WarnContext(ctx, "Fetch after 'not our ref' failed, forwarding to upstream", "upstream", repo.UpstreamURL(),
+			"error", err)
+	} else {
+		if bodyBytes != nil {
+			replayRequestBody(r, bodyBytes)
+		}
+		if !s.serveFromBackend(w, r, repo) {
+			logger.InfoContext(ctx, "Served from mirror after fetching object missing for 'not our ref'", "path", pathValue)
+			if incrementalOutcome != "" {
+				recordIncremental(incrementalFetched)
+			}
+			return nil
+		}
 	}
 	if incrementalOutcome != "" {
-		recordIncremental(incrementalOutcome)
+		recordIncremental(incrementalOutcomeAfterNotOurRef(incrementalOutcome))
 	}
+	logger.InfoContext(ctx, "Falling back to upstream due to 'not our ref'", "path", pathValue)
+	s.forwardWithBody(w, r, host, pathValue, bodyBytes)
 	return nil
+}
+
+func bufferRequestBody(r *http.Request) ([]byte, error) {
+	if r.Body == nil || r.Body == http.NoBody {
+		return nil, nil
+	}
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		return nil, errors.Wrap(err, "read request body")
+	}
+	replayRequestBody(r, body)
+	return body, nil
 }
 
 // replayRequestBody replaces r.Body with a fresh reader over bodyBytes so the
@@ -943,24 +1022,24 @@ func ExtractRepoPath(pathValue string) string {
 // goroutine is already cloning (StateCloning), it polls until completion or the
 // context is cancelled. Returns an error if the clone fails or the context is done.
 func (s *Strategy) ensureCloneReady(ctx context.Context, repo *gitclone.Repository) error {
-	if repo.State() == gitclone.StateEmpty {
-		if err := s.startClone(ctx, repo); err != nil {
-			return err
+	for {
+		switch repo.State() {
+		case gitclone.StateReady:
+			return nil
+		case gitclone.StateEmpty:
+			if err := s.startClone(ctx, repo); err != nil {
+				return err
+			}
+		case gitclone.StateCloning:
+			t := time.NewTimer(500 * time.Millisecond)
+			select {
+			case <-ctx.Done():
+				t.Stop()
+				return errors.Wrap(ctx.Err(), "cancelled waiting for clone")
+			case <-t.C:
+			}
 		}
 	}
-	for repo.State() == gitclone.StateCloning {
-		t := time.NewTimer(500 * time.Millisecond)
-		select {
-		case <-ctx.Done():
-			t.Stop()
-			return errors.Wrap(ctx.Err(), "cancelled waiting for clone")
-		case <-t.C:
-		}
-	}
-	if repo.State() != gitclone.StateReady {
-		return errors.New("repository unavailable after clone attempt")
-	}
-	return nil
 }
 
 func (s *Strategy) startClone(ctx context.Context, repo *gitclone.Repository) (returnErr error) {
@@ -991,8 +1070,11 @@ func (s *Strategy) startClone(ctx context.Context, repo *gitclone.Repository) (r
 
 	logger.InfoContext(ctx, "Attempting mirror snapshot restore", "upstream", upstream)
 
-	if err := s.tryRestoreSnapshot(ctx, repo); err != nil {
-		logger.InfoContext(ctx, "Mirror snapshot restore failed, falling back to clone", "upstream", upstream, "error", err)
+	restoreCtx, cancelRestore := context.WithTimeout(ctx, s.cloneManager.Config().CloneTimeout)
+	restoreErr := s.tryRestoreSnapshot(restoreCtx, repo)
+	cancelRestore()
+	if restoreErr != nil {
+		logger.InfoContext(ctx, "Mirror snapshot restore failed, falling back to clone", "upstream", upstream, "error", restoreErr)
 	} else {
 		logger.InfoContext(ctx, "Mirror snapshot restored, fetching to freshen", "upstream", upstream)
 
@@ -1009,8 +1091,8 @@ func (s *Strategy) startClone(ctx context.Context, repo *gitclone.Repository) (r
 				"upstream", upstream, "error", err)
 			// The restored snapshot may be corrupt or empty. Remove it and
 			// fall through to a fresh clone so we don't re-upload bad data.
-			repo.ResetToEmpty()
 			if rmErr := os.RemoveAll(repo.Path()); rmErr != nil {
+				repo.ResetToEmpty()
 				return errors.Wrapf(rmErr, "remove corrupt mirror for %s", upstream)
 			}
 		} else {
@@ -1030,7 +1112,7 @@ func (s *Strategy) startClone(ctx context.Context, repo *gitclone.Repository) (r
 	logger.InfoContext(ctx, "Starting clone", "upstream", upstream, "path", repo.Path())
 
 	cloneStart := time.Now()
-	err := repo.Clone(ctx)
+	err := repo.CloneClaimed(ctx)
 
 	// Clean up spools regardless of clone success or failure, so that subsequent
 	// requests either serve from the local backend or go directly to upstream.
@@ -1040,7 +1122,6 @@ func (s *Strategy) startClone(ctx context.Context, repo *gitclone.Repository) (r
 
 	if err != nil {
 		s.metrics.recordOperation(ctx, "clone", "error", "background", time.Since(cloneStart))
-		repo.ResetToEmpty()
 		return errors.Wrapf(err, "clone %s", upstream)
 	}
 

@@ -176,12 +176,8 @@ func (d *APIV1) putObject(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Client-supplied metadata is replayed to later readers, so credentials must
-	// not be persisted and the metadata the git and gomod strategies authorize
-	// against must not be forgeable from outside them.
-	skip := slices.Concat(httputil.TransportHeaders, httputil.CredentialHeaders,
-		gitobject.MetadataHeaders, gomodobject.MetadataHeaders)
-	headers := httputil.FilterHeaders(r.Header, skip...)
+	// Extract and filter headers from request
+	headers := apiObjectHeaders(r.Header)
 	var opts []cache.Option
 	if etag := headers.Get(cache.ETagKey); etag != "" {
 		rawETag, err := cache.RawETagFromHeader(etag)
@@ -209,6 +205,12 @@ func (d *APIV1) putObject(w http.ResponseWriter, r *http.Request) {
 		d.httpError(w, http.StatusInternalServerError, err, "Failed to close cache writer")
 		return
 	}
+}
+
+func apiObjectHeaders(headers http.Header) http.Header {
+	skip := slices.Concat(httputil.TransportHeaders, httputil.CredentialHeaders,
+		gitobject.MetadataHeaders, gomodobject.MetadataHeaders)
+	return httputil.FilterHeaders(headers, skip...)
 }
 
 func (d *APIV1) deleteObject(w http.ResponseWriter, r *http.Request) {

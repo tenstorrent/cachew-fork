@@ -26,6 +26,8 @@ import (
 
 type State int
 
+var errUnsafeMirrorMetadata = errors.New("unsafe mirror metadata")
+
 const (
 	StateEmpty   State = iota // Not cloned yet
 	StateCloning              // Clone in progress
@@ -111,11 +113,15 @@ type CredentialProvider interface {
 type CredentialProviderProvider func() (CredentialProvider, error)
 
 type Repository struct {
-	mu                 sync.RWMutex
-	config             Config
-	state              State
-	path               string
-	upstreamURL        string
+	// mu guards state and is read-held for minutes during snapshot
+	// generation; a queued writer would park every new reader behind it.
+	mu          sync.RWMutex
+	config      Config
+	state       State
+	path        string
+	upstreamURL string
+	// metaMu guards per-request/per-fetch bookkeeping so it never writes mu.
+	metaMu             sync.Mutex
 	lastFetch          time.Time
 	lastFetchAttempt   time.Time // set when a git fetch starts, including failures; gates NeedsFetch
 	lastCruftExpireAt  time.Time // set when a prune expires objects rather than only combining cruft; gates cruftExpireDue
@@ -273,13 +279,8 @@ func (m *Manager) GetOrCreate(ctx context.Context, upstreamURL string) (*Reposit
 	// Checked before the repository is built: whether the mirror is already on
 	// disk decides both its initial state and whether its idle clock is
 	// persisted.
-	_, headErr := os.Stat(filepath.Join(clonePath, "HEAD"))
+	_, headErr := os.Lstat(filepath.Join(clonePath, "HEAD"))
 	onDisk := headErr == nil
-
-	state := StateEmpty
-	if onDisk {
-		state = StateReady
-	}
 
 	// A failed write leaves the mirrors intact; the only consequence is that
 	// the next restart re-seeds this one, so serving continues.
@@ -291,13 +292,31 @@ func (m *Manager) GetOrCreate(ctx context.Context, upstreamURL string) (*Reposit
 	}
 
 	repo = &Repository{
-		state:              state,
+		state:              StateEmpty,
 		config:             m.config,
 		path:               clonePath,
 		upstreamURL:        upstreamURL,
 		fetchSem:           make(chan struct{}, 1),
 		credentialProvider: m.credentialProvider,
 		lastServed:         lastServed,
+	}
+
+	headFile := filepath.Join(clonePath, "HEAD")
+	if _, err := os.Lstat(headFile); err == nil {
+		// Mirrors can survive from an older process or cache restore, so they must cross the same trust boundary as new restores.
+		if err := resetMirrorMetadata(ctx, clonePath, repo.upstreamURL); err != nil {
+			if !errors.Is(err, errUnsafeMirrorMetadata) {
+				return nil, errors.Wrap(err, "sanitize existing mirror")
+			}
+			if removeErr := os.RemoveAll(clonePath); removeErr != nil {
+				return nil, errors.Join(errors.Wrap(err, "sanitize existing mirror"),
+					errors.Wrap(removeErr, "remove unsafe existing mirror"))
+			}
+		} else if err := repo.configureMirror(ctx, clonePath); err != nil {
+			return nil, errors.Wrap(err, "configure existing mirror")
+		} else {
+			repo.state = StateReady
+		}
 	}
 
 	repo.fetchSem <- struct{}{}
@@ -356,9 +375,9 @@ func (m *Manager) seedLastServed(upstreamURL string, onDisk bool) (time.Time, er
 // lastServedGranularity, so this is cheap enough for the request path.
 func (m *Manager) MarkServed(repo *Repository) error {
 	now := time.Now()
-	repo.mu.Lock()
+	repo.metaMu.Lock()
 	repo.lastServed = now
-	repo.mu.Unlock()
+	repo.metaMu.Unlock()
 	if _, err := m.lastServed.record(repo.upstreamURL, now); err != nil {
 		return errors.Wrap(err, "record last served")
 	}
@@ -374,9 +393,7 @@ func (m *Manager) IdleMirrors(ttl time.Duration) []*Repository {
 	cutoff := time.Now().Add(-ttl)
 	var idle []*Repository
 	for _, repo := range m.All() {
-		repo.mu.RLock()
-		stale := repo.state == StateReady && repo.lastServed.Before(cutoff)
-		repo.mu.RUnlock()
+		stale := repo.State() == StateReady && repo.LastServed().Before(cutoff)
 		if stale {
 			idle = append(idle, repo)
 		}
@@ -388,8 +405,8 @@ func (m *Manager) IdleMirrors(ttl time.Duration) []*Repository {
 // mirror, reporting false if the repository is being evicted and the caller
 // should treat it as absent. Every true result must be paired with EndServe.
 func (r *Repository) BeginServe() bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	r.metaMu.Lock()
+	defer r.metaMu.Unlock()
 	if r.evicting {
 		return false
 	}
@@ -399,8 +416,8 @@ func (r *Repository) BeginServe() bool {
 
 // EndServe releases a reservation taken by BeginServe.
 func (r *Repository) EndServe() {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	r.metaMu.Lock()
+	defer r.metaMu.Unlock()
 	if r.serves > 0 {
 		r.serves--
 	}
@@ -408,8 +425,8 @@ func (r *Repository) EndServe() {
 
 // LastServed returns when a client was last served from this repository.
 func (r *Repository) LastServed() time.Time {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
+	r.metaMu.Lock()
+	defer r.metaMu.Unlock()
 	return r.lastServed
 }
 
@@ -418,8 +435,10 @@ func (r *Repository) LastServed() time.Time {
 // request that passes BeginServe after this point cannot exist, so a zero
 // count here means no reader can appear later.
 func (r *Repository) beginEvict(cutoff time.Time) bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	r.metaMu.Lock()
+	defer r.metaMu.Unlock()
 	if r.state != StateReady || r.evicting || !r.lastServed.Before(cutoff) {
 		return false
 	}
@@ -432,8 +451,8 @@ func (r *Repository) beginEvict(cutoff time.Time) bool {
 }
 
 func (r *Repository) abortEvict() {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	r.metaMu.Lock()
+	defer r.metaMu.Unlock()
 	r.evicting = false
 }
 
@@ -559,7 +578,9 @@ func (m *Manager) evictAt(ctx context.Context, repo *Repository, cutoff time.Tim
 		m.clonesMu.Lock()
 		delete(m.clones, repo.upstreamURL)
 		m.clonesMu.Unlock()
+		repo.mu.Lock()
 		repo.state = StateEmpty
+		repo.mu.Unlock()
 		result.Unlinked = true
 		if err := m.removeAll(trash); err != nil {
 			// The staged copy still occupies trash, so the bytes are not freed.
@@ -587,12 +608,8 @@ func (m *Manager) evictAt(ctx context.Context, repo *Repository, cutoff time.Tim
 
 func (m *Manager) DiscoverExisting(ctx context.Context) ([]*Repository, error) {
 	var discovered []*Repository
-	// One instant shared by every mirror seeded on this pass, so the times held
-	// in memory and the times written below cannot disagree. Seeds are collected
-	// during the walk and flushed after it: writing the record file inside the
-	// walk would create and delete files in the directory being walked.
+	var upstreamURLs []string
 	seededAt := time.Now()
-	var seeds []string
 	walkErr := filepath.Walk(m.config.MirrorRoot, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
@@ -611,7 +628,7 @@ func (m *Manager) DiscoverExisting(ctx context.Context) ([]*Repository, error) {
 		}
 
 		headPath := filepath.Join(path, "HEAD")
-		if _, statErr := os.Stat(headPath); statErr != nil {
+		if _, statErr := os.Lstat(headPath); statErr != nil {
 			if errors.Is(statErr, os.ErrNotExist) {
 				return nil
 			}
@@ -630,54 +647,23 @@ func (m *Manager) DiscoverExisting(ctx context.Context) ([]*Repository, error) {
 			return nil
 		}
 		upstreamURL := "https://" + host + "/" + repoPath
-
-		// A mirror with no record has never been served. Its clock starts now
-		// and is persisted after the walk, so restarts do not keep resetting it.
-		lastServed := m.lastServed.get(upstreamURL)
-		if lastServed.IsZero() {
-			lastServed = seededAt
-			seeds = append(seeds, upstreamURL)
-		}
-
-		repo := &Repository{
-			state:              StateReady,
-			config:             m.config,
-			path:               path,
-			upstreamURL:        upstreamURL,
-			fetchSem:           make(chan struct{}, 1),
-			credentialProvider: m.credentialProvider,
-			lastServed:         lastServed,
-		}
-		repo.fetchSem <- struct{}{}
-
-		if err := configureMirror(ctx, path, m.config.PackThreads); err != nil {
-			return errors.Wrapf(err, "configure mirror for %s", upstreamURL)
-		}
-
-		if m.config.Maintenance {
-			if err := registerMaintenance(ctx, path); err != nil {
-				return errors.Wrapf(err, "register maintenance for %s", upstreamURL)
-			}
-		}
-
-		m.clonesMu.Lock()
-		m.clones[upstreamURL] = repo
-		m.clonesMu.Unlock()
-
-		discovered = append(discovered, repo)
-
+		upstreamURLs = append(upstreamURLs, upstreamURL)
 		return fs.SkipDir
 	})
 
-	// Persisted even when the walk failed part-way: the mirrors it did reach are
-	// already registered with an in-memory seed, and startup carries on after
-	// logging the warm-up error, so leaving those seeds unwritten would let a
-	// restart keep resetting their idle clocks.
-	if len(seeds) > 0 {
-		if err := m.lastServed.seedMissing(seeds, seededAt); err != nil {
-			logging.FromContext(ctx).WarnContext(ctx,
-				"Failed to persist initial last-served times, idle eviction will restart the clock for these mirrors",
-				"upstreams", seeds, "error", err)
+	// Seeding before registration avoids rewriting the entire last-served record for each mirror discovered at startup.
+	if err := m.lastServed.seedMissing(upstreamURLs, seededAt); err != nil {
+		logging.FromContext(ctx).WarnContext(ctx,
+			"Failed to persist initial last-served times, idle eviction will restart the clock for these mirrors",
+			"upstreams", upstreamURLs, "error", err)
+	}
+	for _, upstreamURL := range upstreamURLs {
+		repo, err := m.GetOrCreate(ctx, upstreamURL)
+		if err != nil {
+			return nil, errors.Wrapf(err, "discover mirror for %s", upstreamURL)
+		}
+		if repo.State() == StateReady {
+			discovered = append(discovered, repo)
 		}
 	}
 
@@ -695,12 +681,22 @@ func RepoPathFromURL(upstreamURL string) (string, error) {
 	if err != nil {
 		return "", errors.Wrap(err, "parse upstream URL")
 	}
-	repoPath := filepath.Join(parsed.Host, strings.TrimSuffix(parsed.Path, ".git"))
-	// Host and path both usually originate in a client-supplied request target,
-	// and Join collapses "..", so a traversal in either can walk out of the root
-	// every caller joins this onto. Refuse instead of silently resolving.
-	if repoPath == ".." || strings.HasPrefix(repoPath, ".."+string(filepath.Separator)) || filepath.IsAbs(repoPath) {
-		return "", errors.Errorf("upstream URL %q resolves outside the mirror root", upstreamURL)
+	if parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || parsed.RawQuery != "" ||
+		parsed.Fragment != "" || strings.ContainsAny(parsed.Host, `/\`) {
+		return "", errors.Errorf("unsupported upstream URL %q", upstreamURL)
+	}
+	repoPath := strings.TrimSuffix(strings.TrimSuffix(strings.TrimPrefix(parsed.Path, "/"), "/"), ".git")
+	if repoPath == "" {
+		return "", errors.Errorf("upstream URL %q has no repository path", upstreamURL)
+	}
+	for segment := range strings.SplitSeq(repoPath, "/") {
+		if segment == "" || segment == "." || segment == ".." || strings.Contains(segment, `\`) {
+			return "", errors.Errorf("unsupported upstream URL path %q", parsed.Path)
+		}
+	}
+	repoPath = filepath.Join(parsed.Host, filepath.FromSlash(repoPath))
+	if !filepath.IsLocal(repoPath) {
+		return "", errors.Errorf("upstream URL path %q is not local", parsed.Path)
 	}
 	return repoPath, nil
 }
@@ -728,14 +724,20 @@ func (r *Repository) UpstreamURL() string {
 }
 
 func (r *Repository) LastFetch() time.Time {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
+	r.metaMu.Lock()
+	defer r.metaMu.Unlock()
 	return r.lastFetch
 }
 
+func (r *Repository) setLastFetch(at time.Time) {
+	r.metaMu.Lock()
+	defer r.metaMu.Unlock()
+	r.lastFetch = at
+}
+
 func (r *Repository) NeedsFetch(fetchInterval time.Duration) bool {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
+	r.metaMu.Lock()
+	defer r.metaMu.Unlock()
 	last := r.lastFetch
 	if r.lastFetchAttempt.After(last) {
 		last = r.lastFetchAttempt
@@ -758,8 +760,8 @@ func (r *Repository) FetchInFlight() bool {
 
 // FetchFailures returns the number of consecutive failed fetches.
 func (r *Repository) FetchFailures() int {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
+	r.metaMu.Lock()
+	defer r.metaMu.Unlock()
 	return r.fetchFailures
 }
 
@@ -768,8 +770,8 @@ func (r *Repository) FetchFailures() int {
 // backoff starts at base and doubles per failure up to MaxFetchBackoff; a
 // successful fetch clears it.
 func (r *Repository) BackgroundFetchBackoff(base time.Duration) time.Duration {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
+	r.metaMu.Lock()
+	defer r.metaMu.Unlock()
 	backoff := FetchBackoff(base, r.fetchFailures)
 	if backoff == 0 {
 		return 0
@@ -820,10 +822,12 @@ func WithReadLockReturn[T any](repo *Repository, fn func() (T, error)) (T, error
 // be replaced with a fresh clone.
 func (r *Repository) ResetToEmpty() {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	r.state = StateEmpty
+	r.mu.Unlock()
+	r.metaMu.Lock()
 	r.lastFetch = time.Time{}
 	r.lastFetchAttempt = time.Time{}
+	r.metaMu.Unlock()
 }
 
 // TryStartCloning atomically transitions the repository from StateEmpty to
@@ -852,9 +856,15 @@ func (r *Repository) WithFetchExclusion(ctx context.Context, fn func() error) er
 	}
 }
 
-// ConfigureMirror configures a git directory at repoPath as a mirror with
-// the repository's pack threads and optional maintenance settings.
+// ConfigureMirror sanitizes and configures a git directory at repoPath as a mirror.
 func (r *Repository) ConfigureMirror(ctx context.Context, repoPath string) error {
+	if err := resetMirrorMetadata(ctx, repoPath, r.upstreamURL); err != nil {
+		return errors.Wrap(err, "reset mirror metadata")
+	}
+	return r.configureMirror(ctx, repoPath)
+}
+
+func (r *Repository) configureMirror(ctx context.Context, repoPath string) error {
 	if err := configureMirror(ctx, repoPath, r.config.PackThreads); err != nil {
 		return errors.Wrap(err, "configure mirror")
 	}
@@ -866,22 +876,181 @@ func (r *Repository) ConfigureMirror(ctx context.Context, repoPath string) error
 	return nil
 }
 
+func resetMirrorMetadata(ctx context.Context, repoPath, upstreamURL string) error {
+	configPath := filepath.Join(repoPath, "config")
+	info, err := os.Lstat(configPath)
+	if err != nil {
+		return errors.Wrap(err, "stat mirror config")
+	}
+	if !info.Mode().IsRegular() {
+		return errors.Wrap(errUnsafeMirrorMetadata, "mirror config is not a regular file")
+	}
+	// Cached metadata can invoke commands; retain only storage features needed to read objects, then rebuild trusted settings.
+	configValues, err := mirrorConfigValues(ctx, configPath)
+	if err != nil {
+		return err
+	}
+	objectFormat := configValues["extensions.objectformat"]
+	if objectFormat != "" && objectFormat != "sha1" && objectFormat != "sha256" {
+		return errors.Wrapf(errUnsafeMirrorMetadata, "unsupported mirror object format %q", objectFormat)
+	}
+	refStorage := configValues["extensions.refstorage"]
+	if refStorage != "" && refStorage != "files" && refStorage != "reftable" {
+		return errors.Wrapf(errUnsafeMirrorMetadata, "unsupported mirror ref storage %q", refStorage)
+	}
+	// Cleanup must not resolve through a cached symlink and remove files outside the mirror.
+	if err := filepath.WalkDir(repoPath, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.Type()&os.ModeSymlink != 0 || (!entry.IsDir() && !entry.Type().IsRegular()) {
+			return errors.Wrapf(errUnsafeMirrorMetadata, "unsafe mirror entry %s", path)
+		}
+		return nil
+	}); err != nil {
+		return errors.Wrap(err, "validate mirror entries")
+	}
+
+	repositoryFormat := "0"
+	if objectFormat != "" || refStorage != "" {
+		repositoryFormat = "1"
+	}
+	escapedRemoteURL, err := gitConfigValue(upstreamURL)
+	if err != nil {
+		return err
+	}
+	config := "[core]\n\trepositoryformatversion = " + repositoryFormat + "\n\tfilemode = true\n\tbare = true\n" +
+		"[remote \"origin\"]\n\turl = " + escapedRemoteURL + "\n\tfetch = +refs/*:refs/*\n\tmirror = true\n"
+	if objectFormat != "" || refStorage != "" {
+		config += "[extensions]\n"
+	}
+	if objectFormat != "" {
+		config += "\tobjectFormat = " + objectFormat + "\n"
+	}
+	if refStorage != "" {
+		config += "\trefStorage = " + refStorage + "\n"
+	}
+	configFile, err := os.CreateTemp(repoPath, ".cachew-config-*")
+	if err != nil {
+		return errors.Wrap(err, "create temporary mirror config")
+	}
+	configTempPath := configFile.Name()
+	defer os.Remove(configTempPath) //nolint:errcheck // best-effort cleanup on failure
+	if _, err := configFile.WriteString(config); err != nil {
+		_ = configFile.Close()
+		return errors.Wrap(err, "write temporary mirror config")
+	}
+	if err := configFile.Close(); err != nil {
+		return errors.Wrap(err, "close temporary mirror config")
+	}
+
+	// Git interprets these paths as configuration, hooks, or object-store indirection rather than inert cached data.
+	for _, path := range []string{
+		filepath.Join(repoPath, ".git"),
+		filepath.Join(repoPath, ".lfsconfig"),
+		filepath.Join(repoPath, "commondir"),
+		filepath.Join(repoPath, "config.worktree"),
+		filepath.Join(repoPath, "hooks"),
+		filepath.Join(repoPath, "index"),
+		filepath.Join(repoPath, "objects", "info", "alternates"),
+		filepath.Join(repoPath, "objects", "info", "http-alternates"),
+		filepath.Join(repoPath, "modules"),
+		filepath.Join(repoPath, "worktrees"),
+	} {
+		if err := os.RemoveAll(path); err != nil {
+			return errors.Wrapf(err, "remove unsafe mirror metadata %s", path)
+		}
+	}
+	// #nosec G703 - both paths are created within the validated mirror directory
+	if err := os.Rename(configTempPath, configPath); err != nil {
+		return errors.Wrap(err, "replace mirror config")
+	}
+	return nil
+}
+
+func gitConfigValue(value string) (string, error) {
+	if strings.ContainsAny(value, "\x00\r\n") {
+		return "", errors.New("mirror origin contains a control character")
+	}
+	value = strings.ReplaceAll(strings.ReplaceAll(value, `\`, `\\`), `"`, `\"`)
+	return `"` + value + `"`, nil
+}
+
+func mirrorConfigValues(ctx context.Context, configPath string) (map[string]string, error) {
+	cmd := exec.CommandContext(ctx, "git", "config", "--file", configPath, "--no-includes", "--null", "--list") // #nosec G204
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return nil, errors.Wrapf(err, "read mirror config: %s", string(output))
+	}
+	values := map[string]string{}
+	for entry := range strings.SplitSeq(string(output), "\x00") {
+		key, value, ok := strings.Cut(entry, "\n")
+		if ok {
+			values[strings.ToLower(key)] = value
+		}
+	}
+	return values, nil
+}
+
 // MarkReady transitions the repository to StateReady, indicating it is
 // up-to-date and can serve requests from the local mirror.
 func (r *Repository) MarkReady() {
 	r.mu.Lock()
 	r.state = StateReady
-	r.lastFetch = time.Now()
 	r.mu.Unlock()
+	r.setLastFetch(time.Now())
 }
 
+// Clone starts one mirror clone. Other callers wait for the result.
 func (r *Repository) Clone(ctx context.Context) error {
+	return r.clone(ctx, 0)
+}
+
+// CloneWithWaitTimeout limits how long a caller waits for another clone.
+// The limit does not apply to the caller that starts the clone.
+func (r *Repository) CloneWithWaitTimeout(ctx context.Context, waitTimeout time.Duration) error {
+	return r.clone(ctx, waitTimeout)
+}
+
+func (r *Repository) clone(ctx context.Context, waitTimeout time.Duration) error {
+	if r.TryStartCloning() {
+		return r.CloneClaimed(ctx)
+	}
+	if waitTimeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, waitTimeout)
+		defer cancel()
+	}
+
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		switch r.State() {
+		case StateReady:
+			return nil
+		case StateEmpty:
+			return errors.New("repository clone did not complete")
+		case StateCloning:
+		}
+		select {
+		case <-ctx.Done():
+			return errors.Wrap(ctx.Err(), "wait for repository clone")
+		case <-ticker.C:
+		}
+	}
+}
+
+// CloneClaimed requires the caller to acquire ownership with TryStartCloning first.
+func (r *Repository) CloneClaimed(ctx context.Context) error {
 	r.mu.Lock()
 	if r.state == StateReady {
 		r.mu.Unlock()
 		return nil
 	}
-	r.state = StateCloning
+	if r.state != StateCloning {
+		r.mu.Unlock()
+		return errors.New("repository clone was not claimed")
+	}
 	r.mu.Unlock()
 
 	err := r.executeClone(ctx)
@@ -894,8 +1063,8 @@ func (r *Repository) Clone(ctx context.Context) error {
 	}
 
 	r.state = StateReady
-	r.lastFetch = time.Now()
 	r.mu.Unlock()
+	r.setLastFetch(time.Now())
 	return nil
 }
 
@@ -1035,7 +1204,7 @@ func (r *Repository) Fetch(ctx context.Context) error {
 // for catch-up fetches after snapshot restore where the delta may be large and
 // the default Config.FetchTimeout is too short.
 func (r *Repository) FetchWithTimeout(ctx context.Context, timeout time.Duration) error {
-	_, err := r.fetchInternal(ctx, timeout, true, true)
+	_, err := r.fetchInternal(ctx, timeout, true, fetchCoalesceSuccess)
 	return err
 }
 
@@ -1047,7 +1216,7 @@ func (r *Repository) FetchWithTimeout(ctx context.Context, timeout time.Duration
 // contacting upstream. Callers that need a guaranteed fetch should fall back to
 // FetchVerified only when attempted is false.
 func (r *Repository) FetchCoalescing(ctx context.Context) (attempted bool, err error) {
-	return r.fetchInternal(ctx, r.config.FetchTimeout, true, true)
+	return r.fetchInternal(ctx, r.config.FetchTimeout, true, fetchCoalesceAny)
 }
 
 // FetchLenient fetches from upstream with the given timeout but without the
@@ -1056,7 +1225,7 @@ func (r *Repository) FetchCoalescing(ctx context.Context) (attempted bool, err e
 // stall at near-zero transfer rate for minutes — the same situation that
 // executeClone handles by omitting lowSpeedLimit.
 func (r *Repository) FetchLenient(ctx context.Context, timeout time.Duration) error {
-	_, err := r.fetchInternal(ctx, timeout, false, true)
+	_, err := r.fetchInternal(ctx, timeout, false, fetchCoalesceSuccess)
 	return err
 }
 
@@ -1066,7 +1235,7 @@ func (r *Repository) FetchLenient(ctx context.Context, timeout time.Duration) er
 // WithFetchExclusion) or its fetch may have failed — so a nil return
 // guarantees this call ran a successful git fetch.
 func (r *Repository) FetchVerified(ctx context.Context) error {
-	_, err := r.fetchInternal(ctx, r.config.FetchTimeout, true, false)
+	_, err := r.fetchInternal(ctx, r.config.FetchTimeout, true, fetchNoCoalescing)
 	return err
 }
 
@@ -1095,11 +1264,20 @@ func (r *Repository) FetchVerifiedIfAbsent(ctx context.Context, oids []string) (
 	return true, r.executeFetch(fetchCtx, true)
 }
 
+type fetchCoalescing uint8
+
+const (
+	fetchNoCoalescing fetchCoalescing = iota
+	fetchCoalesceSuccess
+	fetchCoalesceAny
+)
+
 // fetchInternal returns attempted=true when this call ran the git fetch itself,
 // whether or not the fetch succeeded, and attempted=false when it never reached
 // upstream: a coalescing caller piggy-backed on another semaphore holder, or the
 // context ended while waiting for the semaphore.
-func (r *Repository) fetchInternal(ctx context.Context, timeout time.Duration, enforceSpeedLimit, coalesce bool) (attempted bool, err error) {
+func (r *Repository) fetchInternal(ctx context.Context, timeout time.Duration, enforceSpeedLimit bool, coalesce fetchCoalescing) (attempted bool, err error) {
+	lastFetch := r.LastFetch()
 	select {
 	case <-r.fetchSem:
 		defer func() {
@@ -1108,22 +1286,14 @@ func (r *Repository) fetchInternal(ctx context.Context, timeout time.Duration, e
 	case <-ctx.Done():
 		return false, errors.Wrap(ctx.Err(), "context cancelled before acquiring fetch semaphore")
 	default:
-		// The semaphore is held. Coalescing callers treat the holder's work as
-		// their fetch; verified callers wait their turn and fetch themselves.
-		if coalesce {
-			select {
-			case <-r.fetchSem:
-				r.fetchSem <- struct{}{}
-				return false, nil
-			case <-ctx.Done():
-				return false, errors.Wrap(ctx.Err(), "context cancelled while waiting for fetch")
-			}
-		}
 		select {
 		case <-r.fetchSem:
 			defer func() {
 				r.fetchSem <- struct{}{}
 			}()
+			if coalesce == fetchCoalesceAny || coalesce == fetchCoalesceSuccess && r.LastFetch().After(lastFetch) {
+				return false, nil
+			}
 		case <-ctx.Done():
 			return false, errors.Wrap(ctx.Err(), "context cancelled before acquiring fetch semaphore")
 		}
@@ -1145,9 +1315,9 @@ func (r *Repository) executeFetch(ctx context.Context, enforceSpeedLimit bool) e
 	// Record the attempt before the network call so a failure or timeout still
 	// trips NeedsFetch's cooldown and serial requests do not each pay a full
 	// IncrementalFetchTimeout / FetchTimeout during an upstream outage.
-	r.mu.Lock()
+	r.metaMu.Lock()
 	r.lastFetchAttempt = time.Now()
-	r.mu.Unlock()
+	r.metaMu.Unlock()
 
 	config := DefaultGitTuningConfig()
 
@@ -1189,12 +1359,12 @@ func (r *Repository) executeFetch(ctx context.Context, enforceSpeedLimit bool) e
 	}
 
 	r.recordFetchOutcome(true)
-	r.mu.Lock()
+	r.metaMu.Lock()
 	// Drop any cached ref-staleness verdict so the next check reopens instead of
 	// serving a stale "behind" result for the rest of the interval. This also
 	// clears a cached failure, since upstream is now known reachable.
 	r.invalidateRefCheckLocked()
-	r.mu.Unlock()
+	r.metaMu.Unlock()
 	return nil
 }
 
@@ -1202,8 +1372,8 @@ func (r *Repository) executeFetch(ctx context.Context, enforceSpeedLimit bool) e
 // backoff. Consecutive failures accumulate so BackgroundFetchBackoff can
 // lengthen the retry interval; success resets to the normal cadence.
 func (r *Repository) recordFetchOutcome(success bool) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	r.metaMu.Lock()
+	defer r.metaMu.Unlock()
 	r.lastFetchAttempt = time.Now()
 	if !success {
 		r.fetchFailures++
@@ -1216,17 +1386,17 @@ func (r *Repository) recordFetchOutcome(success bool) {
 // EnsureRefsUpToDate checks whether the local mirror's refs match upstream.
 // If refs are stale it returns NeedsFetch=true so the caller can schedule a
 // background fetch via the job scheduler, rather than fetching synchronously
-// on the request path (which would acquire a write lock and block all serving).
+// on the request path.
 //
 // Concurrent callers share one check: the first runs the ls-remote while later
 // callers wait on refCheckInFlight and reuse its outcome. Without this, a burst
 // of requests landing in the same window would each issue their own ls-remote
 // against upstream.
 func (r *Repository) EnsureRefsUpToDate(ctx context.Context) (needsFetch bool, err error) {
-	r.mu.Lock()
+	r.metaMu.Lock()
 	if r.refCheckValid && time.Since(r.lastRefCheck) < r.config.RefCheckInterval {
 		stale, checkErr := r.refCheckStale, r.refCheckErr
-		r.mu.Unlock()
+		r.metaMu.Unlock()
 		return stale, checkErr
 	}
 	// A failed check is cached for a short backoff window so that during an
@@ -1237,20 +1407,20 @@ func (r *Repository) EnsureRefsUpToDate(ctx context.Context) (needsFetch bool, e
 	// for a completed one.
 	if r.refCheckErr != nil && time.Since(r.refCheckErrAt) < r.refCheckFailureBackoff() {
 		checkErr := r.refCheckErr
-		r.mu.Unlock()
+		r.metaMu.Unlock()
 		return false, checkErr
 	}
 	if r.refCheckInFlight != nil {
 		ch := r.refCheckInFlight
-		r.mu.Unlock()
+		r.metaMu.Unlock()
 		select {
 		case <-ch:
 		case <-ctx.Done():
 			return false, errors.Wrap(ctx.Err(), "context cancelled waiting for in-flight ref check")
 		}
-		r.mu.Lock()
+		r.metaMu.Lock()
 		stale, checkErr := r.refCheckStale, r.refCheckErr
-		r.mu.Unlock()
+		r.metaMu.Unlock()
 		return stale, checkErr
 	}
 	// Record the check time to rate-limit re-entry after a successful check, but
@@ -1260,13 +1430,13 @@ func (r *Repository) EnsureRefsUpToDate(ctx context.Context) (needsFetch bool, e
 	r.lastRefCheck = time.Now()
 	r.refCheckInFlight = make(chan struct{})
 	inFlight := r.refCheckInFlight
-	r.mu.Unlock()
+	r.metaMu.Unlock()
 
 	defer func() {
-		r.mu.Lock()
+		r.metaMu.Lock()
 		close(inFlight)
 		r.refCheckInFlight = nil
-		r.mu.Unlock()
+		r.metaMu.Unlock()
 	}()
 
 	// Detach from the caller's context so a disconnecting client cannot fail every
@@ -1284,7 +1454,7 @@ func (r *Repository) refCheckFailureBackoff() time.Duration {
 }
 
 // invalidateRefCheckLocked drops any cached ref-check verdict, including a
-// cached failure, so the next check reopens. The caller must hold r.mu.
+// cached failure, so the next check reopens. The caller must hold r.metaMu.
 func (r *Repository) invalidateRefCheckLocked() {
 	r.refCheckValid = false
 	r.refCheckErr = nil
@@ -1300,16 +1470,16 @@ func (r *Repository) runRefCheck(ctx context.Context) (bool, error) {
 	ctx, cancel := context.WithTimeout(ctx, r.config.LsRemoteTimeout)
 	defer cancel()
 
-	r.mu.RLock()
+	r.metaMu.Lock()
 	lastFetchBefore := r.lastFetch
-	r.mu.RUnlock()
+	r.metaMu.Unlock()
 
 	record := func(valid, stale bool, err error) {
-		r.mu.Lock()
+		r.metaMu.Lock()
 		// A fetch that landed while this check was in flight already invalidated
 		// the cache; do not overwrite that with a pre-fetch verdict.
 		if r.lastFetch.After(lastFetchBefore) {
-			r.mu.Unlock()
+			r.metaMu.Unlock()
 			return
 		}
 		r.refCheckValid = valid
@@ -1320,7 +1490,7 @@ func (r *Repository) runRefCheck(ctx context.Context) (bool, error) {
 		} else {
 			r.refCheckErrAt = time.Time{}
 		}
-		r.mu.Unlock()
+		r.metaMu.Unlock()
 	}
 
 	localRefs, err := r.GetLocalRefs(ctx)
@@ -1394,9 +1564,9 @@ func (r *Repository) EnsureRefs(
 
 	// Invalidate the cached ref-check so the normal transparent path also
 	// re-evaluates after our forced fetch.
-	r.mu.Lock()
+	r.metaMu.Lock()
 	r.invalidateRefCheckLocked()
-	r.mu.Unlock()
+	r.metaMu.Unlock()
 
 	localRefs, err = r.GetLocalRefs(ctx)
 	if err != nil {

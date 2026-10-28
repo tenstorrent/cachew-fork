@@ -2,7 +2,7 @@ package git_test
 
 import (
 	"context"
-	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 	"time"
@@ -44,6 +44,7 @@ func TestRepackInterval(t *testing.T) {
 			}, newTestScheduler(ctx, t), nil, mux, cm, func() (*githubapp.TokenManager, error) { return nil, nil }, nil) //nolint:nilnil
 			assert.NoError(t, err)
 			assert.True(t, s != nil)
+			waitForReady(t, s)
 		})
 	}
 }
@@ -52,20 +53,26 @@ func TestRepackScheduledForExistingRepos(t *testing.T) {
 	_, ctx, _ := logging.Configure(context.Background(), logging.Config{})
 	tmpDir := t.TempDir()
 
-	// Create a fake bare clone directory on disk before initializing strategy.
 	clonePath := filepath.Join(tmpDir, "github.com", "org", "repo")
-	err := os.MkdirAll(clonePath, 0o750)
-	assert.NoError(t, err)
-	err = os.WriteFile(filepath.Join(clonePath, "HEAD"), []byte("ref: refs/heads/main\n"), 0o640)
-	assert.NoError(t, err)
+	output, err := exec.Command("git", "init", "--bare", clonePath).CombinedOutput()
+	assert.NoError(t, err, string(output))
 
 	mux := newTestMux()
 	cm := gitclone.NewManagerProvider(ctx, gitclone.Config{
 		MirrorRoot: tmpDir,
 	}, nil)
+	manager, err := cm()
+	assert.NoError(t, err)
+	const upstreamURL = "https://github.com/org/repo"
+	_, err = manager.GetOrCreate(ctx, upstreamURL)
+	assert.NoError(t, err)
+	output, err = exec.Command("git", "-C", clonePath, "config", "remote.origin.url", clonePath).CombinedOutput()
+	assert.NoError(t, err, string(output))
 	s, err := git.New(ctx, git.Config{
-		RepackInterval: 24 * time.Hour,
+		RepackInterval: 24 * time.Hour, DisableUpstreamAuthz: true,
 	}, newTestScheduler(ctx, t), nil, mux, cm, func() (*githubapp.TokenManager, error) { return nil, nil }, nil) //nolint:nilnil
 	assert.NoError(t, err)
-	assert.True(t, s != nil)
+	waitForReady(t, s)
+	_, repack := s.PeriodicJobsScheduled(upstreamURL)
+	assert.True(t, repack)
 }

@@ -119,6 +119,54 @@ func TestManager_GetOrCreate(t *testing.T) {
 	assert.True(t, repo == repo2, "expected same repository instance")
 }
 
+func TestRepoPathFromURLRejectsTraversal(t *testing.T) {
+	path, err := RepoPathFromURL("https://github.com/org/repo.git")
+	assert.NoError(t, err)
+	assert.Equal(t, filepath.Join("github.com", "org", "repo"), path)
+
+	for _, upstream := range []string{
+		"http://github.com/org/repo",
+		"https://user@github.com/org/repo",
+		"https://github.com/org/repo?x",
+		"https://github.com/../../tmp/repo",
+		"https://github.com/%2e%2e/%2e%2e/tmp/repo",
+		"https://github.com/org/repo%2f..%2f..%2ftmp/repo",
+	} {
+		_, err := RepoPathFromURL(upstream)
+		assert.Error(t, err)
+	}
+}
+
+func TestConfigureMirrorSanitizesExecutableMetadata(t *testing.T) {
+	_, ctx, _ := logging.Configure(t.Context(), logging.Config{Level: "error"})
+	repoPath := createBareRepo(t, t.TempDir())
+	hookPath := filepath.Join(repoPath, "hooks", "reference-transaction")
+	proofPath := filepath.Join(t.TempDir(), "proof")
+	assert.NoError(t, os.WriteFile(hookPath, []byte("#!/bin/sh\ntouch \""+proofPath+"\"\n"), 0o755))
+	assert.NoError(t, exec.Command("git", "-C", repoPath, "config", "remote.origin.url", "https://github.com/org/repo").Run())
+	assert.NoError(t, exec.Command("git", "-C", repoPath, "config", "credential.helper", "!touch "+proofPath).Run())
+	assert.NoError(t, exec.Command("git", "-C", repoPath, "config", "core.alternateRefsCommand", "touch "+proofPath).Run())
+	assert.NoError(t, os.WriteFile(filepath.Join(repoPath, "objects", "info", "alternates"), []byte(repoPath+"/objects\n"), 0o600))
+	assert.NoError(t, os.WriteFile(filepath.Join(repoPath, "commondir"), []byte("payload\n"), 0o600))
+
+	repo := &Repository{config: testRepoConfig(), upstreamURL: "https://github.com/org/repo"}
+	assert.NoError(t, repo.ConfigureMirror(ctx, repoPath))
+
+	_, err := os.Lstat(hookPath)
+	assert.True(t, os.IsNotExist(err))
+	_, err = os.Lstat(filepath.Join(repoPath, "objects", "info", "alternates"))
+	assert.True(t, os.IsNotExist(err))
+	_, err = os.Lstat(filepath.Join(repoPath, "commondir"))
+	assert.True(t, os.IsNotExist(err))
+	cmd := exec.Command("git", "-C", repoPath, "config", "--get", "credential.helper")
+	assert.Error(t, cmd.Run())
+	output, err := exec.Command("git", "-C", repoPath, "config", "--get", "remote.origin.url").Output()
+	assert.NoError(t, err)
+	assert.Equal(t, "https://github.com/org/repo", strings.TrimSpace(string(output)))
+	_, err = os.Lstat(proofPath)
+	assert.True(t, os.IsNotExist(err))
+}
+
 func TestManager_GetOrCreate_ExistingClone(t *testing.T) {
 	_, ctx, _ := logging.Configure(t.Context(), logging.Config{Level: "error"})
 	tmpDir := t.TempDir()
@@ -132,14 +180,34 @@ func TestManager_GetOrCreate_ExistingClone(t *testing.T) {
 	assert.NoError(t, err)
 
 	repoPath := filepath.Join(tmpDir, "github.com", "user", "repo")
-	assert.NoError(t, os.MkdirAll(repoPath, 0o755))
-	assert.NoError(t, os.WriteFile(filepath.Join(repoPath, "HEAD"), []byte("ref: refs/heads/main\n"), 0o644))
+	assert.NoError(t, exec.Command("git", "init", "--bare", repoPath).Run())
 
 	upstreamURL := "https://github.com/user/repo"
 	repo, err := manager.GetOrCreate(context.Background(), upstreamURL)
 	assert.NoError(t, err)
 	assert.NotZero(t, repo)
 
+	assert.Equal(t, StateReady, repo.State())
+}
+
+func TestManager_GetOrCreate_PreservesExistingCloneWhenSanitizationCanceled(t *testing.T) {
+	_, ctx, _ := logging.Configure(t.Context(), logging.Config{Level: "error"})
+	tmpDir := t.TempDir()
+	manager, err := NewManager(ctx, Config{MirrorRoot: tmpDir}, nil)
+	assert.NoError(t, err)
+
+	repoPath := filepath.Join(tmpDir, "github.com", "user", "repo")
+	assert.NoError(t, exec.Command("git", "init", "--bare", repoPath).Run())
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err = manager.GetOrCreate(canceledCtx, "https://github.com/user/repo")
+	assert.Error(t, err)
+	assert.True(t, errors.Is(err, context.Canceled))
+	_, err = os.Stat(filepath.Join(repoPath, "HEAD"))
+	assert.NoError(t, err)
+	repo, err := manager.GetOrCreate(context.Background(), "https://github.com/user/repo")
+	assert.NoError(t, err)
 	assert.Equal(t, StateReady, repo.State())
 }
 
@@ -209,6 +277,9 @@ func TestManager_DiscoverExisting(t *testing.T) {
 	repo3 := manager.Get("https://gitlab.com/org/project")
 	assert.NotZero(t, repo3)
 	assert.Equal(t, StateReady, repo3.State())
+	assert.Equal(t, repo1.LastServed(), repo2.LastServed())
+	assert.Equal(t, repo1.LastServed(), repo3.LastServed())
+	assert.Equal(t, repo1.LastServed(), manager.lastServed.get(repo1.UpstreamURL()))
 
 	// Verify mirror config was applied to discovered repos.
 	for _, repoPath := range repoPaths {
@@ -288,82 +359,85 @@ func TestRepository_NeedsFetch(t *testing.T) {
 
 	assert.False(t, repo.NeedsFetch(30*time.Minute))
 
-	repo.mu.Lock()
+	repo.metaMu.Lock()
 	repo.lastFetch = time.Now()
-	repo.mu.Unlock()
+	repo.metaMu.Unlock()
 
 	assert.False(t, repo.NeedsFetch(15*time.Minute))
 
 	// A recent failed attempt must also suppress NeedsFetch, even when the
 	// last successful fetch is older than the interval.
-	repo.mu.Lock()
+	repo.metaMu.Lock()
 	repo.lastFetch = time.Now().Add(-time.Hour)
 	repo.lastFetchAttempt = time.Now()
-	repo.mu.Unlock()
+	repo.metaMu.Unlock()
 	assert.False(t, repo.NeedsFetch(15*time.Minute))
 
-	repo.mu.Lock()
+	repo.metaMu.Lock()
 	repo.lastFetchAttempt = time.Now().Add(-20 * time.Minute)
-	repo.mu.Unlock()
+	repo.metaMu.Unlock()
 	assert.True(t, repo.NeedsFetch(15*time.Minute))
 }
 
-func TestRepository_FetchVerifiedDoesNotCoalesce(t *testing.T) {
-	ctx := context.Background()
-	tmpDir := t.TempDir()
-	upstreamPath := createBareRepo(t, tmpDir)
+func TestRepository_FetchDoesNotCoalesceWithExclusion(t *testing.T) {
+	for _, verified := range []bool{false, true} {
+		t.Run(fmt.Sprintf("verified=%t", verified), func(t *testing.T) {
+			ctx := context.Background()
+			tmpDir := t.TempDir()
+			upstreamPath := createBareRepo(t, tmpDir)
 
-	clonePath := filepath.Join(tmpDir, "clone")
-	repo := &Repository{
-		state:       StateEmpty,
-		config:      testRepoConfig(),
-		path:        clonePath,
-		upstreamURL: upstreamPath,
-		fetchSem:    make(chan struct{}, 1),
+			clonePath := filepath.Join(tmpDir, "clone")
+			repo := &Repository{
+				state:       StateEmpty,
+				config:      testRepoConfig(),
+				path:        clonePath,
+				upstreamURL: upstreamPath,
+				fetchSem:    make(chan struct{}, 1),
+			}
+			repo.fetchSem <- struct{}{}
+			assert.NoError(t, repo.Clone(ctx))
+
+			workPath := filepath.Join(tmpDir, "work")
+			assert.NoError(t, os.WriteFile(filepath.Join(workPath, "f.txt"), []byte("y"), 0o644))
+			for _, args := range [][]string{
+				{"git", "-C", workPath, "commit", "-am", "update"},
+				{"git", "-C", workPath, "push", upstreamPath, "HEAD"},
+			} {
+				assert.NoError(t, exec.Command(args[0], args[1:]...).Run())
+			}
+			newSHAOut, err := exec.Command("git", "-C", workPath, "rev-parse", "HEAD").Output()
+			assert.NoError(t, err)
+			newSHA := strings.TrimSpace(string(newSHAOut))
+
+			holdSem := func(t *testing.T, fetch func() error) error {
+				t.Helper()
+				release := make(chan struct{})
+				entered := make(chan struct{})
+				holderDone := make(chan error, 1)
+				go func() {
+					holderDone <- repo.WithFetchExclusion(ctx, func() error {
+						close(entered)
+						<-release
+						return nil
+					})
+				}()
+				<-entered
+				fetchDone := make(chan error, 1)
+				go func() { fetchDone <- fetch() }()
+				time.Sleep(50 * time.Millisecond)
+				close(release)
+				assert.NoError(t, <-holderDone)
+				return <-fetchDone
+			}
+
+			fetch := repo.Fetch
+			if verified {
+				fetch = repo.FetchVerified
+			}
+			assert.NoError(t, holdSem(t, func() error { return fetch(ctx) }))
+			assert.True(t, repo.HasCommit(ctx, newSHA))
+		})
 	}
-	repo.fetchSem <- struct{}{}
-	assert.NoError(t, repo.Clone(ctx))
-
-	// Advance upstream so the mirror is behind.
-	workPath := filepath.Join(tmpDir, "work")
-	assert.NoError(t, os.WriteFile(filepath.Join(workPath, "f.txt"), []byte("y"), 0o644))
-	for _, args := range [][]string{
-		{"git", "-C", workPath, "commit", "-am", "update"},
-		{"git", "-C", workPath, "push", upstreamPath, "HEAD"},
-	} {
-		assert.NoError(t, exec.Command(args[0], args[1:]...).Run())
-	}
-	newSHAOut, err := exec.Command("git", "-C", workPath, "rev-parse", "HEAD").Output()
-	assert.NoError(t, err)
-	newSHA := strings.TrimSpace(string(newSHAOut))
-
-	holdSem := func(t *testing.T, fetch func() error) error {
-		t.Helper()
-		release := make(chan struct{})
-		holderDone := make(chan error, 1)
-		go func() {
-			holderDone <- repo.WithFetchExclusion(ctx, func() error {
-				<-release
-				return nil
-			})
-		}()
-		time.Sleep(20 * time.Millisecond)
-		fetchDone := make(chan error, 1)
-		go func() { fetchDone <- fetch() }()
-		time.Sleep(50 * time.Millisecond)
-		close(release)
-		assert.NoError(t, <-holderDone)
-		return <-fetchDone
-	}
-
-	// Fetch coalesces with the semaphore holder even though the holder was
-	// not fetching, so the mirror stays behind.
-	assert.NoError(t, holdSem(t, func() error { return repo.Fetch(ctx) }))
-	assert.False(t, repo.HasCommit(ctx, newSHA))
-
-	// FetchVerified waits for the holder and then runs its own fetch.
-	assert.NoError(t, holdSem(t, func() error { return repo.FetchVerified(ctx) }))
-	assert.True(t, repo.HasCommit(ctx, newSHA))
 }
 
 func TestRepository_FetchCoalescingReportsWhetherItFetched(t *testing.T) {
@@ -382,7 +456,6 @@ func TestRepository_FetchCoalescingReportsWhetherItFetched(t *testing.T) {
 	repo.fetchSem <- struct{}{}
 	assert.NoError(t, repo.Clone(ctx))
 
-	// Coalescing onto a non-fetch semaphore holder reports fetched=false.
 	release := make(chan struct{})
 	acquired := make(chan struct{})
 	holderDone := make(chan error, 1)
@@ -505,9 +578,9 @@ func TestRepository_EnsureRefsUpToDate_CachesFailureForBackoff(t *testing.T) {
 
 	// The failure is cached only for a fraction of RefCheckInterval, so recovery
 	// is picked up long before a successful verdict would expire.
-	repo.mu.Lock()
+	repo.metaMu.Lock()
 	repo.refCheckErrAt = time.Now().Add(-2 * repo.refCheckFailureBackoff())
-	repo.mu.Unlock()
+	repo.metaMu.Unlock()
 
 	_, err = repo.EnsureRefsUpToDate(ctx)
 	assert.Error(t, err)
@@ -547,10 +620,10 @@ func TestRepository_EnsureRefsUpToDate_FetchInvalidatesStaleCache(t *testing.T) 
 	ctx := context.Background()
 
 	// Clear any cached verdict and advance upstream so the check reports stale.
-	repo.mu.Lock()
+	repo.metaMu.Lock()
 	repo.lastRefCheck = time.Now().Add(-2 * time.Minute)
 	repo.refCheckValid = false
-	repo.mu.Unlock()
+	repo.metaMu.Unlock()
 	advanceBareUpstream(t, upstreamPath)
 
 	needsFetch, err := repo.EnsureRefsUpToDate(ctx)
@@ -732,6 +805,41 @@ func TestRepository_Clone_StateVisibleDuringClone(t *testing.T) {
 	// Wait for clone to finish
 	assert.NoError(t, <-cloneDone)
 	assert.Equal(t, StateReady, repo.State())
+}
+
+func TestRepositoryCloneWaitsForCurrentOwner(t *testing.T) {
+	repo := &Repository{
+		state:       StateCloning,
+		config:      testRepoConfig(),
+		path:        filepath.Join(t.TempDir(), "clone"),
+		upstreamURL: "https://example.test/example/repo",
+		fetchSem:    make(chan struct{}, 1),
+	}
+	repo.fetchSem <- struct{}{}
+	ready := make(chan struct{})
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		repo.MarkReady()
+		close(ready)
+	}()
+
+	assert.NoError(t, repo.Clone(t.Context()))
+	<-ready
+	assert.Equal(t, StateReady, repo.State())
+}
+
+func TestRepositoryCloneWaitTimeout(t *testing.T) {
+	repo := &Repository{
+		state:       StateCloning,
+		config:      testRepoConfig(),
+		path:        filepath.Join(t.TempDir(), "clone"),
+		upstreamURL: "https://example.test/example/repo",
+		fetchSem:    make(chan struct{}, 1),
+	}
+	repo.fetchSem <- struct{}{}
+
+	err := repo.CloneWithWaitTimeout(t.Context(), 20*time.Millisecond)
+	assert.True(t, errors.Is(err, context.DeadlineExceeded))
 }
 
 func TestRepository_CloneSetsMirrorConfig(t *testing.T) {
@@ -1099,6 +1207,176 @@ func TestRepository_FetchVerifiedIfAbsentPeerDelivered(t *testing.T) {
 	assert.True(t, repo.HasCommit(ctx, newSHA))
 }
 
+func TestRepositoryEnsureRefsUpToDateDoesNotCacheLocalError(t *testing.T) {
+	config := testRepoConfig()
+	config.RefCheckInterval = time.Hour
+	repo := &Repository{
+		config:      config,
+		path:        filepath.Join(t.TempDir(), "missing"),
+		upstreamURL: filepath.Join(t.TempDir(), "upstream.git"),
+	}
+
+	_, err := repo.EnsureRefsUpToDate(t.Context())
+
+	assert.Error(t, err)
+	repo.metaMu.Lock()
+	defer repo.metaMu.Unlock()
+	assert.False(t, repo.refCheckValid)
+}
+
+func TestRepositoryEnsureRefsUpToDateDoesNotCacheInFlightCheck(t *testing.T) {
+	tmpDir := t.TempDir()
+	upstreamPath := createBareRepo(t, tmpDir)
+	config := testRepoConfig()
+	config.RefCheckInterval = time.Hour
+	repo := &Repository{
+		state:       StateEmpty,
+		config:      config,
+		path:        filepath.Join(tmpDir, "clone"),
+		upstreamURL: upstreamPath,
+		fetchSem:    make(chan struct{}, 1),
+	}
+	repo.fetchSem <- struct{}{}
+	assert.NoError(t, repo.Clone(t.Context()))
+
+	realGit, err := exec.LookPath("git")
+	assert.NoError(t, err)
+	binDir := t.TempDir()
+	started := filepath.Join(binDir, "started")
+	release := filepath.Join(binDir, "release")
+	script := fmt.Sprintf(`#!/bin/sh
+if echo " $* " | grep -q ' ls-remote '; then
+  touch %q
+  while [ ! -e %q ]; do sleep 0.01; done
+fi
+exec %q "$@"
+`, started, release, realGit)
+	assert.NoError(t, os.WriteFile(filepath.Join(binDir, "git"), []byte(script), 0o755))
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	type result struct {
+		stale bool
+		err   error
+	}
+	resultCh := make(chan result, 1)
+	go func() {
+		stale, err := repo.EnsureRefsUpToDate(t.Context())
+		resultCh <- result{stale: stale, err: err}
+	}()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(started); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("ls-remote did not start")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	repo.metaMu.Lock()
+	valid := repo.refCheckValid
+	repo.metaMu.Unlock()
+	assert.False(t, valid)
+	assert.NoError(t, os.WriteFile(release, nil, 0o644))
+
+	got := <-resultCh
+	assert.NoError(t, got.err)
+	assert.False(t, got.stale)
+	repo.metaMu.Lock()
+	defer repo.metaMu.Unlock()
+	assert.True(t, repo.refCheckValid)
+}
+
+func TestRepositoryEnsureRefsUpToDateSharesStaleResult(t *testing.T) {
+	tmpDir := t.TempDir()
+	upstreamPath := createBareRepo(t, tmpDir)
+	config := testRepoConfig()
+	config.RefCheckInterval = time.Hour
+	repo := &Repository{
+		state:       StateEmpty,
+		config:      config,
+		path:        filepath.Join(tmpDir, "clone"),
+		upstreamURL: upstreamPath,
+		fetchSem:    make(chan struct{}, 1),
+	}
+	repo.fetchSem <- struct{}{}
+	assert.NoError(t, repo.Clone(t.Context()))
+	localRefs, err := repo.GetLocalRefs(t.Context())
+	assert.NoError(t, err)
+	var headRef, localSHA string
+	for ref, sha := range localRefs {
+		if strings.HasPrefix(ref, "refs/heads/") {
+			headRef, localSHA = ref, sha
+			break
+		}
+	}
+	assert.NotEqual(t, "", headRef)
+
+	realGit, err := exec.LookPath("git")
+	assert.NoError(t, err)
+	binDir := t.TempDir()
+	claim := filepath.Join(binDir, "claim")
+	staleStarted := filepath.Join(binDir, "stale-started")
+	releaseStale := filepath.Join(binDir, "release-stale")
+	script := fmt.Sprintf(`#!/bin/sh
+if echo " $* " | grep -q ' ls-remote '; then
+  if mkdir %q 2>/dev/null; then
+    touch %q
+    while [ ! -e %q ]; do sleep 0.01; done
+    printf 'ffffffffffffffffffffffffffffffffffffffff\t%s\n'
+  else
+    printf '%s\t%s\n'
+  fi
+  exit 0
+fi
+exec %q "$@"
+`, claim, staleStarted, releaseStale, headRef, localSHA, headRef, realGit)
+	assert.NoError(t, os.WriteFile(filepath.Join(binDir, "git"), []byte(script), 0o755))
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	type result struct {
+		stale bool
+		err   error
+	}
+	staleResult := make(chan result, 1)
+	go func() {
+		stale, err := repo.EnsureRefsUpToDate(t.Context())
+		staleResult <- result{stale: stale, err: err}
+	}()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(staleStarted); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("stale ref check did not start")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	peerResult := make(chan result, 1)
+	go func() {
+		stale, err := repo.EnsureRefsUpToDate(t.Context())
+		peerResult <- result{stale: stale, err: err}
+	}()
+
+	assert.NoError(t, os.WriteFile(releaseStale, nil, 0o644))
+	got := <-staleResult
+	assert.NoError(t, got.err)
+	assert.True(t, got.stale)
+	peer := <-peerResult
+	assert.NoError(t, peer.err)
+	assert.True(t, peer.stale)
+	assert.Equal(t, int64(1), repo.lsRemoteRuns.Load())
+	repo.metaMu.Lock()
+	defer repo.metaMu.Unlock()
+	assert.True(t, repo.refCheckValid)
+	assert.True(t, repo.refCheckStale)
+}
+
 // TestMirrorConfigAllowsUnreachableSHA verifies that the mirror config lets
 // git upload-pack serve objects that are present in the ODB but unreachable
 // from any ref (e.g. after a force-push orphans a commit).
@@ -1214,9 +1492,9 @@ func TestRepositoryBackgroundFetchBackoff(t *testing.T) {
 	assert.True(t, repo.BackgroundFetchBackoff(base) > 59*time.Minute)
 	assert.True(t, repo.BackgroundFetchBackoff(base) <= time.Hour)
 
-	repo.mu.Lock()
+	repo.metaMu.Lock()
 	repo.lastFetchAttempt = time.Now().Add(-2 * time.Hour)
-	repo.mu.Unlock()
+	repo.metaMu.Unlock()
 	assert.Equal(t, time.Duration(0), repo.BackgroundFetchBackoff(base))
 
 	repo.recordFetchOutcome(true)
@@ -1316,4 +1594,116 @@ func TestCommitLookupsRejectOptionsAndRevisionSyntax(t *testing.T) {
 		_, err := os.Stat(sideEffect)
 		assert.True(t, os.IsNotExist(err), "git wrote %s for input %q", sideEffect, tt.input)
 	}
+}
+
+func TestRepositoryRequestPathNotBlockedByLongReadLock(t *testing.T) {
+	config := testRepoConfig()
+	config.RefCheckInterval = time.Hour
+	_, ctx, _ := logging.Configure(t.Context(), logging.Config{Level: "error"})
+	manager, err := NewManager(ctx, Config{MirrorRoot: t.TempDir()}, nil)
+	assert.NoError(t, err)
+	repo := &Repository{
+		state:         StateReady,
+		config:        config,
+		path:          t.TempDir(),
+		upstreamURL:   "https://example.test/org/repo",
+		fetchSem:      make(chan struct{}, 1),
+		refCheckValid: true,
+		lastRefCheck:  time.Now(),
+	}
+	repo.fetchSem <- struct{}{}
+
+	held := make(chan struct{})
+	release := make(chan struct{})
+	defer close(release)
+	go func() {
+		_ = repo.WithReadLock(func() error {
+			close(held)
+			<-release
+			return nil
+		})
+	}()
+	<-held
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		stale, err := repo.EnsureRefsUpToDate(t.Context())
+		assert.NoError(t, err)
+		assert.False(t, stale)
+		repo.setLastFetch(time.Now())
+		assert.False(t, repo.NeedsFetch(time.Hour))
+		assert.Equal(t, StateReady, repo.State())
+		assert.True(t, repo.BeginServe())
+		assert.NoError(t, manager.MarkServed(repo))
+		assert.False(t, repo.LastServed().IsZero())
+		repo.EndServe()
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("request-path bookkeeping blocked behind a held read lock")
+	}
+}
+
+func TestRepository_FetchVerifiedDoesNotCoalesce(t *testing.T) {
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+	upstreamPath := createBareRepo(t, tmpDir)
+
+	clonePath := filepath.Join(tmpDir, "clone")
+	repo := &Repository{
+		state:       StateEmpty,
+		config:      testRepoConfig(),
+		path:        clonePath,
+		upstreamURL: upstreamPath,
+		fetchSem:    make(chan struct{}, 1),
+	}
+	repo.fetchSem <- struct{}{}
+	assert.NoError(t, repo.Clone(ctx))
+
+	workPath := filepath.Join(tmpDir, "work")
+	assert.NoError(t, os.WriteFile(filepath.Join(workPath, "f.txt"), []byte("y"), 0o644))
+	for _, args := range [][]string{
+		{"git", "-C", workPath, "commit", "-am", "update"},
+		{"git", "-C", workPath, "push", upstreamPath, "HEAD"},
+	} {
+		assert.NoError(t, exec.Command(args[0], args[1:]...).Run())
+	}
+	newSHAOut, err := exec.Command("git", "-C", workPath, "rev-parse", "HEAD").Output()
+	assert.NoError(t, err)
+	newSHA := strings.TrimSpace(string(newSHAOut))
+
+	holdSem := func(t *testing.T, fetch func() error) time.Time {
+		t.Helper()
+		release := make(chan struct{})
+		acquired := make(chan struct{})
+		peerFetchAt := make(chan time.Time, 1)
+		holderDone := make(chan error, 1)
+		go func() {
+			holderDone <- repo.WithFetchExclusion(ctx, func() error {
+				close(acquired)
+				<-release
+				err := repo.executeFetch(ctx, true)
+				peerFetchAt <- repo.LastFetch()
+				return err
+			})
+		}()
+		<-acquired
+		fetchDone := make(chan error, 1)
+		go func() { fetchDone <- fetch() }()
+		time.Sleep(50 * time.Millisecond)
+		close(release)
+		assert.NoError(t, <-holderDone)
+		assert.NoError(t, <-fetchDone)
+		return <-peerFetchAt
+	}
+
+	peerFetchAt := holdSem(t, func() error { return repo.Fetch(ctx) })
+	assert.Equal(t, peerFetchAt, repo.LastFetch())
+	assert.True(t, repo.HasCommit(ctx, newSHA))
+
+	peerFetchAt = holdSem(t, func() error { return repo.FetchVerified(ctx) })
+	assert.True(t, repo.LastFetch().After(peerFetchAt))
+	assert.True(t, repo.HasCommit(ctx, newSHA))
 }

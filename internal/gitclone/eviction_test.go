@@ -27,8 +27,8 @@ func newMirrorManager(t *testing.T) (context.Context, *Manager, func(upstreamURL
 		t.Helper()
 		path, err := manager.clonePathForURL(upstreamURL)
 		assert.NoError(t, err)
-		assert.NoError(t, os.MkdirAll(path, 0o750))
-		assert.NoError(t, os.WriteFile(filepath.Join(path, "HEAD"), []byte("ref: refs/heads/main\n"), 0o600))
+		output, err := exec.Command("git", "init", "--bare", path).CombinedOutput()
+		assert.NoError(t, err, string(output))
 		repo, err := manager.GetOrCreate(ctx, upstreamURL)
 		assert.NoError(t, err)
 		assert.Equal(t, StateReady, repo.State())
@@ -41,9 +41,9 @@ func TestEvictRemovesIdleMirror(t *testing.T) {
 	ctx, manager, create := newMirrorManager(t)
 	repo := create("https://github.com/org/idle")
 
-	repo.mu.Lock()
+	repo.metaMu.Lock()
 	repo.lastServed = time.Now().Add(-2 * time.Hour)
-	repo.mu.Unlock()
+	repo.metaMu.Unlock()
 
 	idle := manager.IdleMirrors(time.Hour)
 	assert.Equal(t, 1, len(idle))
@@ -69,9 +69,9 @@ func TestEvictRemovesIdleMirror(t *testing.T) {
 func TestEvictDeclinesWhileServing(t *testing.T) {
 	ctx, manager, create := newMirrorManager(t)
 	repo := create("https://github.com/org/busy")
-	repo.mu.Lock()
+	repo.metaMu.Lock()
 	repo.lastServed = time.Now().Add(-2 * time.Hour)
-	repo.mu.Unlock()
+	repo.metaMu.Unlock()
 
 	assert.True(t, repo.BeginServe(), "serve should be admitted before eviction")
 
@@ -210,6 +210,9 @@ func TestIdleMirrorsIgnoresRecentlyServed(t *testing.T) {
 func TestMarkServedSurvivesReload(t *testing.T) {
 	ctx, manager, create := newMirrorManager(t)
 	repo := create("https://github.com/org/persisted")
+	manager.lastServed.mu.Lock()
+	manager.lastServed.times[repo.UpstreamURL()] = time.Now().Add(-2 * lastServedGranularity)
+	manager.lastServed.mu.Unlock()
 	assert.NoError(t, manager.MarkServed(repo))
 
 	// A new Manager over the same root stands in for a pod restart: without

@@ -6,6 +6,7 @@ import (
 	"net/http"
 
 	"github.com/tenstorrent/internal-cachew/internal/cache"
+	"github.com/tenstorrent/internal-cachew/internal/gitclone"
 )
 
 // SetAuthzHTTPClient points the strategy's upstream authorization probes at a
@@ -29,3 +30,8 @@ func (t *TestableGoproxyCacher) Put(ctx context.Context, name string, content io
 
 // CheckoutRef exposes checkoutRef for external tests.
 func CheckoutRef(version string) (string, bool) { return checkoutRef(version) }
+
+// GenerateZipForTest lets external tests cover generation without widening the production API.
+func GenerateZipForTest(ctx context.Context, repo *gitclone.Repository, modulePath, version string) (io.ReadSeekCloser, error) {
+	return (&privateFetcher{}).generateZip(ctx, repo, modulePath, version)
+}

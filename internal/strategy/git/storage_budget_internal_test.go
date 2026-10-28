@@ -71,6 +71,34 @@ func TestStorageBudgetConfigValidation(t *testing.T) {
 // assertion that lands on it is asserting the cap, not the arithmetic.
 const budgetCacheLimitMB = 100
 
+func TestEvictionDefersQueuedColdPreparation(t *testing.T) {
+	for _, mode := range []string{"idle", "quota"} {
+		t.Run(mode, func(t *testing.T) {
+			_, ctx, _ := logging.Configure(t.Context(), logging.Config{Level: "error"})
+			manager := newDiscoveredMirrorManager(ctx, t, 1)
+			repo := manager.All()[0]
+			s := &Strategy{
+				ctx: ctx, cloneManager: manager, scheduler: &queueCapturingScheduler{},
+				cache: newBudgetDiskCache(ctx, t), storage: newStorageMetrics(),
+				config: Config{StorageLimitMB: 100, StorageMinCacheMB: 10},
+			}
+			evict := func() {
+				if mode == "idle" {
+					assert.NoError(t, s.evictIdleMirrors(ctx, time.Nanosecond))
+				} else {
+					s.enforceStorageBudget(ctx, map[string]int64{repo.UpstreamURL(): 200 * mib}, 200*mib)
+				}
+			}
+			s.mirrorPreparations.Store(repo.UpstreamURL(), true)
+			evict()
+			assert.Equal(t, 1, len(manager.All()))
+			s.mirrorPreparations.Delete(repo.UpstreamURL())
+			evict()
+			assert.Zero(t, len(manager.All()))
+		})
+	}
+}
+
 // The dashboard queries these names literally, and the Prometheus exporter
 // derives them from the instrument's unit as well as its name, so pin them.
 func TestMirrorEvictionMetricSeriesNames(t *testing.T) {

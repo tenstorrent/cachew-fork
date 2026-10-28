@@ -292,6 +292,9 @@ func (s *Strategy) reclaimMirrorsToFit(
 			return
 		}
 		upstream := repo.UpstreamURL()
+		if _, preparing := s.mirrorPreparations.Load(upstream); preparing {
+			continue
+		}
 		size, measured := mirrorSizes[upstream]
 		if !measured {
 			// Appeared after the scan, so its size is unknown and evicting it

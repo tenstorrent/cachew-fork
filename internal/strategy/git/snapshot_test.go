@@ -3,6 +3,7 @@ package git_test
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -85,8 +86,6 @@ func TestSnapshotHTTPEndpoint(t *testing.T) {
 	assert.Equal(t, "application/zstd", w.Header().Get("Content-Type"))
 	assert.Equal(t, snapshotData, w.Body.Bytes())
 
-	// Test snapshot not found - repo has no mirror, so clone is attempted but
-	// fails immediately because the context is cancelled.
 	cancelCtx, cancel := context.WithCancel(ctx)
 	cancel()
 	req = httptest.NewRequest(http.MethodGet, "/git/github.com/org/nonexistent/snapshot.tar.zst", nil)
@@ -97,7 +96,8 @@ func TestSnapshotHTTPEndpoint(t *testing.T) {
 
 	handler.ServeHTTP(w, req)
 
-	assert.Equal(t, 503, w.Code)
+	assert.Equal(t, http.StatusNotFound, w.Code)
+	assert.Equal(t, "no-store", w.Header().Get("Cache-Control"))
 }
 
 func TestSnapshotOnDemandGenerationViaHTTP(t *testing.T) {
@@ -110,6 +110,7 @@ func TestSnapshotOnDemandGenerationViaHTTP(t *testing.T) {
 	mirrorRoot := filepath.Join(tmpDir, "mirrors")
 	mirrorPath := filepath.Join(mirrorRoot, "github.com", "org", "repo")
 	createTestMirrorRepo(t, mirrorPath)
+	addSnapshotGarbage(t, mirrorPath)
 
 	memCache, err := cache.NewMemory(ctx, cache.MemoryConfig{MaxTTL: time.Hour})
 	assert.NoError(t, err)
@@ -137,6 +138,42 @@ func TestSnapshotOnDemandGenerationViaHTTP(t *testing.T) {
 	// Allow background goroutines (spool cleanup, cache backfill) to finish
 	// before TempDir cleanup runs.
 	time.Sleep(2 * time.Second)
+
+	restoreDir := t.TempDir()
+	assert.NoError(t, snapshot.Extract(ctx, w.Body, restoreDir, 0))
+	assertSnapshotGitFiles(t, mirrorPath, filepath.Join(restoreDir, ".git"))
+}
+
+func addSnapshotGarbage(t *testing.T, mirrorPath string) {
+	t.Helper()
+	output, err := exec.Command("git", "-C", mirrorPath, "repack", "-ad").CombinedOutput()
+	assert.NoError(t, err, string(output))
+	for _, name := range []string{"objects/pack/tmp_pack_unused", "objects/pack/tmp_idx_unused", "objects/pack/stale.lock"} {
+		assert.NoError(t, os.WriteFile(filepath.Join(mirrorPath, name), []byte("garbage"), 0o644))
+	}
+}
+
+func assertSnapshotGitFiles(t *testing.T, mirrorPath, restoredGitDir string) {
+	t.Helper()
+	for _, name := range []string{"objects/pack/tmp_pack_unused", "objects/pack/tmp_idx_unused", "objects/pack/stale.lock"} {
+		_, err := os.Stat(filepath.Join(restoredGitDir, name))
+		assert.True(t, os.IsNotExist(err), "snapshot should exclude %s", name)
+		data, err := os.ReadFile(filepath.Join(mirrorPath, name))
+		assert.NoError(t, err)
+		assert.Equal(t, "garbage", string(data))
+	}
+	packs, err := filepath.Glob(filepath.Join(mirrorPath, "objects/pack/pack-*"))
+	assert.NoError(t, err)
+	assert.True(t, len(packs) >= 2, "expected a real pack and index")
+	for _, pack := range packs {
+		want, err := os.ReadFile(pack)
+		assert.NoError(t, err)
+		got, err := os.ReadFile(filepath.Join(restoredGitDir, "objects/pack", filepath.Base(pack)))
+		assert.NoError(t, err)
+		assert.Equal(t, want, got)
+	}
+	output, err := exec.CommandContext(t.Context(), "git", "-C", restoredGitDir, "-c", "core.fsmonitor=false", "fsck", "--full").CombinedOutput()
+	assert.NoError(t, err, string(output))
 }
 
 // createTestMirrorRepo creates a bare mirror-style repo at mirrorPath with one commit.
@@ -404,13 +441,24 @@ func TestSnapshotGenerationWithFilterFailsWhenMirrorIgnoresFilter(t *testing.T) 
 
 	waitForReady(t, s)
 
-	// A mirror missing uploadpack.allowFilter makes git silently fall back to
-	// a full clone; generation must fail rather than cache the full artifact.
-	// Unset only after waitForReady: startup warming reruns configureMirror,
-	// which would re-enable the capability.
 	cmd := exec.Command("git", "-C", mirrorPath, "config", "--unset", "uploadpack.allowfilter")
 	output, err := cmd.CombinedOutput()
 	assert.NoError(t, err, string(output))
+
+	realGit, err := exec.LookPath("git")
+	assert.NoError(t, err)
+	binDir := t.TempDir()
+	gitWrapper := filepath.Join(binDir, "git")
+	script := fmt.Sprintf(`#!/bin/sh
+%q "$@"
+git_status=$?
+if [ "$1" = "clone" ] && [ "$git_status" -eq 0 ]; then
+  echo "warning: filtering not recognized by server, ignoring" >&2
+fi
+exit "$git_status"
+`, realGit)
+	assert.NoError(t, os.WriteFile(gitWrapper, []byte(script), 0o755))
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 	err = s.GenerateAndUploadSnapshot(ctx, repo)
 	assert.Error(t, err)
@@ -450,7 +498,7 @@ func createTestMirrorRepoWithHistory(t *testing.T, mirrorPath string) string {
 	return historicalBlob
 }
 
-func TestSnapshotGenerationIncludesTrackedLockFiles(t *testing.T) {
+func TestSnapshotGenerationExcludesGitGarbage(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not found in PATH")
 	}
@@ -462,10 +510,12 @@ func TestSnapshotGenerationIncludesTrackedLockFiles(t *testing.T) {
 
 	mirrorPath := filepath.Join(mirrorRoot, "github.com", "org", "repo")
 	createTestMirrorRepoWithFiles(t, mirrorPath, map[string]string{
-		"hello.txt":           "hello\n",
-		"package-lock.json":   "{\n  \"name\": \"repo\"\n}\n",
-		"subdir/Gemfile.lock": "GEM\n",
+		"hello.txt":                  "hello\n",
+		"package-lock.json":          "{\n  \"name\": \"repo\"\n}\n",
+		"subdir/Gemfile.lock":        "GEM\n",
+		"objects/pack/tmp_pack_test": "tracked fixture\n",
 	})
+	addSnapshotGarbage(t, mirrorPath)
 
 	memCache, err := cache.NewMemory(ctx, cache.MemoryConfig{MaxTTL: time.Hour})
 	assert.NoError(t, err)
@@ -497,6 +547,11 @@ func TestSnapshotGenerationIncludesTrackedLockFiles(t *testing.T) {
 	data, err = os.ReadFile(filepath.Join(restoreDir, "subdir", "Gemfile.lock"))
 	assert.NoError(t, err)
 	assert.Equal(t, "GEM\n", string(data))
+
+	data, err = os.ReadFile(filepath.Join(restoreDir, "objects", "pack", "tmp_pack_test"))
+	assert.NoError(t, err)
+	assert.Equal(t, "tracked fixture\n", string(data))
+	assertSnapshotGitFiles(t, mirrorPath, filepath.Join(restoreDir, ".git"))
 }
 
 func TestMirrorSnapshotRestoreDirectly(t *testing.T) {
@@ -512,6 +567,7 @@ func TestMirrorSnapshotRestoreDirectly(t *testing.T) {
 	// Create a mirror repo and generate a mirror snapshot (bare tarball).
 	mirrorPath := filepath.Join(mirrorRoot, "github.com", "org", "repo")
 	createTestMirrorRepo(t, mirrorPath)
+	addSnapshotGarbage(t, mirrorPath)
 
 	memCache, err := cache.NewMemory(ctx, cache.MemoryConfig{MaxTTL: time.Hour})
 	assert.NoError(t, err)
@@ -535,6 +591,7 @@ func TestMirrorSnapshotRestoreDirectly(t *testing.T) {
 	cacheKey := cache.NewKey(upstreamURL + ".mirror-snapshot")
 	err = snapshot.Restore(ctx, memCache, cacheKey, restoreDir, 0)
 	assert.NoError(t, err)
+	assertSnapshotGitFiles(t, mirrorPath, restoreDir)
 
 	// Should be bare already (no .git subdir).
 	_, err = os.Stat(filepath.Join(restoreDir, ".git"))
@@ -759,6 +816,7 @@ func TestSnapshotHeadServesMetadataWithoutBody(t *testing.T) {
 	missResp := httptest.NewRecorder()
 	handler.ServeHTTP(missResp, missReq)
 	assert.Equal(t, 404, missResp.Code, "HEAD on an uncached snapshot must not trigger generation")
+	assert.Equal(t, "no-store", missResp.Header().Get("Cache-Control"))
 
 	waitForReady(t, s)
 	err = s.GenerateAndUploadSnapshot(ctx, repo)
@@ -1277,6 +1335,9 @@ func commitUpstream(t *testing.T, upstream, msg string) string {
 
 func newBundleTestStrategy(ctx context.Context, t *testing.T, mirrorRoot string, refCheckInterval time.Duration) *testMux {
 	t.Helper()
+	mirrorPath := filepath.Join(mirrorRoot, "example.com", "org", "repo")
+	upstreamURL, err := exec.Command("git", "-C", mirrorPath, "remote", "get-url", "origin").Output()
+	assert.NoError(t, err)
 	memCache, err := cache.NewMemory(ctx, cache.MemoryConfig{MaxTTL: time.Hour})
 	assert.NoError(t, err)
 	mux := newTestMux()
@@ -1284,14 +1345,16 @@ func newBundleTestStrategy(ctx context.Context, t *testing.T, mirrorRoot string,
 	s, err := git.New(ctx, git.Config{DisableUpstreamAuthz: true}, newTestScheduler(ctx, t), memCache, mux, cm, func() (*githubapp.TokenManager, error) { return nil, nil }, nil) //nolint:nilnil
 	assert.NoError(t, err)
 	waitForReady(t, s)
+	assert.NoError(t, exec.Command("git", "-C", mirrorPath, "remote", "set-url", "origin",
+		strings.TrimSpace(string(upstreamURL))).Run())
 	return mux
 }
 
 func requestBundle(ctx context.Context, mux *testMux, base string) *httptest.ResponseRecorder {
 	handler := mux.handlers["GET /git/{host}/{path...}"]
-	req := httptest.NewRequest(http.MethodGet, "/git/github.com/org/repo/snapshot.bundle?base="+base, nil)
+	req := httptest.NewRequest(http.MethodGet, "/git/example.com/org/repo/snapshot.bundle?base="+base, nil)
 	req = req.WithContext(ctx)
-	req.SetPathValue("host", "github.com")
+	req.SetPathValue("host", "example.com")
 	req.SetPathValue("path", "org/repo/snapshot.bundle")
 	w := httptest.NewRecorder()
 	handler.ServeHTTP(w, req)
@@ -1305,8 +1368,8 @@ func TestBundleRequestUpToDateReturnsNoContent(t *testing.T) {
 
 	_, ctx, _ := logging.Configure(context.Background(), logging.Config{})
 	mirrorRoot := filepath.Join(t.TempDir(), "mirrors")
-	mirrorPath := filepath.Join(mirrorRoot, "github.com", "org", "repo")
-	createUpstreamAndMirror(t, mirrorPath)
+	mirrorPath := filepath.Join(mirrorRoot, "example.com", "org", "repo")
+	upstream := createUpstreamAndMirror(t, mirrorPath)
 	mux := newBundleTestStrategy(ctx, t, mirrorRoot, time.Millisecond)
 
 	head, err := exec.Command("git", "-C", mirrorPath, "rev-parse", "HEAD").Output()
@@ -1315,6 +1378,11 @@ func TestBundleRequestUpToDateReturnsNoContent(t *testing.T) {
 	w := requestBundle(ctx, mux, strings.TrimSpace(string(head)))
 	assert.Equal(t, http.StatusNoContent, w.Code)
 	assert.Equal(t, 0, w.Body.Len())
+
+	commitUpstream(t, upstream, "second")
+	w = requestBundle(ctx, mux, strings.TrimSpace(string(head)))
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.True(t, strings.HasPrefix(w.Body.String(), "# v2 git bundle"))
 }
 
 func TestBundleRequestFreshensStaleMirror(t *testing.T) {
@@ -1324,7 +1392,7 @@ func TestBundleRequestFreshensStaleMirror(t *testing.T) {
 
 	_, ctx, _ := logging.Configure(context.Background(), logging.Config{})
 	mirrorRoot := filepath.Join(t.TempDir(), "mirrors")
-	mirrorPath := filepath.Join(mirrorRoot, "github.com", "org", "repo")
+	mirrorPath := filepath.Join(mirrorRoot, "example.com", "org", "repo")
 	upstream := createUpstreamAndMirror(t, mirrorPath)
 	mux := newBundleTestStrategy(ctx, t, mirrorRoot, time.Millisecond)
 
@@ -1347,7 +1415,7 @@ func TestBundleRequestUpToDateFetchesDespiteRecentRefCheck(t *testing.T) {
 
 	_, ctx, _ := logging.Configure(context.Background(), logging.Config{})
 	mirrorRoot := filepath.Join(t.TempDir(), "mirrors")
-	mirrorPath := filepath.Join(mirrorRoot, "github.com", "org", "repo")
+	mirrorPath := filepath.Join(mirrorRoot, "example.com", "org", "repo")
 	upstream := createUpstreamAndMirror(t, mirrorPath)
 	// A long RefCheckInterval so the startup fetch would suppress a
 	// rate-limited freshen for the rest of the test.
@@ -1375,7 +1443,7 @@ func TestBundleRequestFreshenFailureIsNotUpToDate(t *testing.T) {
 
 	_, ctx, _ := logging.Configure(context.Background(), logging.Config{})
 	mirrorRoot := filepath.Join(t.TempDir(), "mirrors")
-	mirrorPath := filepath.Join(mirrorRoot, "github.com", "org", "repo")
+	mirrorPath := filepath.Join(mirrorRoot, "example.com", "org", "repo")
 	upstream := createUpstreamAndMirror(t, mirrorPath)
 	mux := newBundleTestStrategy(ctx, t, mirrorRoot, time.Millisecond)
 
@@ -1391,6 +1459,31 @@ func TestBundleRequestFreshenFailureIsNotUpToDate(t *testing.T) {
 	assert.Equal(t, http.StatusNotFound, w.Code)
 }
 
+func TestBundleRequestCreationFailureIsNotUpToDate(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not found in PATH")
+	}
+
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{})
+	mirrorRoot := filepath.Join(t.TempDir(), "mirrors")
+	mirrorPath := filepath.Join(mirrorRoot, "example.com", "org", "repo")
+	upstream := createUpstreamAndMirror(t, mirrorPath)
+	baseOut, err := exec.Command("git", "-C", mirrorPath, "rev-parse", "HEAD").Output()
+	assert.NoError(t, err)
+	base := strings.TrimSpace(string(baseOut))
+	head := commitUpstream(t, upstream, "second")
+	cmd := exec.Command("git", "-C", mirrorPath, "-c", "fetch.unpackLimit=1000", "fetch", "origin")
+	output, err := cmd.CombinedOutput()
+	assert.NoError(t, err, string(output))
+	mux := newBundleTestStrategy(ctx, t, mirrorRoot, time.Millisecond)
+
+	headObject := filepath.Join(mirrorPath, "objects", head[:2], head[2:])
+	assert.NoError(t, os.Remove(headObject))
+
+	w := requestBundle(ctx, mux, base)
+	assert.Equal(t, http.StatusNotFound, w.Code)
+}
+
 func TestBundleRequestUnknownBase(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not found in PATH")
@@ -1398,7 +1491,7 @@ func TestBundleRequestUnknownBase(t *testing.T) {
 
 	_, ctx, _ := logging.Configure(context.Background(), logging.Config{})
 	mirrorRoot := filepath.Join(t.TempDir(), "mirrors")
-	mirrorPath := filepath.Join(mirrorRoot, "github.com", "org", "repo")
+	mirrorPath := filepath.Join(mirrorRoot, "example.com", "org", "repo")
 	createUpstreamAndMirror(t, mirrorPath)
 	mux := newBundleTestStrategy(ctx, t, mirrorRoot, time.Millisecond)
 
@@ -1407,4 +1500,53 @@ func TestBundleRequestUnknownBase(t *testing.T) {
 
 	invalid := requestBundle(ctx, mux, "not-a-sha")
 	assert.Equal(t, http.StatusBadRequest, invalid.Code)
+}
+
+func TestSnapshotGenerationIncludesTrackedLockFiles(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not found in PATH")
+	}
+
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{})
+	tmpDir := t.TempDir()
+	mirrorRoot := filepath.Join(tmpDir, "mirrors")
+	upstreamURL := "https://github.com/org/repo"
+
+	mirrorPath := filepath.Join(mirrorRoot, "github.com", "org", "repo")
+	createTestMirrorRepoWithFiles(t, mirrorPath, map[string]string{
+		"hello.txt":           "hello\n",
+		"package-lock.json":   "{\n  \"name\": \"repo\"\n}\n",
+		"subdir/Gemfile.lock": "GEM\n",
+	})
+
+	memCache, err := cache.NewMemory(ctx, cache.MemoryConfig{MaxTTL: time.Hour})
+	assert.NoError(t, err)
+	mux := newTestMux()
+
+	cm := gitclone.NewManagerProvider(ctx, gitclone.Config{MirrorRoot: mirrorRoot}, nil)
+	s, err := git.New(ctx, git.Config{DisableUpstreamAuthz: true}, newTestScheduler(ctx, t), memCache, mux, cm, func() (*githubapp.TokenManager, error) { return nil, nil }, nil) //nolint:nilnil
+	assert.NoError(t, err)
+
+	manager, err := cm()
+	assert.NoError(t, err)
+	repo, err := manager.GetOrCreate(ctx, upstreamURL)
+	assert.NoError(t, err)
+	assert.Equal(t, gitclone.StateReady, repo.State())
+
+	waitForReady(t, s)
+	err = s.GenerateAndUploadSnapshot(ctx, repo)
+	assert.NoError(t, err)
+
+	cacheKey := cache.NewKey(upstreamURL + ".snapshot")
+	restoreDir := filepath.Join(tmpDir, "restored")
+	err = snapshot.Restore(ctx, memCache, cacheKey, restoreDir, 0)
+	assert.NoError(t, err)
+
+	data, err := os.ReadFile(filepath.Join(restoreDir, "package-lock.json"))
+	assert.NoError(t, err)
+	assert.Equal(t, "{\n  \"name\": \"repo\"\n}\n", string(data))
+
+	data, err = os.ReadFile(filepath.Join(restoreDir, "subdir", "Gemfile.lock"))
+	assert.NoError(t, err)
+	assert.Equal(t, "GEM\n", string(data))
 }

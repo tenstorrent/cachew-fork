@@ -35,6 +35,18 @@ import (
 // in E2E fallback scenarios so we can assert the client received it.
 const fakeUpstreamMarker = "FAKE-UPSTREAM-RESPONSE"
 
+type fetchPhaseContext struct {
+	context.Context
+	entered chan struct{}
+	once    sync.Once
+}
+
+// Value lets cancellation tests wait until tracing or logging reads the detached fetch context.
+func (c *fetchPhaseContext) Value(key any) any {
+	c.once.Do(func() { close(c.entered) })
+	return c.Context.Value(key)
+}
+
 // countingFakeUpstream returns a fake upstream httptest.Server that counts every
 // request and responds with fakeUpstreamMarker, plus its hit counter.
 func countingFakeUpstream(t *testing.T) (*httptest.Server, *atomic.Int32) {
@@ -118,6 +130,7 @@ func setupE2EStrategy(ctx context.Context, t *testing.T, mirrorRoot string, cfg 
 		FetchTimeout:     30 * time.Second,
 		RefCheckInterval: time.Nanosecond, // expire cooldown immediately so incremental can fetch
 	}, nil)
+	prepareIncrementalTestMirrors(ctx, t, cm, mirrorRoot)
 	s, err := git.New(ctx, cfg, newTestScheduler(ctx, t), nil, mux, cm,
 		func() (*githubapp.TokenManager, error) { return nil, nil }, nil) //nolint:nilnil
 	assert.NoError(t, err)
@@ -548,6 +561,7 @@ func newTestStrategyForMirror(ctx context.Context, t *testing.T, mirrorRoot stri
 		FetchTimeout:     30 * time.Second,
 		RefCheckInterval: time.Nanosecond, // expire cooldown immediately so incremental can fetch
 	}, nil)
+	prepareIncrementalTestMirrors(ctx, t, cm, mirrorRoot)
 	s, err := git.New(ctx, cfg, newTestScheduler(ctx, t), nil, mux, cm,
 		func() (*githubapp.TokenManager, error) { return nil, nil }, nil) //nolint:nilnil
 	assert.NoError(t, err)
@@ -569,12 +583,46 @@ func newTestStrategyForMirrorWithRefCheck(ctx context.Context, t *testing.T, mir
 		FetchTimeout:     30 * time.Second,
 		RefCheckInterval: refCheckInterval,
 	}, nil)
+	prepareIncrementalTestMirrors(ctx, t, cm, mirrorRoot)
 	s, err := git.New(ctx, cfg, newTestScheduler(ctx, t), nil, mux, cm,
 		func() (*githubapp.TokenManager, error) { return nil, nil }, nil) //nolint:nilnil
 	assert.NoError(t, err)
 	manager, err := cm()
 	assert.NoError(t, err)
 	return s, manager
+}
+
+// prepareIncrementalTestMirrors restores local test remotes after sanitization so fetches stay hermetic.
+func prepareIncrementalTestMirrors(ctx context.Context, t *testing.T, provider gitclone.ManagerProvider, root string) {
+	t.Helper()
+	manager, err := provider()
+	assert.NoError(t, err)
+	assert.NoError(t, filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() {
+			return nil
+		}
+		if _, err := os.Stat(filepath.Join(path, "HEAD")); os.IsNotExist(err) {
+			return nil
+		}
+		settings := map[string]string{}
+		for _, key := range []string{"remote.origin.url", "remote.origin.uploadpack"} {
+			if output, err := exec.Command("git", "-C", path, "config", "--local", "--get", key).Output(); err == nil {
+				settings[key] = strings.TrimSpace(string(output))
+			}
+		}
+		relative, err := filepath.Rel(root, path)
+		assert.NoError(t, err)
+		_, err = manager.GetOrCreate(ctx, "https://"+filepath.ToSlash(relative))
+		assert.NoError(t, err)
+		for key, value := range settings {
+			output, err := exec.Command("git", "-C", path, "config", "--local", key, value).CombinedOutput()
+			assert.NoError(t, err, string(output))
+		}
+		return filepath.SkipDir
+	}))
 }
 
 func TestEnsureWantsAvailable(t *testing.T) {
@@ -957,30 +1005,36 @@ func TestEnsureWantsAvailable(t *testing.T) {
 		repo, err := manager.GetOrCreate(ctx, fakeUpstreamURL)
 		assert.NoError(t, err)
 
-		// Hold the semaphore so attempt 1 coalesces. Cancel the request
-		// context while waiting; after release, ensureWantsAvailable must
-		// report client_gone (not fallback_fetch_failed / local_error).
 		release := make(chan struct{})
+		acquired := make(chan struct{})
 		holderDone := make(chan error, 1)
 		go func() {
 			holderDone <- repo.WithFetchExclusion(ctx, func() error {
+				close(acquired)
 				<-release
 				return nil
 			})
 		}()
-		time.Sleep(20 * time.Millisecond)
+		<-acquired
 
 		reqCtx, cancel := context.WithCancel(ctx)
+		fetchCtx := &fetchPhaseContext{Context: reqCtx, entered: make(chan struct{})}
 		type result struct {
 			outcome string
 			err     error
 		}
 		done := make(chan result, 1)
 		go func() {
-			outcome, err := git.EnsureWantsAvailable(reqCtx, s, repo, []string{newSHA})
+			outcome, err := git.EnsureWantsAvailable(fetchCtx, s, repo, []string{newSHA})
 			done <- result{outcome, err}
 		}()
-		time.Sleep(20 * time.Millisecond)
+		select {
+		case <-fetchCtx.entered:
+		case <-time.After(5 * time.Second):
+			cancel()
+			close(release)
+			t.Fatal("request did not reach the fetch phase")
+		}
 		cancel()
 		close(release)
 		assert.NoError(t, <-holderDone)
@@ -1948,7 +2002,7 @@ func TestIncrementalDisabledFallsBackViaNotOurRef(t *testing.T) {
 
 	reader := setupMetricsReader(t)
 	s, cachewSrv := setupE2EStrategy(ctx, t, mirrorRoot, git.Config{
-		IncrementalPullthrough:  false, // the old path must be taken
+		IncrementalPullthrough:  false,
 		IncrementalFetchTimeout: 30 * time.Second,
 	})
 	waitForReady(t, s)
@@ -1969,14 +2023,13 @@ func TestIncrementalDisabledFallsBackViaNotOurRef(t *testing.T) {
 	respBody, err := io.ReadAll(resp.Body)
 	assert.NoError(t, err)
 
-	assert.True(t, hits.Load() >= 1, "fake upstream should receive the forwarded POST when incremental is disabled")
-	assert.True(t, strings.Contains(string(respBody), fakeUpstreamMarker),
-		"client should receive the fake upstream marker body")
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Equal(t, int32(0), hits.Load())
+	assert.Contains(t, string(respBody), "PACK")
 
-	// Mirror must NOT contain newSHA: no incremental fetch ran.
 	// #nosec G204 - mirrorPath is a t.TempDir() path and newSHA is rev-parse output from the local upstream
 	catFile := exec.Command("git", "-C", mirrorPath, "cat-file", "-e", newSHA)
-	assert.Error(t, catFile.Run(), "mirror should not contain newSHA when incremental pull-through is disabled")
+	assert.NoError(t, catFile.Run(), "backend retry should fetch the missing commit")
 
 	rm := collectMetrics(ctx, t, reader)
 	assertIncrementalEligible(t, rm, host+"/"+repoPath, true)

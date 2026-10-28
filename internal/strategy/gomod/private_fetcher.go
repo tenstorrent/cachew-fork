@@ -29,6 +29,8 @@ type privateFetcher struct {
 	cloneManager *gitclone.Manager
 }
 
+const privateCloneWaitTimeout = 30 * time.Minute
+
 type moduleInfo struct {
 	Version string `json:"Version"`
 	Time    string `json:"Time"`
@@ -126,29 +128,10 @@ func (p *privateFetcher) ensureReady(ctx context.Context, repo *gitclone.Reposit
 		return nil
 	}
 
-	if err := repo.Clone(ctx); err != nil {
+	if err := repo.CloneWithWaitTimeout(ctx, privateCloneWaitTimeout); err != nil {
 		return errors.Wrap(err, "clone repository")
 	}
-
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
-
-	timeout := time.After(30 * time.Minute) // reasonable timeout for cloning
-
-	for {
-		if repo.State() == gitclone.StateReady {
-			return nil
-		}
-
-		select {
-		case <-ticker.C:
-			// Continue polling
-		case <-timeout:
-			return errors.Errorf("timeout waiting for repository %s to be ready", repo.UpstreamURL())
-		case <-ctx.Done():
-			return errors.Wrap(ctx.Err(), "context cancelled while waiting for clone")
-		}
-	}
+	return nil
 }
 
 func (p *privateFetcher) verifyCommitExists(ctx context.Context, repo *gitclone.Repository, version string) error {
@@ -309,12 +292,17 @@ func (p *privateFetcher) generateZip(ctx context.Context, repo *gitclone.Reposit
 	// We use --no-checkout then checkout the specific ref so that both tagged versions and
 	// raw commit hashes (from pseudo-versions) work; --branch only accepts branch/tag names.
 	// #nosec G204 - repo.Path() and cloneDir are controlled by us
-	cmd := exec.CommandContext(ctx, "git", "clone", "--no-checkout", repo.Path(), cloneDir)
+	cmd := exec.CommandContext(ctx, "git", "-c", "core.hooksPath="+os.DevNull, "clone", "--template=", "--no-checkout", repo.Path(), cloneDir)
+	cmd.Env = append(os.Environ(), "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL="+os.DevNull,
+		"GIT_CONFIG_COUNT=0", "GIT_CONFIG_PARAMETERS=", "GIT_TEMPLATE_DIR=")
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return nil, errors.Wrapf(err, "git clone: %s", string(output))
 	}
-	// #nosec G204 - cloneDir is ours and gitRef cannot be read as an option
-	cmd = exec.CommandContext(ctx, "git", "-C", cloneDir, "checkout", gitRef, "--")
+	// #nosec G204 - cloneDir and gitRef are controlled by us
+	cmd = exec.CommandContext(ctx, "git", "-c", "core.hooksPath="+os.DevNull, "-C", cloneDir, "checkout", gitRef, "--")
+	// Module files can activate host filters, and inherited templates can add hooks that checkout executes.
+	cmd.Env = append(os.Environ(), "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL="+os.DevNull,
+		"GIT_CONFIG_COUNT=0", "GIT_CONFIG_PARAMETERS=", "GIT_TEMPLATE_DIR=")
 	if output, err := cmd.CombinedOutput(); err != nil {
 		return nil, errors.Wrapf(err, "git checkout %s: %s", gitRef, string(output))
 	}

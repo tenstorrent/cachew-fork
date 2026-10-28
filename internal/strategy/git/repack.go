@@ -44,6 +44,9 @@ const (
 )
 
 func (s *Strategy) scheduleRepackJobs(repo *gitclone.Repository) {
+	if _, loaded := s.repackJobsScheduled.LoadOrStore(repo.UpstreamURL(), true); loaded {
+		return
+	}
 	s.scheduler.SubmitPeriodicJob(repo.UpstreamURL(), repackJobID, s.config.RepackInterval, func(ctx context.Context) error {
 		return s.repack(ctx, repo, triggerBackground)
 	})
