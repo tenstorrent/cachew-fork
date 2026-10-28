@@ -71,6 +71,9 @@ func TestReplaceRepositoryLFSConfigDoesNotFollowSymlink(t *testing.T) {
 }
 
 func TestRestoreMirrorSnapshotSanitizesCachedCode(t *testing.T) {
+	globalConfig := filepath.Join(t.TempDir(), "gitconfig")
+	assert.NoError(t, os.WriteFile(globalConfig, []byte("[credential]\n\thelper = cachew-test-global-helper\n"), 0o600))
+	t.Setenv("GIT_CONFIG_GLOBAL", globalConfig)
 	_, ctx, _ := logging.Configure(context.Background(), logging.Config{})
 	upstream := "https://github.com/org/repo"
 	manager, err := gitclone.NewManager(ctx, gitclone.Config{MirrorRoot: t.TempDir()}, nil)
@@ -93,8 +96,11 @@ func TestRestoreMirrorSnapshotSanitizesCachedCode(t *testing.T) {
 
 	_, err = os.Lstat(filepath.Join(repo.Path(), "hooks", "reference-transaction"))
 	assert.True(t, os.IsNotExist(err))
-	cmd := exec.Command("git", "-C", repo.Path(), "config", "--get", "credential.helper")
+	cmd := exec.Command("git", "-C", repo.Path(), "config", "--local", "--get", "credential.helper")
 	assert.Error(t, cmd.Run())
+	inheritedHelper, err := exec.Command("git", "config", "--global", "--get", "credential.helper").Output()
+	assert.NoError(t, err)
+	assert.True(t, string(inheritedHelper) == "cachew-test-global-helper\n", "global helper must remain configured")
 	_, err = os.Lstat(proofPath)
 	assert.True(t, os.IsNotExist(err))
 }

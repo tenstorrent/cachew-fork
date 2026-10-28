@@ -138,6 +138,9 @@ func TestRepoPathFromURLRejectsTraversal(t *testing.T) {
 }
 
 func TestConfigureMirrorSanitizesExecutableMetadata(t *testing.T) {
+	globalConfig := filepath.Join(t.TempDir(), "gitconfig")
+	assert.NoError(t, os.WriteFile(globalConfig, []byte("[credential]\n\thelper = cachew-test-global-helper\n"), 0o600))
+	t.Setenv("GIT_CONFIG_GLOBAL", globalConfig)
 	_, ctx, _ := logging.Configure(t.Context(), logging.Config{Level: "error"})
 	repoPath := createBareRepo(t, t.TempDir())
 	hookPath := filepath.Join(repoPath, "hooks", "reference-transaction")
@@ -158,8 +161,11 @@ func TestConfigureMirrorSanitizesExecutableMetadata(t *testing.T) {
 	assert.True(t, os.IsNotExist(err))
 	_, err = os.Lstat(filepath.Join(repoPath, "commondir"))
 	assert.True(t, os.IsNotExist(err))
-	cmd := exec.Command("git", "-C", repoPath, "config", "--get", "credential.helper")
+	cmd := exec.Command("git", "-C", repoPath, "config", "--local", "--get", "credential.helper")
 	assert.Error(t, cmd.Run())
+	inheritedHelper, err := exec.Command("git", "config", "--global", "--get", "credential.helper").Output()
+	assert.NoError(t, err)
+	assert.True(t, string(inheritedHelper) == "cachew-test-global-helper\n", "global helper must remain configured")
 	output, err := exec.Command("git", "-C", repoPath, "config", "--get", "remote.origin.url").Output()
 	assert.NoError(t, err)
 	assert.Equal(t, "https://github.com/org/repo", strings.TrimSpace(string(output)))
