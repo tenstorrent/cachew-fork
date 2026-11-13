@@ -835,3 +835,28 @@ func TestJobSchedulerCancelPeriodicJobIsSafeWhenAbsent(t *testing.T) {
 	scheduler.CancelPeriodicJob("never-registered", "periodic")
 	assert.False(t, scheduler.QueueActive("never-registered"))
 }
+
+func TestJobSchedulerCloseCancelsRunningJobs(t *testing.T) {
+	_, ctx, _ := logging.Configure(context.Background(), logging.Config{Level: "error"})
+
+	scheduler, err := jobscheduler.New(ctx, jobscheduler.Config{Concurrency: 1})
+	assert.NoError(t, err)
+
+	started := make(chan struct{})
+	cancelled := make(chan struct{})
+	scheduler.Submit("queue", "blocking", func(ctx context.Context) error {
+		close(started)
+		<-ctx.Done()
+		close(cancelled)
+		return nil
+	})
+	<-started
+
+	assert.NoError(t, scheduler.Close())
+
+	select {
+	case <-cancelled:
+	case <-time.After(time.Second):
+		t.Fatal("Close must cancel the context of running jobs")
+	}
+}

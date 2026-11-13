@@ -90,8 +90,8 @@ func bucketName(t *testing.T) string {
 		if !strings.Contains(frame.Function, "s3clienttest") {
 			// frame.Function is e.g. "github.com/tenstorrent/internal-cachew/internal/cache_test.TestS3Cache"
 			fn := strings.TrimPrefix(frame.Function, modulePrefix)
-			if idx := strings.LastIndex(fn, "."); idx >= 0 {
-				pkg = fn[:idx]
+			if before, _, ok := strings.CutLast(fn, "."); ok {
+				pkg = before
 			}
 			break
 		}

@@ -212,7 +212,9 @@ func (q *RootScheduler) Drain() {
 	close(q.drain)
 }
 
+// Close cancels the context running jobs receive and closes the schedule store.
 func (q *RootScheduler) Close() error {
+	q.cancel()
 	if q.store != nil {
 		return errors.WithStack(q.store.Close())
 	}

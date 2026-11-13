@@ -12,6 +12,11 @@ import (
 	"github.com/tenstorrent/internal-cachew/internal/metadatadb"
 )
 
+const (
+	repoA = "repo-a"
+	repoB = "repo-b"
+)
+
 // Suite runs a comprehensive test suite against a metadatadb.Backend implementation.
 // The factory must return n backends that share the same underlying storage.
 func Suite(t *testing.T, newBackends func(t *testing.T, n int) []metadatadb.Backend) {
@@ -261,15 +266,15 @@ func testIntMap(t *testing.T, backend metadatadb.Backend) {
 	ns := namespace(t, s, "test")
 	m := metadatadb.NewIntMap[string](ns, "clones")
 
-	assert.Equal(t, int64(0), m.Get("repo-a"))
+	assert.Equal(t, int64(0), m.Get(repoA))
 
-	assert.NoError(t, m.Set("repo-a", 10))
-	assert.NoError(t, m.Set("repo-b", 20))
+	assert.NoError(t, m.Set(repoA, 10))
+	assert.NoError(t, m.Set(repoB, 20))
 
-	assert.Equal(t, map[string]int64{"repo-a": 10, "repo-b": 20}, m.Entries())
+	assert.Equal(t, map[string]int64{repoA: 10, repoB: 20}, m.Entries())
 
-	assert.NoError(t, m.Delete("repo-a"))
-	assert.Equal(t, map[string]int64{"repo-b": 20}, m.Entries())
+	assert.NoError(t, m.Delete(repoA))
+	assert.Equal(t, map[string]int64{repoB: 20}, m.Entries())
 }
 
 func testIntMapIncr(t *testing.T, backend metadatadb.Backend) {
@@ -277,12 +282,12 @@ func testIntMapIncr(t *testing.T, backend metadatadb.Backend) {
 	ns := namespace(t, s, "test")
 	m := metadatadb.NewIntMap[string](ns, "histogram")
 
-	assert.NoError(t, m.Add("repo-a", 1))
-	assert.NoError(t, m.Add("repo-a", 1))
-	assert.NoError(t, m.Add("repo-b", 5))
-	assert.NoError(t, m.Add("repo-a", 3))
+	assert.NoError(t, m.Add(repoA, 1))
+	assert.NoError(t, m.Add(repoA, 1))
+	assert.NoError(t, m.Add(repoB, 5))
+	assert.NoError(t, m.Add(repoA, 3))
 
-	assert.Equal(t, map[string]int64{"repo-a": 5, "repo-b": 5}, m.Entries())
+	assert.Equal(t, map[string]int64{repoA: 5, repoB: 5}, m.Entries())
 }
 
 func testList(t *testing.T, backend metadatadb.Backend) {
@@ -374,8 +379,8 @@ func testFlushRoundTrip(t *testing.T, backend metadatadb.Backend) {
 	m := metadatadb.NewMap[string, int](ns, "ports")
 	assert.NoError(t, m.Set("http", 80))
 	im := metadatadb.NewIntMap[string](ns, "clones")
-	assert.NoError(t, im.Add("repo-a", 3))
-	assert.NoError(t, im.Add("repo-b", 7))
+	assert.NoError(t, im.Add(repoA, 3))
+	assert.NoError(t, im.Add(repoB, 7))
 	l := metadatadb.NewList[string](ns, "log")
 	assert.NoError(t, l.Append("entry1"))
 	assert.NoError(t, l.Append("entry2"))
@@ -398,7 +403,7 @@ func testFlushRoundTrip(t *testing.T, backend metadatadb.Backend) {
 	assert.Equal(t, int64(15), metadatadb.NewInt(ns2, "counter").Get())
 	assert.Equal(t, []string{"a", "b"}, metadatadb.NewSet[string](ns2, "tags").Members())
 	assert.Equal(t, map[string]int{"http": 80}, metadatadb.NewMap[string, int](ns2, "ports").Entries())
-	assert.Equal(t, map[string]int64{"repo-a": 3, "repo-b": 7}, metadatadb.NewIntMap[string](ns2, "clones").Entries())
+	assert.Equal(t, map[string]int64{repoA: 3, repoB: 7}, metadatadb.NewIntMap[string](ns2, "clones").Entries())
 	assert.Equal(t, []string{"entry1", "entry2"}, metadatadb.NewList[string](ns2, "log").Entries())
 }
 

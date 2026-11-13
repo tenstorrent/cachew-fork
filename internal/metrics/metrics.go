@@ -211,7 +211,7 @@ func (c *Client) ServeMetrics(ctx context.Context, authorize func(http.Handler) 
 
 	go func() {
 		<-ctx.Done()
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		defer cancel()
 		if err := server.Shutdown(shutdownCtx); err != nil {
 			logger.ErrorContext(shutdownCtx, "Metrics server shutdown error", "error", err)

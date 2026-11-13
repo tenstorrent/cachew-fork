@@ -214,14 +214,26 @@ func reconcileOrphanedFiles(ctx context.Context, root string, db *diskMetaDB) (i
 		return 0, errors.Errorf("failed to walk metadata for orphan reconciliation: %w", err)
 	}
 
+	cacheRoot, err := os.OpenRoot(root)
+	if err != nil {
+		return 0, errors.Errorf("failed to open cache root: %w", err)
+	}
+	defer cacheRoot.Close()
+
 	var size, orphanedBytes int64
 	var orphanedFiles, tempFiles, unrecognised int
-	err := filepath.Walk(root, func(path string, info fs.FileInfo, err error) error {
+	err = filepath.Walk(root, func(path string, info fs.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
 		if info.IsDir() || path == filepath.Join(root, metaDBFileName) {
 			return nil
+		}
+		// Removing through the root keeps a path swapped for a symlink mid-walk
+		// from deleting anything outside the cache.
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return errors.Errorf("failed to relativise %s: %w", path, err)
 		}
 
 		// The prefix alone is not enough: [Disk.Create] only ever opens a temp
@@ -229,7 +241,7 @@ func reconcileOrphanedFiles(ctx context.Context, root string, db *diskMetaDB) (i
 		// ".tmp-" file anywhere else was written by something other than this
 		// cache and falls through to the unrecognised path below.
 		if strings.HasPrefix(info.Name(), diskTempPrefix) && inEntryShardDir(root, path) {
-			if removeErr := os.Remove(path); removeErr != nil {
+			if removeErr := cacheRoot.Remove(rel); removeErr != nil {
 				return errors.Errorf("failed to remove abandoned temp file %s: %w", path, removeErr)
 			}
 			tempFiles++
@@ -250,7 +262,7 @@ func reconcileOrphanedFiles(ctx context.Context, root string, db *diskMetaDB) (i
 			return nil
 		}
 
-		if removeErr := os.Remove(path); removeErr != nil {
+		if removeErr := cacheRoot.Remove(rel); removeErr != nil {
 			return errors.Errorf("failed to remove orphaned cache file %s: %w", path, removeErr)
 		}
 		orphanedFiles++

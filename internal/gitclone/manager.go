@@ -607,6 +607,13 @@ func (m *Manager) evictAt(ctx context.Context, repo *Repository, cutoff time.Tim
 }
 
 func (m *Manager) DiscoverExisting(ctx context.Context) ([]*Repository, error) {
+	// Removing through the root keeps a temp dir swapped for a symlink mid-walk
+	// from deleting anything outside the mirror root.
+	mirrorRoot, err := os.OpenRoot(m.config.MirrorRoot)
+	if err != nil {
+		return nil, errors.Wrap(err, "open mirror root")
+	}
+	defer mirrorRoot.Close()
 	var discovered []*Repository
 	var upstreamURLs []string
 	seededAt := time.Now()
@@ -621,7 +628,11 @@ func (m *Manager) DiscoverExisting(ctx context.Context) ([]*Repository, error) {
 
 		if strings.HasPrefix(info.Name(), cloneTempPrefix) {
 			logging.FromContext(ctx).InfoContext(ctx, "Removing leftover clone temp dir", "path", path)
-			if rmErr := os.RemoveAll(path); rmErr != nil {
+			rel, relErr := filepath.Rel(m.config.MirrorRoot, path)
+			if relErr != nil {
+				return errors.Wrapf(relErr, "relativise leftover clone temp dir %s", path)
+			}
+			if rmErr := mirrorRoot.RemoveAll(rel); rmErr != nil {
 				return errors.Wrapf(rmErr, "remove leftover clone temp dir %s", path)
 			}
 			return fs.SkipDir
@@ -1071,21 +1082,22 @@ func (r *Repository) CloneClaimed(ctx context.Context) error {
 // mirrorConfigSettings returns git config key-value pairs applied to mirror
 // clones to optimise upload-pack serving performance.
 func mirrorConfigSettings(packThreads int) [][2]string {
+	const enabled = "true"
 	return [][2]string{
 		// Protocol
 		{"protocol.version", "2"},
-		{"uploadpack.allowFilter", "true"},
-		{"uploadpack.allowAnySHA1InWant", "true"},
+		{"uploadpack.allowFilter", enabled},
+		{"uploadpack.allowAnySHA1InWant", enabled},
 		// Bitmaps
-		{"repack.writeBitmaps", "true"},
-		{"pack.useBitmaps", "true"},
-		{"pack.useBitmapBoundaryTraversal", "true"},
+		{"repack.writeBitmaps", enabled},
+		{"pack.useBitmaps", enabled},
+		{"pack.useBitmapBoundaryTraversal", enabled},
 		// Commit graph
-		{"core.commitGraph", "true"},
-		{"gc.writeCommitGraph", "true"},
-		{"fetch.writeCommitGraph", "true"},
+		{"core.commitGraph", enabled},
+		{"gc.writeCommitGraph", enabled},
+		{"fetch.writeCommitGraph", enabled},
 		// Multi-pack-index
-		{"core.multiPackIndex", "true"},
+		{"core.multiPackIndex", enabled},
 		// Keep fetched objects as packs
 		{"transfer.unpackLimit", "1"},
 		{"fetch.unpackLimit", "1"},

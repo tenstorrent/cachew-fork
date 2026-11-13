@@ -221,7 +221,7 @@ func (n *namespace) seed(ctx context.Context) error {
 	if err != nil {
 		return errors.Wrap(err, "marshal rollup")
 	}
-	opts := minio.PutObjectOptions{ContentType: "application/json"}
+	opts := minio.PutObjectOptions{ContentType: jsonContentType}
 	opts.SetMatchETagExcept("*")
 	info, err := n.b.client.PutObject(ctx, n.b.bucket, n.rollupKey(),
 		bytes.NewReader(data), int64(len(data)), opts)

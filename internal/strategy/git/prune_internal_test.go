@@ -89,7 +89,7 @@ func TestFirstPruneDelayStaggersMirrors(t *testing.T) {
 		"the same mirror must land in the same slot across restarts")
 	assert.True(t, first >= 0 && first < interval, "delay %s should fall inside the interval", first)
 
-	slots := map[time.Duration]struct{}{}
+	slots := make(map[time.Duration]struct{})
 	for _, upstream := range []string{
 		"github.com/org/a", "github.com/org/b", "github.com/org/c",
 		"github.com/org/d", "github.com/org/e",

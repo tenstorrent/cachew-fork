@@ -319,14 +319,7 @@ func New(
 		logger.InfoContext(warmCtx, "Git strategy ready")
 	}()
 
-	s.proxy = &httputil.ReverseProxy{
-		Director:  s.directUpstream,
-		Transport: transport,
-		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-			logging.FromContext(r.Context()).ErrorContext(r.Context(), "Upstream request failed", "error", err)
-			w.WriteHeader(http.StatusBadGateway)
-		},
-	}
+	s.proxy = s.newUpstreamProxy(transport)
 
 	mux.Handle("GET /git/{host}/{path...}", http.HandlerFunc(s.handleRequest))
 	mux.Handle("POST /git/{host}/{path...}", http.HandlerFunc(s.handleRequest))

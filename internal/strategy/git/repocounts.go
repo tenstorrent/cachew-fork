@@ -224,12 +224,12 @@ func repoCountsKey(upstreamURL string, now time.Time) string {
 }
 
 func splitRepoCountsKey(k string) (repo string, day time.Time, ok bool) {
-	idx := strings.LastIndex(k, repoCountsKeySeparator)
-	if idx < 0 {
+	before, after, ok := strings.CutLast(k, repoCountsKeySeparator)
+	if !ok {
 		return "", time.Time{}, false
 	}
-	repo = k[:idx]
-	dateStr := k[idx+1:]
+	repo = before
+	dateStr := after
 	if repo == "" || dateStr == "" {
 		return "", time.Time{}, false
 	}

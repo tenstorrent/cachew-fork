@@ -129,7 +129,7 @@ func (s *Strategy) cloneForSnapshot(ctx context.Context, repo *gitclone.Reposito
 			args = append(args, "--no-local", "--filter="+filter)
 		}
 		args = append(args, repo.Path(), destDir)
-		// #nosec G204 - repo.Path() and destDir are controlled by us
+		// #nosec G204 G702 - repo.Path() and destDir are controlled by us
 		cmd := exec.CommandContext(ctx, "git", args...)
 		// Repository files choose checkout filters, while inherited templates can add hooks that run and leak into snapshots.
 		// LC_ALL=C pins git's messages to English so the filter fallback
@@ -154,7 +154,7 @@ func (s *Strategy) cloneForSnapshot(ctx context.Context, repo *gitclone.Reposito
 		// git clone from a local path sets remote.origin.url to that path; restore
 		// it to the upstream URL. Clients use insteadOf to route through cachew, so
 		// embedding the cachew URL here would couple snapshots to a specific instance.
-		// #nosec G204 - upstreamURL is derived from controlled inputs
+		// #nosec G204 G702 - upstreamURL is derived from controlled inputs
 		cmd = exec.CommandContext(ctx, "git", "-C", destDir, "remote", "set-url", "origin", repo.UpstreamURL())
 		if output, err = cmd.CombinedOutput(); err != nil {
 			return errors.Wrapf(err, "fix snapshot remote URL: %s", string(output))
@@ -1585,7 +1585,7 @@ func (s *Strategy) generateAndUploadLFSSnapshot(ctx context.Context, repo *gitcl
 
 		// Set up LFS in the snapshot clone. cloneForSnapshot already restores
 		// remote.origin.url to the upstream URL, so LFS will fetch from GitHub.
-		// #nosec G204
+		// #nosec G204 G702 - workDir is derived from a validated upstream URL
 		if output, err := exec.CommandContext(ctx, "git", "-C", workDir,
 			"lfs", "install", "--local").CombinedOutput(); err != nil {
 			logger.WarnContext(ctx, "git lfs install --local failed (non-fatal)", "upstream", upstream, "error", err,

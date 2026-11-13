@@ -242,8 +242,8 @@ func Load(
 	// Wrap the mux with interceptors. The last-registered interceptor runs
 	// outermost so that registration order matches interception order.
 	var h http.Handler = mux
-	for i := len(interceptors) - 1; i >= 0; i-- {
-		h = interceptors[i].Intercept(h)
+	for _, interceptor := range slices.Backward(interceptors) {
+		h = interceptor.Intercept(h)
 	}
 	return h, readiers, nil
 }
