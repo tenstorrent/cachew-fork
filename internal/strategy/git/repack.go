@@ -41,6 +41,9 @@ const (
 const (
 	triggerBackground = "background"
 	triggerStartup    = "startup"
+	// triggerRequest marks work done inline for a client request, such as the
+	// commit-graph repair a serve failure triggers.
+	triggerRequest = "request"
 )
 
 func (s *Strategy) scheduleRepackJobs(repo *gitclone.Repository) {

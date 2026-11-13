@@ -135,6 +135,7 @@ type Strategy struct {
 	deferredRestoreOnce       sync.Map                                              // keyed by upstream URL, ensures at most one deferred restore per repo
 	forcedFetches             sync.Map                                              // keyed by upstream URL, ensures at most one cooldown-bypassing fetch is queued per repo
 	pendingStartupMaintenance sync.Map                                              // keyed by upstream URL, present while a startup-maintenance pass is queued but not yet started
+	commitGraphRepairs        sync.Map                                              // keyed by upstream URL, ensures at most one inline commit-graph repair runs per repo
 	bundleBuilds              sync.Map
 	snapshotJobsScheduled     sync.Map
 	repackJobsScheduled       sync.Map
@@ -749,7 +750,6 @@ func (s *Strategy) serveReadyRepo(w http.ResponseWriter, r *http.Request, repo *
 	// Started at handler entry so the incremental duration metric covers the whole
 	// latency this handler adds on the request path.
 	incrementalStart := time.Now()
-	logger := logging.FromContext(ctx)
 
 	if handled, err := s.handleRefDiscovery(w, r, repo, host, pathValue, isInfoRefs); handled || err != nil {
 		return err
@@ -824,35 +824,66 @@ func (s *Strategy) serveReadyRepo(w http.ResponseWriter, r *http.Request, repo *
 		}
 	}
 
-	if !s.serveFromBackend(w, r, repo) {
-		if incrementalOutcome != "" {
-			recordIncremental(incrementalOutcome)
-		}
-		return nil
+	fallback := s.serveFromBackend(w, r, repo)
+	served := fallback == backendServed || s.serveAfterBackendRepair(w, r, repo, fallback, pathValue, bodyBytes)
+	if outcome := incrementalOutcomeAfterServe(incrementalOutcome, fallback, served); outcome != "" {
+		recordIncremental(outcome)
 	}
+	if !served {
+		s.forwardWithBody(w, r, host, pathValue, bodyBytes)
+	}
+	return nil
+}
+
+// serveAfterBackendRepair repairs the mirror for the reason the local serve fell
+// back, then re-serves from it. It reports whether the response reached the
+// client; false means the caller must forward upstream.
+func (s *Strategy) serveAfterBackendRepair(w http.ResponseWriter, r *http.Request, repo *gitclone.Repository,
+	fallback backendFallback, pathValue string, bodyBytes []byte) bool {
+	ctx := r.Context()
+	logger := logging.FromContext(ctx)
+
+	// A stale commit-graph is an index fault rather than a missing object, so
+	// fetching cannot fix it: the fetch leaves the graph naming the commits the
+	// prune deleted. Rewrite the graph and re-serve before falling back, since a
+	// full upstream passthrough would otherwise be paid on every request until
+	// something else happened to rewrite the graph.
+	if fallback == backendStaleCommitGraph {
+		if err := s.rewriteCommitGraph(ctx, repo); err != nil {
+			logger.WarnContext(ctx, "Commit-graph rewrite after serve failure failed, forwarding to upstream",
+				"upstream", repo.UpstreamURL(), "error", err)
+			return false
+		}
+		if s.reserveFromBackend(w, r, repo, bodyBytes) {
+			logger.InfoContext(ctx, "Served from mirror after rewriting stale commit-graph", "path", pathValue)
+			return true
+		}
+		logger.WarnContext(ctx, "Serve still failed after rewriting commit-graph, forwarding to upstream",
+			"upstream", repo.UpstreamURL(), "path", pathValue)
+		return false
+	}
+
 	// The missing object is usually a commit the stale mirror has not fetched
 	// yet; fetching is far cheaper than proxying the whole pack from upstream.
 	if _, err := s.doFetchReporting(ctx, repo); err != nil {
 		logger.WarnContext(ctx, "Fetch after 'not our ref' failed, forwarding to upstream", "upstream", repo.UpstreamURL(),
 			"error", err)
-	} else {
-		if bodyBytes != nil {
-			replayRequestBody(r, bodyBytes)
-		}
-		if !s.serveFromBackend(w, r, repo) {
-			logger.InfoContext(ctx, "Served from mirror after fetching object missing for 'not our ref'", "path", pathValue)
-			if incrementalOutcome != "" {
-				recordIncremental(incrementalFetched)
-			}
-			return nil
-		}
-	}
-	if incrementalOutcome != "" {
-		recordIncremental(incrementalOutcomeAfterNotOurRef(incrementalOutcome))
+	} else if s.reserveFromBackend(w, r, repo, bodyBytes) {
+		logger.InfoContext(ctx, "Served from mirror after fetching object missing for 'not our ref'", "path", pathValue)
+		return true
 	}
 	logger.InfoContext(ctx, "Falling back to upstream due to 'not our ref'", "path", pathValue)
-	s.forwardWithBody(w, r, host, pathValue, bodyBytes)
-	return nil
+	return false
+}
+
+// reserveFromBackend replays the buffered request body and serves from the
+// mirror again, reporting whether the response reached the client.
+func (s *Strategy) reserveFromBackend(w http.ResponseWriter, r *http.Request, repo *gitclone.Repository,
+	bodyBytes []byte) bool {
+	if bodyBytes != nil {
+		replayRequestBody(r, bodyBytes)
+	}
+	return s.serveFromBackend(w, r, repo) == backendServed
 }
 
 func bufferRequestBody(r *http.Request) ([]byte, error) {

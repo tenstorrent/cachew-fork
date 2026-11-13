@@ -1812,6 +1812,12 @@ func (r *Repository) PruneUnreachable(ctx context.Context) (int64, error) {
 		if err := r.packRefs(pruneCtx); err != nil {
 			return err
 		}
+		// Inside the same exclusion that just deleted the objects: the graph has
+		// to be rebuilt after the objects go, and doing it here leaves no window
+		// where a concurrent read can see the graph naming what the prune removed.
+		if err := r.rewriteCommitGraphLocked(pruneCtx); err != nil {
+			return err
+		}
 
 		if before > 0 {
 			if after, afterErr := dirSizeBytes(r.path); afterErr == nil {
@@ -1824,6 +1830,36 @@ func (r *Repository) PruneUnreachable(ctx context.Context) (int64, error) {
 		return 0, err
 	}
 	return reclaimed, nil
+}
+
+// RewriteCommitGraph rewrites the mirror's commit-graph from the commits still
+// reachable from refs, which drops any commit whose object a prune has since
+// deleted.
+//
+// A commit-graph is a separate index that names commits by OID without holding
+// them. Prune deletes unreachable objects, so a commit-graph written before the
+// prune keeps naming commits that no longer exist, and any later read that
+// consults it fails with "Could not read <oid>" / "unable to parse commit
+// <oid>". The mirror enables core.commitGraph, so it is the index rather than
+// the object store that has to be rebuilt. --reachable is what makes this a
+// repair: the rewritten graph covers only the object set prune left behind, so
+// the dangling entries disappear.
+//
+// Not a full gc: repacking and re-expiring the object store is the prune job's
+// work, and this only has to make the index agree with it.
+//
+// Runs under the fetch exclusion because it renames commit-graph-chain and its
+// graph files, which a concurrent fetch may be writing.
+func (r *Repository) RewriteCommitGraph(ctx context.Context) error {
+	return r.WithFetchExclusion(ctx, func() error {
+		return r.rewriteCommitGraphLocked(ctx)
+	})
+}
+
+// rewriteCommitGraphLocked rewrites the commit-graph. The caller must already
+// hold the fetch exclusion.
+func (r *Repository) rewriteCommitGraphLocked(ctx context.Context) error {
+	return r.runGit(ctx, "commit-graph", "write", "--reachable", "--split=replace")
 }
 
 // cruftExpireDue reports whether this prune is the one that expires unreachable

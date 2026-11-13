@@ -16,6 +16,10 @@ import (
 
 func IsGitRequest(pathValue string) bool { return isGitRequest(pathValue) }
 
+// IsStaleCommitGraphError exposes the stderr matcher so tests can pin the exact
+// wording git emits for a commit-graph naming a pruned commit.
+func IsStaleCommitGraphError(stderr string) bool { return isStaleCommitGraphError(stderr) }
+
 // SetServiceToken installs a stand-in for cachew's own GitHub App credentials,
 // so tests can observe which upstream requests they are attached to without a
 // real GitHub App.
@@ -31,6 +35,16 @@ func (s *Strategy) GenerateAndUploadSnapshot(ctx context.Context, repo *gitclone
 func (s *Strategy) GenerateAndUploadMirrorSnapshot(ctx context.Context, repo *gitclone.Repository) error {
 	_, err := s.generateAndUploadMirrorSnapshot(ctx, repo)
 	return err
+}
+
+// SnapshotExcludePatterns exposes the mirror snapshot exclusions so tests can
+// assert which derived state is kept out of a tarball.
+func SnapshotExcludePatterns(gitDir string) []string { return snapshotExcludePatterns(gitDir) }
+
+// PruneJob runs the prune job (including the commit-graph repair it performs) so
+// tests can assert what a scheduled prune leaves behind.
+func (s *Strategy) PruneJob(ctx context.Context, repo *gitclone.Repository) error {
+	return s.prune(ctx, repo, triggerBackground)
 }
 
 // RunCoordinatedSnapshot exports the coordinated base-snapshot job for tests.
@@ -74,11 +88,6 @@ func SubmitFetchForce(s *Strategy, repo *gitclone.Repository) { s.submitFetchFor
 // EnsureWantsAvailable exports ensureWantsAvailable for testing.
 func EnsureWantsAvailable(ctx context.Context, s *Strategy, repo *gitclone.Repository, wants []string) (string, error) {
 	return s.ensureWantsAvailable(ctx, repo, wants)
-}
-
-// IncrementalOutcomeAfterNotOurRef exports incrementalOutcomeAfterNotOurRef for testing.
-func IncrementalOutcomeAfterNotOurRef(outcome string) string {
-	return incrementalOutcomeAfterNotOurRef(outcome)
 }
 
 // MirrorPreparationScheduled lets tests check for a queued or active preparation job.

@@ -35,6 +35,12 @@ const (
 	// full upstream passthrough. A separate outcome keeps those passthroughs out
 	// of the local_hit/fetched success counts.
 	incrementalFallbackNotOurRef = "fallback_not_our_ref"
+	// fallback_stale_commit_graph means the mirror's commit-graph indexed commits
+	// the object store no longer had, so the request could only be served after a
+	// graph rewrite or by falling back upstream. Kept apart from the other
+	// fallbacks because it is a mirror-integrity fault rather than an upstream
+	// condition, and its rate is what says whether the repair is keeping up.
+	incrementalFallbackStaleCommitGraph = "fallback_stale_commit_graph"
 )
 
 // classifyMissingErr maps a MissingObjects failure to an incremental outcome: a
@@ -212,11 +218,24 @@ func (s *Strategy) ensureWantsAvailable(ctx context.Context, repo *gitclone.Repo
 	return incrementalFetched, nil
 }
 
-// incrementalOutcomeAfterNotOurRef reclassifies a successful incremental outcome
-// when the local backend still reports "not our ref"/"unknown ref".
-func incrementalOutcomeAfterNotOurRef(incrementalOutcome string) string {
-	if incrementalOutcome != "" {
+// incrementalOutcomeAfterServe reclassifies an incremental outcome once the
+// local serve's result is known. Empty means incremental did not run.
+//
+// A commit-graph rewrite fetches nothing, so when it lets the mirror serve, the
+// original outcome still says how the wants became available. After "not our
+// ref" only a fetch makes the mirror serve. A request that still ends upstream
+// must not count as a local_hit or fetched success.
+func incrementalOutcomeAfterServe(outcome string, fallback backendFallback, served bool) string {
+	switch {
+	case outcome == "":
+		return ""
+	case fallback == backendServed, fallback == backendStaleCommitGraph && served:
+		return outcome
+	case fallback == backendStaleCommitGraph:
+		return incrementalFallbackStaleCommitGraph
+	case served:
+		return incrementalFetched
+	default:
 		return incrementalFallbackNotOurRef
 	}
-	return ""
 }
