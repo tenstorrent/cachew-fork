@@ -7,6 +7,12 @@ block-test.hcl
 
 .env
 
+graphify-out/
+
+*~
+*.tmp
+*.orig
+
 .claude/
 
 # Binaries
