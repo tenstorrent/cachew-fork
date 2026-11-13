@@ -13,6 +13,7 @@ import (
 	"github.com/tenstorrent/internal-cachew/internal/httputil"
 	"github.com/tenstorrent/internal-cachew/internal/logging"
 	"github.com/tenstorrent/internal-cachew/internal/strategy/handler"
+	"github.com/tenstorrent/internal-cachew/internal/transfer"
 )
 
 // RegisterHTTPProxy registers a caching HTTP proxy strategy. It intercepts
@@ -52,7 +53,7 @@ var (
 
 func NewHTTPProxy(ctx context.Context, c cache.Cache, _ Mux) (*HTTPProxy, error) {
 	logger := logging.FromContext(ctx)
-	client := &http.Client{}
+	client := transfer.NewClient("proxy")
 	p := &HTTPProxy{logger: logger}
 
 	p.handler = handler.New(client, c).

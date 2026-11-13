@@ -37,6 +37,7 @@ import (
 	"github.com/tenstorrent/internal-cachew/internal/repoauthz"
 	"github.com/tenstorrent/internal-cachew/internal/snapshot"
 	"github.com/tenstorrent/internal-cachew/internal/strategy"
+	"github.com/tenstorrent/internal-cachew/internal/transfer"
 )
 
 //nolint:gochecknoglobals // OTel tracer instances are package-scoped by convention
@@ -251,7 +252,7 @@ func New(
 	// module proxy is probed for visibility once, not once per entry point.
 	transport := newSwappableTransport(clonedDefaultTransport())
 	if authz == nil {
-		authz = repoauthz.NewAuthorizer(&http.Client{Transport: transport}, 0)
+		authz = repoauthz.NewAuthorizer(&http.Client{Transport: transfer.NewTransport(transport, "git")}, 0)
 	}
 
 	s := &Strategy{

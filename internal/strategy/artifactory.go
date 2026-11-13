@@ -13,6 +13,7 @@ import (
 	"github.com/tenstorrent/internal-cachew/internal/cache"
 	"github.com/tenstorrent/internal-cachew/internal/logging"
 	"github.com/tenstorrent/internal-cachew/internal/strategy/handler"
+	"github.com/tenstorrent/internal-cachew/internal/transfer"
 )
 
 func RegisterArtifactory(r *Registry) {
@@ -62,7 +63,7 @@ func NewArtifactory(ctx context.Context, config ArtifactoryConfig, cache cache.C
 	a := &Artifactory{
 		target: u,
 		cache:  cache,
-		client: &http.Client{},
+		client: transfer.NewClient("artifactory"),
 		logger: logging.FromContext(ctx),
 	}
 
