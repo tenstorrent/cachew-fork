@@ -1,6 +1,7 @@
 package gitclone
 
 import (
+	"bytes"
 	"context"
 	"io/fs"
 	"maps"
@@ -49,6 +50,11 @@ const (
 	// unset, and the base of the background fetch backoff.
 	DefaultFetchInterval = 15 * time.Minute
 
+	// DefaultFetchLowSpeedLimit and DefaultFetchLowSpeedTime apply when the
+	// matching Config fields are unset.
+	DefaultFetchLowSpeedLimit = 200 * 1024
+	DefaultFetchLowSpeedTime  = 60 * time.Second
+
 	// MaxFetchBackoff caps the backoff between failed background fetches. An
 	// hour is long enough that a permanently broken mirror (deleted upstream,
 	// revoked credentials) costs almost nothing, while still recovering
@@ -70,32 +76,30 @@ func (s State) String() string {
 }
 
 type GitTuningConfig struct {
-	PostBuffer    int           // http.postBuffer size in bytes
-	LowSpeedLimit int           // http.lowSpeedLimit in bytes/sec
-	LowSpeedTime  time.Duration // http.lowSpeedTime
+	PostBuffer int // http.postBuffer size in bytes
 }
 
 func DefaultGitTuningConfig() GitTuningConfig {
 	return GitTuningConfig{
-		PostBuffer:    524288000, // 500MB buffer
-		LowSpeedLimit: 1000,      // 1KB/s minimum speed
-		LowSpeedTime:  60 * time.Second,
+		PostBuffer: 524288000, // 500MB buffer
 	}
 }
 
 type Config struct {
-	MirrorRoot       string        `hcl:"mirror-root,optional" help:"Directory to store git clones." default:"${CACHEW_STATE}/git-mirrors"`
-	FetchInterval    time.Duration `hcl:"fetch-interval,optional" help:"How often to fetch from upstream in minutes." default:"15m"`
-	RefCheckInterval time.Duration `hcl:"ref-check-interval,optional" help:"How long to cache ref checks." default:"10s"`
-	Maintenance      bool          `hcl:"maintenance,optional" help:"Enable git maintenance scheduling for mirror repos. Its tasks run outside this process and take the same locks the git commands here do, so enabling it also gives up the cleanup of locks left by a killed command." default:"false"`
-	PackThreads      int           `hcl:"pack-threads,optional" help:"Threads for git pack operations (0 = all CPU cores)." default:"0"`
-	CloneTimeout     time.Duration `hcl:"clone-timeout,optional" help:"Upper bound for 'git clone --mirror'. Generous by default since large repos can take 30+ minutes." default:"1h"`
-	FetchTimeout     time.Duration `hcl:"fetch-timeout,optional" help:"Upper bound for 'git fetch' so a slow upstream cannot block the fetch path indefinitely." default:"5m"`
-	LsRemoteTimeout  time.Duration `hcl:"ls-remote-timeout,optional" help:"Upper bound for 'git ls-remote' so a slow upstream cannot block the request path indefinitely." default:"1m"`
-	RepackTimeout    time.Duration `hcl:"repack-timeout,optional" help:"Upper bound for 'git repack' so a slow repack on a large repository cannot block the scheduler queue indefinitely." default:"10m"`
-	PruneTimeout     time.Duration `hcl:"prune-timeout,optional" help:"Upper bound for the pruning repack, which rewrites every pack and so takes much longer than the geometric repack that repack-timeout bounds." default:"1h"`
-	PruneGrace       time.Duration `hcl:"prune-grace,optional" help:"How long an unreachable object is kept before the pruning repack deletes it, measured from when the object was last packed rather than from when it stopped being reachable, since that is the only date git records. The first prune to see it unreachable moves it into a cruft pack and a later prune deletes it once the window has elapsed, which keeps a force-push from dropping an object a client is still mid-transfer on: upload-pack serves the mirror without a lock. An object written before the window and orphaned inside it is reclaimed immediately. 0 deletes every unreachable object on the first prune that sees it." default:"24h"`
-	MaxCruftSizeMB   int           `hcl:"max-cruft-size-mb,optional" help:"Largest cruft pack the pruning repack will write, in megabytes. Above this git splits the unreachable objects across several cruft packs, which bounds the size of any one pack and of the memory the write needs. On its own it does not bound the work a prune does: because every prune expires objects, git still reads and rewrites every existing cruft pack on every run, so by itself this is not an I/O bound on a large unreachable set. Setting prune-expire-interval as well makes most prunes skip the expiration, which is what lets git leave the cruft packs that have reached this size alone. Requires git 2.43 or newer, which added --max-cruft-size; older git fails the prune. 0 writes a single cruft pack." default:"0"`
+	MirrorRoot         string        `hcl:"mirror-root,optional" help:"Directory to store git clones." default:"${CACHEW_STATE}/git-mirrors"`
+	FetchInterval      time.Duration `hcl:"fetch-interval,optional" help:"How often to fetch from upstream in minutes." default:"15m"`
+	RefCheckInterval   time.Duration `hcl:"ref-check-interval,optional" help:"How long to cache ref checks." default:"10s"`
+	Maintenance        bool          `hcl:"maintenance,optional" help:"Enable git maintenance scheduling for mirror repos. Its tasks run outside this process and take the same locks the git commands here do, so enabling it also gives up the cleanup of locks left by a killed command." default:"false"`
+	PackThreads        int           `hcl:"pack-threads,optional" help:"Threads for git pack operations (0 = all CPU cores)." default:"0"`
+	CloneTimeout       time.Duration `hcl:"clone-timeout,optional" help:"Upper bound for 'git clone --mirror'. Generous by default since large repos can take 30+ minutes." default:"1h"`
+	FetchTimeout       time.Duration `hcl:"fetch-timeout,optional" help:"Upper bound for 'git fetch' so a slow upstream cannot block the fetch path indefinitely." default:"5m"`
+	FetchLowSpeedLimit int           `hcl:"fetch-low-speed-limit,optional" help:"Minimum transfer rate, in bytes per second, for a routine 'git fetch'. A fetch slower than this for fetch-low-speed-time is aborted and retried on a new connection, which can be routed over a faster link, until fetch-timeout runs out. Initial clones and post-restore catch-up fetches are not checked." default:"204800"`
+	FetchLowSpeedTime  time.Duration `hcl:"fetch-low-speed-time,optional" help:"How long a routine 'git fetch' may stay below fetch-low-speed-limit before it is aborted and retried. Whole seconds; at least 1s." default:"60s"`
+	LsRemoteTimeout    time.Duration `hcl:"ls-remote-timeout,optional" help:"Upper bound for 'git ls-remote' so a slow upstream cannot block the request path indefinitely." default:"1m"`
+	RepackTimeout      time.Duration `hcl:"repack-timeout,optional" help:"Upper bound for 'git repack' so a slow repack on a large repository cannot block the scheduler queue indefinitely." default:"10m"`
+	PruneTimeout       time.Duration `hcl:"prune-timeout,optional" help:"Upper bound for the pruning repack, which rewrites every pack and so takes much longer than the geometric repack that repack-timeout bounds." default:"1h"`
+	PruneGrace         time.Duration `hcl:"prune-grace,optional" help:"How long an unreachable object is kept before the pruning repack deletes it, measured from when the object was last packed rather than from when it stopped being reachable, since that is the only date git records. The first prune to see it unreachable moves it into a cruft pack and a later prune deletes it once the window has elapsed, which keeps a force-push from dropping an object a client is still mid-transfer on: upload-pack serves the mirror without a lock. An object written before the window and orphaned inside it is reclaimed immediately. 0 deletes every unreachable object on the first prune that sees it." default:"24h"`
+	MaxCruftSizeMB     int           `hcl:"max-cruft-size-mb,optional" help:"Largest cruft pack the pruning repack will write, in megabytes. Above this git splits the unreachable objects across several cruft packs, which bounds the size of any one pack and of the memory the write needs. On its own it does not bound the work a prune does: because every prune expires objects, git still reads and rewrites every existing cruft pack on every run, so by itself this is not an I/O bound on a large unreachable set. Setting prune-expire-interval as well makes most prunes skip the expiration, which is what lets git leave the cruft packs that have reached this size alone. Requires git 2.43 or newer, which added --max-cruft-size; older git fails the prune. 0 writes a single cruft pack." default:"0"`
 	// Inert without MaxCruftSizeMB: the repack it selects saves work only by
 	// leaving cruft packs that have reached a size alone, and that is the
 	// setting which supplies the size. See cruftExpireDue.
@@ -206,6 +210,17 @@ func NewManager(ctx context.Context, config Config, credentialProvider Credentia
 
 	if config.FetchTimeout == 0 {
 		config.FetchTimeout = 5 * time.Minute
+	}
+
+	if config.FetchLowSpeedLimit == 0 {
+		config.FetchLowSpeedLimit = DefaultFetchLowSpeedLimit
+	}
+	if config.FetchLowSpeedTime == 0 {
+		config.FetchLowSpeedTime = DefaultFetchLowSpeedTime
+	}
+	if config.FetchLowSpeedLimit < 0 || config.FetchLowSpeedTime < time.Second {
+		return nil, errors.Errorf("fetch-low-speed-limit must be positive and fetch-low-speed-time at least 1s, got %d and %v",
+			config.FetchLowSpeedLimit, config.FetchLowSpeedTime)
 	}
 
 	if config.LsRemoteTimeout == 0 {
@@ -1332,34 +1347,21 @@ func (r *Repository) executeFetch(ctx context.Context, enforceSpeedLimit bool) e
 	r.lastFetchAttempt = time.Now()
 	r.metaMu.Unlock()
 
-	config := DefaultGitTuningConfig()
-
-	args := []string{
-		"-C", r.path,
-		"-c", "http.postBuffer=" + strconv.Itoa(config.PostBuffer),
-	}
-	if enforceSpeedLimit {
-		args = append(args,
-			"-c", "http.lowSpeedLimit="+strconv.Itoa(config.LowSpeedLimit),
-			"-c", "http.lowSpeedTime="+strconv.Itoa(int(config.LowSpeedTime.Seconds())),
-		)
-	}
-	args = append(args, "fetch", "--prune", "--prune-tags")
-
-	cmd, err := r.GitCommand(ctx, args...)
-	if err != nil {
-		return errors.Wrap(err, "create git command")
-	}
-	// Start the process in its own process group so we can kill the entire
-	// tree (git spawns child processes like git-remote-https that inherit
-	// stdout/stderr pipes and prevent CombinedOutput from returning).
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	cmd.Cancel = func() error {
-		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-	}
 	packsBefore := packFileSizes(r.path)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
+	for attempt := 1; ; attempt++ {
+		output, err := r.runFetch(ctx, enforceSpeedLimit)
+		if err == nil {
+			break
+		}
+		// git aborted a transfer that stayed below the low-speed limit. A fresh
+		// connection can be routed over a faster link, so retry while the fetch
+		// deadline allows; the partial pack is discarded either way.
+		if enforceSpeedLimit && isLowSpeedAbort(output) && ctx.Err() == nil {
+			logging.FromContext(ctx).WarnContext(ctx, "Upstream fetch too slow, retrying on a new connection",
+				"upstream", r.upstreamURL, "attempt", attempt, "min_bytes_per_second", r.config.FetchLowSpeedLimit,
+				"window", r.config.FetchLowSpeedTime)
+			continue
+		}
 		// A fetch is the command whose deadline actually fires in production,
 		// and it is killed mid ref update: without this, one slow upstream
 		// leaves a packed-refs.lock or a loose ref lock that makes every later
@@ -1381,6 +1383,43 @@ func (r *Repository) executeFetch(ctx context.Context, enforceSpeedLimit bool) e
 	r.invalidateRefCheckLocked()
 	r.metaMu.Unlock()
 	return nil
+}
+
+// runFetch runs one git fetch subprocess and returns its combined output.
+func (r *Repository) runFetch(ctx context.Context, enforceSpeedLimit bool) ([]byte, error) {
+	args := []string{
+		"-C", r.path,
+		"-c", "http.postBuffer=" + strconv.Itoa(DefaultGitTuningConfig().PostBuffer),
+	}
+	if enforceSpeedLimit {
+		args = append(args,
+			"-c", "http.lowSpeedLimit="+strconv.Itoa(r.config.FetchLowSpeedLimit),
+			"-c", "http.lowSpeedTime="+strconv.Itoa(int(r.config.FetchLowSpeedTime.Seconds())),
+		)
+	}
+	args = append(args, "fetch", "--prune", "--prune-tags")
+
+	cmd, err := r.GitCommand(ctx, args...)
+	if err != nil {
+		return nil, errors.Wrap(err, "create git command")
+	}
+	// Start the process in its own process group so we can kill the entire
+	// tree (git spawns child processes like git-remote-https that inherit
+	// stdout/stderr pipes and prevent CombinedOutput from returning).
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
+	output, err := cmd.CombinedOutput()
+	return output, errors.WithStack(err)
+}
+
+// isLowSpeedAbort reports whether git's output shows curl aborting a transfer
+// that stayed below http.lowSpeedLimit for http.lowSpeedTime. curl reports it
+// as error 28, which it also uses for other timeouts, so the message that
+// names the low-speed check is what identifies it.
+func isLowSpeedAbort(output []byte) bool {
+	return bytes.Contains(output, []byte("Operation too slow"))
 }
 
 // recordFetchOutcome updates the fetch bookkeeping that drives background
