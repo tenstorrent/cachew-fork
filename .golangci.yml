@@ -478,9 +478,11 @@ linters:
         linters: ["govet"]
       # G703/G704 taint analysis rules flag path traversal and SSRF, but these
       # components intentionally forward URLs and construct paths from config.
+      # The git strategy builds mirror and snapshot paths only through
+      # gitclone.RepoPathFromURL, which rejects non-local paths.
       - text: "G703:"
         linters: [gosec]
-        path: "(internal/cache/disk\\.go|internal/strategy/git/spool\\.go|internal/gitclone/lastserved\\.go)"
+        path: "(internal/cache/disk\\.go|internal/strategy/git/spool\\.go|internal/gitclone/lastserved\\.go|internal/strategy/git/(git|snapshot)\\.go)"
       - text: "G704:"
         linters: [gosec]
       - text: "avoid package names that conflict with Go standard library"

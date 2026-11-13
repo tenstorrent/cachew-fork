@@ -2,6 +2,7 @@ package git
 
 import (
 	"net/http"
+	"net/http/httputil"
 	"strings"
 
 	"github.com/tenstorrent/internal-cachew/internal/logging"
@@ -13,6 +14,32 @@ func (s *Strategy) forwardToUpstream(w http.ResponseWriter, r *http.Request, hos
 	logger.DebugContext(r.Context(), "Forwarding to upstream", "method", r.Method, "host", host, "path", pathValue)
 
 	s.proxy.ServeHTTP(w, r)
+}
+
+// newUpstreamProxy builds the reverse proxy that forwards requests to upstreams.
+func (s *Strategy) newUpstreamProxy(transport http.RoundTripper) *httputil.ReverseProxy {
+	return &httputil.ReverseProxy{
+		Rewrite:   s.rewriteUpstream,
+		Transport: transport,
+		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			logging.FromContext(r.Context()).ErrorContext(r.Context(), "Upstream request failed", "error", err)
+			w.WriteHeader(http.StatusBadGateway)
+		},
+	}
+}
+
+// rewriteUpstream retargets an outbound proxy request at its upstream.
+//
+// Rewrite strips inbound forwarding headers, where the deprecated Director
+// appended the client to them. Carrying X-Forwarded-For across keeps the chain
+// upstreams see unchanged. SetXForwarded's Host and Proto headers are dropped
+// because they would expose cachew's own address to every upstream.
+func (s *Strategy) rewriteUpstream(pr *httputil.ProxyRequest) {
+	pr.Out.Header["X-Forwarded-For"] = pr.In.Header["X-Forwarded-For"]
+	pr.SetXForwarded()
+	pr.Out.Header.Del("X-Forwarded-Host")
+	pr.Out.Header.Del("X-Forwarded-Proto")
+	s.directUpstream(pr.Out)
 }
 
 // directUpstream retargets a cachew request at the upstream it proxies for.

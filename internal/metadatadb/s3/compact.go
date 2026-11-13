@@ -119,7 +119,7 @@ func (n *namespace) compact(ctx context.Context, lst *listing, candidates []stri
 		return errors.Wrap(err, "marshal rollup")
 	}
 
-	opts := minio.PutObjectOptions{ContentType: "application/json"}
+	opts := minio.PutObjectOptions{ContentType: jsonContentType}
 	opts.SetMatchETag(n.rollup.etag)
 	info, err := n.b.client.PutObject(ctx, n.b.bucket, n.rollupKey(),
 		bytes.NewReader(data), int64(len(data)), opts)
@@ -159,7 +159,7 @@ func (n *namespace) probe(ctx context.Context, lst *listing) error {
 	}
 	_, err = n.b.client.PutObject(ctx, n.b.bucket, n.prefix()+key,
 		bytes.NewReader(data), int64(len(data)),
-		minio.PutObjectOptions{ContentType: "application/json"})
+		minio.PutObjectOptions{ContentType: jsonContentType})
 	return errors.Wrap(err, "put probe")
 }
 

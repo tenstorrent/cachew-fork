@@ -121,7 +121,7 @@ func decodeOp(data json.RawMessage) (metadatadb.Op, error) {
 	if err := unmarshalNumeric(data, v.Interface()); err != nil {
 		return nil, errors.Wrapf(err, "unmarshal %s", head.Op)
 	}
-	op, ok := v.Elem().Interface().(metadatadb.Op)
+	op, ok := reflect.TypeAssert[metadatadb.Op](v.Elem())
 	if !ok {
 		return nil, errors.Errorf("%s does not implement Op", head.Op)
 	}

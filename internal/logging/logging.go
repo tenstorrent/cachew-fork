@@ -46,7 +46,7 @@ func Middleware(next http.Handler, config Config) http.Handler {
 		// Propagate attributes tot the handlers.
 		logger := FromContext(ctx).With("method", r.Method, "uri", r.RequestURI)
 		start := time.Now()
-		logger.Debug("Request received")
+		logger.DebugContext(ctx, "Request received")
 		var attrs []any
 		for header, attr := range config.Headers {
 			if h := r.Header.Get(header); h != "" {
@@ -58,7 +58,7 @@ func Middleware(next http.Handler, config Config) http.Handler {
 			r = r.WithContext(ContextWithLogger(ctx, logger))
 		}
 		next.ServeHTTP(w, r)
-		logger.Debug("Request complete", "elapsed", time.Since(start))
+		logger.DebugContext(ctx, "Request complete", "elapsed", time.Since(start))
 	})
 }
 

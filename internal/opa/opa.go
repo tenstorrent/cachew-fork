@@ -84,12 +84,12 @@ func (a *Authorizer) Middleware(next http.Handler) http.Handler {
 
 		allowed, err := evalAllow(r.Context(), a.prepared, input)
 		if err != nil {
-			logger.Error("OPA evaluation failed", "error", err)
+			logger.ErrorContext(r.Context(), "OPA evaluation failed", "error", err)
 			http.Error(w, "policy evaluation error", http.StatusInternalServerError)
 			return
 		}
 		if !allowed {
-			logger.Warn("OPA denied request", "method", r.Method, "path", r.URL.Path, "remote_addr", r.RemoteAddr)
+			logger.WarnContext(r.Context(), "OPA denied request", "method", r.Method, "path", r.URL.Path, "remote_addr", r.RemoteAddr)
 			http.Error(w, "forbidden", http.StatusForbidden)
 			return
 		}

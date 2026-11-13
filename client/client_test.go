@@ -157,7 +157,7 @@ func (fs *fakeServer) namespaces(w http.ResponseWriter, _ *http.Request) {
 	fs.mu.Lock()
 	seen := make(map[string]struct{})
 	for k := range fs.objects {
-		ns := strings.SplitN(k, "/", 2)[0]
+		ns, _, _ := strings.Cut(k, "/")
 		seen[ns] = struct{}{}
 	}
 	fs.mu.Unlock()

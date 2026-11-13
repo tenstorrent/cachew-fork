@@ -21,8 +21,9 @@ import (
 const (
 	// metadataPrefix starts with "." to avoid collisions with cache
 	// namespaces, which are validated to not start with ".".
-	metadataPrefix = ".metadata"
-	rollupName     = "rollup.json"
+	metadataPrefix  = ".metadata"
+	rollupName      = "rollup.json"
+	jsonContentType = "application/json"
 
 	defaultSyncInterval = 15 * time.Second
 	// The effective age threshold is max(minAgeThreshold, 2 × sync-interval).

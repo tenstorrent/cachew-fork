@@ -83,11 +83,11 @@ func (g *GitHubReleases) String() string { return "github-releases" }
 // splitReleasePath splits "release-tag/file.tar.gz" into the release tag and filename.
 // Supports release tags with slashes (e.g. "kustomize/v5.8.1/file.tar.gz").
 func splitReleasePath(rest string) (release, file string) {
-	i := strings.LastIndex(rest, "/")
-	if i < 0 {
+	before, after, ok := strings.CutLast(rest, "/")
+	if !ok {
 		return "", rest
 	}
-	return rest[:i], rest[i+1:]
+	return before, after
 }
 
 // newGitHubRequest creates a new HTTP request with GitHub API headers and authentication.

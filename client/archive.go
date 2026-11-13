@@ -131,8 +131,15 @@ type dirMode struct {
 // returning the changed directories with their original modes. tar overwrites
 // a file by unlinking it, which requires a writable parent directory.
 func makeTreeWritable(root string) ([]dirMode, error) {
+	// Chmod through the root so a directory swapped for a symlink mid-walk
+	// cannot redirect the mode change outside the tree.
+	tree, err := os.OpenRoot(root)
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed to open %s", root)
+	}
+	defer tree.Close()
 	var changed []dirMode
-	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
+	err = filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
 		switch {
 		case walkErr != nil:
 			return walkErr
@@ -146,7 +153,11 @@ func makeTreeWritable(root string) ([]dirMode, error) {
 		// Keep setuid/setgid/sticky so relaxing and restoring don't strip them.
 		mode := info.Mode() & (fs.ModePerm | fs.ModeSetuid | fs.ModeSetgid | fs.ModeSticky)
 		if mode&0o200 == 0 {
-			if err := os.Chmod(path, mode|0o200); err != nil {
+			rel, err := filepath.Rel(root, path)
+			if err != nil {
+				return errors.Wrapf(err, "failed to relativise %s", path)
+			}
+			if err := tree.Chmod(rel, mode|0o200); err != nil {
 				return errors.Wrapf(err, "failed to make %s writable", path)
 			}
 			changed = append(changed, dirMode{path: path, mode: mode})
