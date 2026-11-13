@@ -212,7 +212,17 @@ func (s *Strategy) withSnapshotClone(ctx context.Context, repo *gitclone.Reposit
 }
 
 func snapshotExcludePatterns(gitDir string) []string {
-	return []string{gitDir + "/*.lock", gitDir + "/objects/pack/tmp_*"}
+	return []string{
+		gitDir + "/*.lock",
+		gitDir + "/objects/pack/tmp_*",
+		// A commit-graph is a derived index, and one written before a prune
+		// keeps naming commits the prune deleted. Shipping it would hand every
+		// consumer a repository that fails with "Could not read <oid>" until
+		// they run git gc, so leave it out and let the recipient rebuild it
+		// from the objects it actually received.
+		gitDir + "/objects/info/commit-graph",
+		gitDir + "/objects/info/commit-graphs",
+	}
 }
 
 func (s *Strategy) generateAndUploadSnapshot(ctx context.Context, repo *gitclone.Repository) (commit string, returnErr error) {

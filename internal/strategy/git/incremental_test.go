@@ -1316,12 +1316,6 @@ func TestEnsureWantsAvailable(t *testing.T) {
 	})
 }
 
-func TestIncrementalOutcomeAfterNotOurRef(t *testing.T) {
-	assert.Equal(t, "", git.IncrementalOutcomeAfterNotOurRef(""))
-	assert.Equal(t, "fallback_not_our_ref", git.IncrementalOutcomeAfterNotOurRef("local_hit"))
-	assert.Equal(t, "fallback_not_our_ref", git.IncrementalOutcomeAfterNotOurRef("fetched"))
-}
-
 func TestIncrementalUploadPackServedLocally(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not found in PATH")

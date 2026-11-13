@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/alecthomas/errors"
 
@@ -81,25 +82,48 @@ func (b *bufferedResponseWriter) commit() {
 	_, _ = io.Copy(b.w, &b.buf) //nolint:errcheck
 }
 
+// backendFallback says why a local serve did not produce a usable response, so
+// the caller can decide what to repair before retrying. The zero value means
+// the response was committed to the client and no retry is possible.
+type backendFallback int
+
+const (
+	backendServed backendFallback = iota
+	// backendNotOurRef means upload-pack rejected the wants because the mirror
+	// lacks the object, typically a force-push orphaning an advertised commit.
+	backendNotOurRef
+	// backendStaleCommitGraph means the commit-graph indexes commits the object
+	// store no longer has, so the graph has to be rewritten before a retry can
+	// help.
+	backendStaleCommitGraph
+)
+
+// staleCommitGraphRepairTimeout bounds every graph rewrite a serve failure
+// triggers, inline or background. The rewrite is a local pass over existing
+// packs, far cheaper than a clone, but the inline one holds a client.
+const staleCommitGraphRepairTimeout = 2 * time.Minute
+
 // serveFromBackend serves the request using git http-backend against the local
-// mirror. It returns true if the request should be retried against upstream —
-// specifically when git upload-pack rejects the request with "not our ref",
-// indicating the local mirror is missing an object the client wants (typically
-// due to a concurrent force-push fetch orphaning a previously-advertised commit).
-func (s *Strategy) serveFromBackend(w http.ResponseWriter, r *http.Request, repo *gitclone.Repository) bool {
+// mirror. It returns backendServed when the response reached the client, or a
+// backendFallback reason when the request should be retried — "not our ref"
+// indicates the local mirror is missing an object the client wants (typically
+// due to a concurrent force-push fetch orphaning a previously-advertised
+// commit), and a stale commit-graph indicates the mirror's commit index
+// disagrees with the objects a prune left behind.
+func (s *Strategy) serveFromBackend(w http.ResponseWriter, r *http.Request, repo *gitclone.Repository) backendFallback {
 	ctx := r.Context()
 	logger := logging.FromContext(ctx)
 
 	gitPath, err := exec.LookPath("git")
 	if err != nil {
 		httputil.ErrorResponse(w, r, http.StatusInternalServerError, "git not found in PATH")
-		return false
+		return backendServed
 	}
 
 	absRoot, err := filepath.Abs(s.cloneManager.Config().MirrorRoot)
 	if err != nil {
 		httputil.ErrorResponse(w, r, http.StatusInternalServerError, "failed to get absolute path")
-		return false
+		return backendServed
 	}
 
 	host := r.PathValue("host")
@@ -162,7 +186,7 @@ func (s *Strategy) serveFromBackend(w http.ResponseWriter, r *http.Request, repo
 		body, err := io.ReadAll(r2.Body)
 		if err != nil {
 			httputil.ErrorResponse(w, r, http.StatusInternalServerError, "failed to read request body")
-			return false
+			return backendServed
 		}
 		r2.Body = io.NopCloser(bytes.NewReader(body))
 		r2.ContentLength = int64(len(body))
@@ -174,13 +198,83 @@ func (s *Strategy) serveFromBackend(w http.ResponseWriter, r *http.Request, repo
 	if stderrBuf.Len() > 0 {
 		stderr := stderrBuf.String()
 		logger.ErrorContext(r.Context(), "git http-backend error", "stderr", stderr, "path", backendPath)
+		if isStaleCommitGraphError(stderr) {
+			// An uncommitted response is still retryable, so the caller repairs
+			// inline and re-serves. Once committed the request is lost, but later
+			// requests should not keep paying for the same broken index.
+			if !bw.committed {
+				return backendStaleCommitGraph
+			}
+			s.repairCommitGraphAsync(r.Context(), repo)
+		}
 		if !bw.committed && (strings.Contains(stderr, "not our ref") || strings.Contains(stderr, "unknown ref")) {
-			return true
+			return backendNotOurRef
 		}
 	}
 
 	bw.commit()
-	return false
+	return backendServed
+}
+
+// repairCommitGraphAsync rewrites the mirror's commit-graph in the background.
+//
+// Detached from the request context on purpose: the client that tripped the
+// fault is already being failed, and tying the repair to its connection would
+// abandon the work as soon as it disconnected. The request's logger is carried
+// across so the repair is still attributed to the mirror it belongs to, and
+// RewriteCommitGraph takes the fetch exclusion itself, so it serialises against
+// fetches and snapshots.
+func (s *Strategy) repairCommitGraphAsync(ctx context.Context, repo *gitclone.Repository) {
+	upstream := repo.UpstreamURL()
+	if _, loaded := s.commitGraphRepairs.LoadOrStore(upstream, struct{}{}); loaded {
+		return
+	}
+	go func() {
+		defer s.commitGraphRepairs.Delete(upstream)
+		repairCtx := context.WithoutCancel(ctx)
+		if err := s.rewriteCommitGraph(repairCtx, repo); err != nil {
+			logging.FromContext(repairCtx).WarnContext(repairCtx, "Commit-graph repair failed", "upstream", upstream,
+				"error", err)
+		}
+	}()
+}
+
+// rewriteCommitGraph rewrites the mirror's commit-graph within
+// staleCommitGraphRepairTimeout and records the repair. The timeout covers the
+// wait for the fetch exclusion too, so a long fetch or prune cannot hold a
+// client indefinitely.
+func (s *Strategy) rewriteCommitGraph(ctx context.Context, repo *gitclone.Repository) error {
+	repairCtx, cancel := context.WithTimeout(ctx, staleCommitGraphRepairTimeout)
+	defer cancel()
+	start := time.Now()
+	err := repo.RewriteCommitGraph(repairCtx)
+	status := statusSuccess
+	if err != nil {
+		status = statusError
+	}
+	s.metrics.recordOperation(ctx, "commit-graph-repair", status, triggerRequest, time.Since(start))
+	return errors.Wrap(err, "rewrite commit-graph")
+}
+
+// isStaleCommitGraphError reports whether git's stderr shows a commit-graph
+// naming a commit the object store no longer has.
+//
+// Two wordings matter, because the same broken index fails in two places.
+// Reading the graph directly says "Could not read <oid>" and "unable to parse
+// commit <oid>". Serving a want through upload-pack instead dies one level down,
+// as "git-pack-objects died with error" plus "possible repository corruption on
+// the remote side", because pack-objects cannot resolve a commit the graph
+// claims. The upload-pack pair is matched together and only when it names
+// corruption, so a genuine pack failure is still reported as one.
+func isStaleCommitGraphError(stderr string) bool {
+	if strings.Contains(stderr, "unable to parse commit") {
+		return true
+	}
+	if strings.Contains(stderr, "Could not read") && strings.Contains(stderr, "commit-graph") {
+		return true
+	}
+	return strings.Contains(stderr, "git-pack-objects died with error") &&
+		strings.Contains(stderr, "possible repository corruption on the remote side")
 }
 
 // checkRefsStale checks whether the local mirror's refs are behind upstream.
