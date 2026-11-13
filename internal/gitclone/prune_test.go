@@ -510,3 +510,26 @@ func TestSuccessfulFetchKeepsRefsIntact(t *testing.T) {
 	head := gitOutput(t, upstreamPath, "rev-parse", "HEAD")
 	assert.True(t, objectExists(t, repo.path, head), "the fetch should have brought the new commit in")
 }
+
+func TestPruneRemovesStaleTempPacks(t *testing.T) {
+	_, ctx, _ := logging.Configure(t.Context(), logging.Config{Level: "error"})
+	repo, _ := newClonedTestRepo(t, testPruneConfig(24*time.Hour))
+	packMirror(t, repo.path)
+	packDir := filepath.Join(repo.path, "objects", "pack")
+
+	// Fresh mtimes: git prune alone keeps these until they age past its expiry.
+	stale := []string{"tmp_pack_aBc123", "tmp_idx_aBc123", ".tmp-4242-pack-deadbeef.pack"}
+	for _, name := range stale {
+		assert.NoError(t, os.WriteFile(filepath.Join(packDir, name), []byte("partial transfer"), 0o600))
+	}
+
+	_, err := repo.PruneUnreachable(ctx)
+	assert.NoError(t, err)
+
+	for _, name := range stale {
+		_, statErr := os.Stat(filepath.Join(packDir, name))
+		assert.True(t, os.IsNotExist(statErr), "%s should have been removed", name)
+	}
+	assert.NotEqual(t, 0, len(packFiles(t, repo.path)), "real packs must survive the cleanup")
+	gitOutput(t, repo.path, "fsck", "--connectivity-only")
+}

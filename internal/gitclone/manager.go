@@ -1850,6 +1850,9 @@ func (r *Repository) PruneUnreachable(ctx context.Context) (int64, error) {
 		// The loose prune and packRefs below stay on every tick either way:
 		// they cost the same whichever repack ran, and holding the deletion of
 		// loose objects back to the expiring cadence would buy nothing.
+		if err := r.removeStaleTempPacks(); err != nil {
+			return err
+		}
 		expire := r.cruftExpireDue()
 		if err := r.runRepack(pruneCtx, pruneRepackArgs(cutoff, r.config.MaxCruftSizeMB, expire)...); err != nil {
 			return err
@@ -1884,6 +1887,40 @@ func (r *Repository) PruneUnreachable(ctx context.Context) (int64, error) {
 		return 0, err
 	}
 	return reclaimed, nil
+}
+
+// removeStaleTempPacks deletes the temporary files a killed git fetch or repack
+// leaves in objects/pack: index-pack writes tmp_* and repack writes .tmp-*.
+// git prune removes tmp_* only once they are older than its expiry, and never
+// .tmp-*, so a fetch killed at its deadline otherwise leaves up to a whole
+// transfer on disk for that long.
+//
+// Every one of them is stale when this runs. The caller holds the fetch
+// exclusion, so no fetch is writing a pack, and the repack job runs on the same
+// scheduler queue as the prune, so no repack is either.
+func (r *Repository) removeStaleTempPacks() error {
+	packRoot, err := os.OpenRoot(filepath.Join(r.path, "objects", "pack"))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return errors.Wrap(err, "open pack directory")
+	}
+	defer packRoot.Close()
+	entries, err := fs.ReadDir(packRoot.FS(), ".")
+	if err != nil {
+		return errors.Wrap(err, "list pack directory")
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasPrefix(name, "tmp_") && !strings.HasPrefix(name, ".tmp-") {
+			continue
+		}
+		if err := packRoot.Remove(name); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return errors.Wrapf(err, "remove stale temporary pack file %s", name)
+		}
+	}
+	return nil
 }
 
 // RewriteCommitGraph rewrites the mirror's commit-graph from the commits still
