@@ -52,7 +52,7 @@ const (
 
 	// DefaultFetchLowSpeedLimit and DefaultFetchLowSpeedTime apply when the
 	// matching Config fields are unset.
-	DefaultFetchLowSpeedLimit = 200 * 1024
+	DefaultFetchLowSpeedLimit = 150 * 1024
 	DefaultFetchLowSpeedTime  = 60 * time.Second
 
 	// MaxFetchBackoff caps the backoff between failed background fetches. An
@@ -93,7 +93,7 @@ type Config struct {
 	PackThreads        int           `hcl:"pack-threads,optional" help:"Threads for git pack operations (0 = all CPU cores)." default:"0"`
 	CloneTimeout       time.Duration `hcl:"clone-timeout,optional" help:"Upper bound for 'git clone --mirror'. Generous by default since large repos can take 30+ minutes." default:"1h"`
 	FetchTimeout       time.Duration `hcl:"fetch-timeout,optional" help:"Upper bound for 'git fetch' so a slow upstream cannot block the fetch path indefinitely." default:"5m"`
-	FetchLowSpeedLimit int           `hcl:"fetch-low-speed-limit,optional" help:"Minimum transfer rate, in bytes per second, for a routine 'git fetch'. A fetch slower than this for fetch-low-speed-time is aborted and retried on a new connection, which can be routed over a faster link, until fetch-timeout runs out. Initial clones and post-restore catch-up fetches are not checked." default:"204800"`
+	FetchLowSpeedLimit int           `hcl:"fetch-low-speed-limit,optional" help:"Minimum transfer rate, in bytes per second, for a routine 'git fetch'. A fetch slower than this for fetch-low-speed-time is aborted and retried on a new connection, which can be routed over a faster link, until fetch-timeout runs out. Initial clones and post-restore catch-up fetches are not checked." default:"153600"`
 	FetchLowSpeedTime  time.Duration `hcl:"fetch-low-speed-time,optional" help:"How long a routine 'git fetch' may stay below fetch-low-speed-limit before it is aborted and retried. Whole seconds; at least 1s." default:"60s"`
 	LsRemoteTimeout    time.Duration `hcl:"ls-remote-timeout,optional" help:"Upper bound for 'git ls-remote' so a slow upstream cannot block the request path indefinitely." default:"1m"`
 	RepackTimeout      time.Duration `hcl:"repack-timeout,optional" help:"Upper bound for 'git repack' so a slow repack on a large repository cannot block the scheduler queue indefinitely." default:"10m"`

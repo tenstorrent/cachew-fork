@@ -144,7 +144,7 @@ func TestNewManagerFetchLowSpeedConfig(t *testing.T) {
 		wantLimit int
 		wantTime  time.Duration
 	}{
-		{name: "UnsetUsesDefaults", wantLimit: 200 * 1024, wantTime: 60 * time.Second},
+		{name: "UnsetUsesDefaults", wantLimit: 150 * 1024, wantTime: 60 * time.Second},
 		{name: "ConfiguredIsKept", limit: 1024, window: 5 * time.Second, wantLimit: 1024, wantTime: 5 * time.Second},
 		{name: "NegativeLimitIsRejected", limit: -1, wantErr: true},
 		{name: "SubSecondWindowIsRejected", window: 500 * time.Millisecond, wantErr: true},
