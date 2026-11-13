@@ -1197,6 +1197,7 @@ func (r *Repository) executeClone(ctx context.Context) error {
 	if err != nil {
 		return errors.Wrapf(err, "git clone --mirror: %s", string(output))
 	}
+	recordReceivedPacks(ctx, nil, packFileSizes(cloneDest))
 
 	if err := r.ConfigureMirror(ctx, cloneDest); err != nil {
 		return errors.WithStack(err)
@@ -1356,6 +1357,7 @@ func (r *Repository) executeFetch(ctx context.Context, enforceSpeedLimit bool) e
 	cmd.Cancel = func() error {
 		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 	}
+	packsBefore := packFileSizes(r.path)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		// A fetch is the command whose deadline actually fires in production,
@@ -1371,6 +1373,7 @@ func (r *Repository) executeFetch(ctx context.Context, enforceSpeedLimit bool) e
 	}
 
 	r.recordFetchOutcome(true)
+	recordReceivedPacks(ctx, packsBefore, packFileSizes(r.path))
 	r.metaMu.Lock()
 	// Drop any cached ref-staleness verdict so the next check reopens instead of
 	// serving a stale "behind" result for the rest of the interval. This also

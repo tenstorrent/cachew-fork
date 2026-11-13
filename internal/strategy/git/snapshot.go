@@ -28,6 +28,7 @@ import (
 	"github.com/tenstorrent/internal-cachew/internal/httputil"
 	"github.com/tenstorrent/internal-cachew/internal/logging"
 	"github.com/tenstorrent/internal-cachew/internal/snapshot"
+	"github.com/tenstorrent/internal-cachew/internal/transfer"
 )
 
 const lfsFetchTimeout = 25 * time.Minute
@@ -1634,6 +1635,9 @@ func (s *Strategy) generateAndUploadLFSSnapshot(ctx context.Context, repo *gitcl
 		// surface 0 on error so we don't fail the snapshot for a stat walk.
 		if size, walkErr := dirSizeBytes(lfsDir); walkErr == nil {
 			s.metrics.recordLFSPhaseBytes(ctx, upstream, "fetch", size)
+			// The work directory is recreated for each snapshot, so everything
+			// in .git/lfs is what this fetch downloaded.
+			transfer.RecordReceived(ctx, transfer.SourceLFS, "git", size)
 		} else {
 			logger.DebugContext(ctx, "Failed to size .git/lfs after fetch", "upstream", upstream, "error", walkErr)
 		}

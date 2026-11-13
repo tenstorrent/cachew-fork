@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/tenstorrent/internal-cachew/internal/logging"
+	"github.com/tenstorrent/internal-cachew/internal/transfer"
 )
 
 func (s *Strategy) forwardToUpstream(w http.ResponseWriter, r *http.Request, host, pathValue string) {
@@ -16,11 +17,12 @@ func (s *Strategy) forwardToUpstream(w http.ResponseWriter, r *http.Request, hos
 	s.proxy.ServeHTTP(w, r)
 }
 
-// newUpstreamProxy builds the reverse proxy that forwards requests to upstreams.
+// newUpstreamProxy builds the reverse proxy that forwards requests to upstreams,
+// counting the bytes it receives from them.
 func (s *Strategy) newUpstreamProxy(transport http.RoundTripper) *httputil.ReverseProxy {
 	return &httputil.ReverseProxy{
 		Rewrite:   s.rewriteUpstream,
-		Transport: transport,
+		Transport: transfer.NewTransport(transport, "git"),
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			logging.FromContext(r.Context()).ErrorContext(r.Context(), "Upstream request failed", "error", err)
 			w.WriteHeader(http.StatusBadGateway)

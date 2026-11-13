@@ -15,6 +15,7 @@ import (
 	"github.com/tenstorrent/internal-cachew/internal/logging"
 	"github.com/tenstorrent/internal-cachew/internal/repoauthz"
 	"github.com/tenstorrent/internal-cachew/internal/strategy"
+	"github.com/tenstorrent/internal-cachew/internal/transfer"
 )
 
 // Register registers the module proxy, authorizing private module reads with
@@ -89,6 +90,7 @@ func New(
 	}
 
 	publicFetcher := &goproxy.GoFetcher{
+		Transport: transfer.NewTransport(nil, "gomod"),
 		Env: []string{
 			"GOPROXY=" + config.Proxy,
 			"GOSUMDB=off", // Disable checksum database validation in fetcher, to prevent unneccessary double validation
@@ -116,6 +118,7 @@ func New(
 			cache:   cache,
 			private: s.privateModuleName,
 		},
+		Transport: transfer.NewTransport(nil, "gomod"),
 		ProxiedSumDBs: []string{
 			"sum.golang.org https://sum.golang.org",
 		},

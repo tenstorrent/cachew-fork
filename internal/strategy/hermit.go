@@ -15,6 +15,7 @@ import (
 	"github.com/tenstorrent/internal-cachew/internal/jobscheduler"
 	"github.com/tenstorrent/internal-cachew/internal/logging"
 	"github.com/tenstorrent/internal-cachew/internal/strategy/handler"
+	"github.com/tenstorrent/internal-cachew/internal/transfer"
 )
 
 func RegisterHermit(r *Registry) {
@@ -56,7 +57,7 @@ func NewHermit(ctx context.Context, config HermitConfig, _ jobscheduler.Schedule
 	s := &Hermit{
 		config: config,
 		cache:  c,
-		client: http.DefaultClient,
+		client: transfer.NewClient("hermit"),
 		logger: logger,
 		mux:    mux,
 	}

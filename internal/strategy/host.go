@@ -10,6 +10,7 @@ import (
 
 	"github.com/tenstorrent/internal-cachew/internal/cache"
 	"github.com/tenstorrent/internal-cachew/internal/strategy/handler"
+	"github.com/tenstorrent/internal-cachew/internal/transfer"
 )
 
 func RegisterHost(r *Registry) {
@@ -50,7 +51,7 @@ func NewHost(_ context.Context, config HostConfig, cache cache.Cache, mux Mux) (
 	h := &Host{
 		target:  u,
 		cache:   cache,
-		client:  &http.Client{},
+		client:  transfer.NewClient("host"),
 		prefix:  prefix,
 		headers: config.Headers,
 	}
