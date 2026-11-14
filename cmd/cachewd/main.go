@@ -153,8 +153,7 @@ func main() {
 	// first sample immediately, which left cachew_storage_bytes and its
 	// capacity/per-repo companions missing until the first storage-scan-interval
 	// tick — 15 minutes of blank storage panels after every restart.
-	metricsClient, err := metrics.New(ctx, globalConfig.MetricsConfig)
-	fatalIfError(ctx, logger, err, "Failed to create metrics client")
+	metricsClient := startMetrics(ctx, logger, globalConfig.MetricsConfig)
 	defer func() {
 		if err := metricsClient.Close(); err != nil {
 			logger.ErrorContext(ctx, "Failed to close metrics client", "error", err)
@@ -386,6 +385,13 @@ func setupLogging(ctx context.Context, kctx *kong.Context, cfg logging.Config) (
 	logger, ctx, err := logging.Configure(ctx, cfg)
 	kctx.FatalIfErrorf(err)
 	return logger, ctx
+}
+
+func startMetrics(ctx context.Context, logger *slog.Logger, cfg metrics.Config) *metrics.Client {
+	client, err := metrics.New(ctx, cfg)
+	fatalIfError(ctx, logger, err, "Failed to create metrics client")
+	metrics.RegisterBuildInfo(version, gitCommit)
+	return client
 }
 
 func fatalIfError(ctx context.Context, logger *slog.Logger, err error, msg string) {
