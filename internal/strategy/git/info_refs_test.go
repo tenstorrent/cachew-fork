@@ -55,6 +55,18 @@ type infoRefsFixture struct {
 
 func newInfoRefsFixture(t *testing.T, checkInterval ...time.Duration) *infoRefsFixture {
 	t.Helper()
+	cloneConfig := gitclone.Config{}
+	if len(checkInterval) > 0 {
+		cloneConfig.RefCheckInterval = checkInterval[0]
+	}
+	return newInfoRefsFixtureWithConfig(t, git.Config{DisableUpstreamAuthz: true}, cloneConfig)
+}
+
+// newInfoRefsFixtureWithConfig builds the fixture with the given strategy and
+// clone manager configuration; the clone manager's MirrorRoot is always the
+// fixture's own.
+func newInfoRefsFixtureWithConfig(t *testing.T, gitConfig git.Config, cloneConfig gitclone.Config) *infoRefsFixture {
+	t.Helper()
 
 	tmpDir := t.TempDir()
 	upstreamPath := filepath.Join(tmpDir, "upstream.git")
@@ -77,17 +89,14 @@ func newInfoRefsFixture(t *testing.T, checkInterval ...time.Duration) *infoRefsF
 	logger := slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	ctx := logging.ContextWithLogger(t.Context(), logger)
 	mux := newTestMux()
-	config := gitclone.Config{MirrorRoot: mirrorRoot}
-	if len(checkInterval) > 0 {
-		config.RefCheckInterval = checkInterval[0]
-	}
-	manager := gitclone.NewManagerProvider(ctx, config, nil)
+	cloneConfig.MirrorRoot = mirrorRoot
+	manager := gitclone.NewManagerProvider(ctx, cloneConfig, nil)
 	clones, err := manager()
 	assert.NoError(t, err)
 	_, err = clones.GetOrCreate(ctx, "https://example.test/org/repo")
 	assert.NoError(t, err)
 	runInfoRefsGit(t, "-C", mirrorPath, "config", "remote.origin.url", upstreamPath)
-	strategy, err := git.New(ctx, git.Config{DisableUpstreamAuthz: true}, newTestScheduler(ctx, t), nil, mux, manager,
+	strategy, err := git.New(ctx, gitConfig, newTestScheduler(ctx, t), nil, mux, manager,
 		func() (*githubapp.TokenManager, error) { return nil, nil }, nil) //nolint:nilnil
 	assert.NoError(t, err)
 	waitForReady(t, strategy)

@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -126,22 +127,8 @@ func (s *Strategy) serveFromBackend(w http.ResponseWriter, r *http.Request, repo
 		return backendServed
 	}
 
-	host := r.PathValue("host")
 	pathValue := r.PathValue("path")
-
-	var gitOperation string
-	var repoPathWithSuffix string
-
-	for _, op := range []string{"/info/refs", "/git-upload-pack", "/git-receive-pack"} {
-		if idx := strings.Index(pathValue, op); idx != -1 {
-			repoPathWithSuffix = pathValue[:idx]
-			gitOperation = pathValue[idx:]
-			break
-		}
-	}
-
-	repoPath := strings.TrimSuffix(repoPathWithSuffix, ".git")
-	backendPath := "/" + host + "/" + repoPath + gitOperation
+	backendPath := backendRequestPath(r.PathValue("host"), pathValue)
 
 	logger.DebugContext(r.Context(), "Serving with git http-backend", "original_path", r.URL.Path,
 		"backend_path", backendPath, "clone_path", repo.Path())
@@ -175,6 +162,16 @@ func (s *Strategy) serveFromBackend(w http.ResponseWriter, r *http.Request, repo
 			"GIT_CONFIG_GLOBAL=" + os.DevNull,
 			"PATH=" + os.Getenv("PATH"),
 		},
+	}
+
+	if isUploadPackPost(r, pathValue) {
+		threads, release, err := s.acquirePackThreads(ctx)
+		if err != nil {
+			logger.DebugContext(ctx, "Client went away while queued for pack threads", "error", err)
+			return backendServed
+		}
+		defer release()
+		handler.Env = append(handler.Env, packThreadsEnv(threads)...)
 	}
 
 	r2 := r.Clone(r.Context())
@@ -214,6 +211,37 @@ func (s *Strategy) serveFromBackend(w http.ResponseWriter, r *http.Request, repo
 
 	bw.commit()
 	return backendServed
+}
+
+// backendRequestPath maps a proxied request path onto the mirror layout under
+// GIT_PROJECT_ROOT, dropping any .git suffix from the repository name.
+func backendRequestPath(host, pathValue string) string {
+	var gitOperation string
+	var repoPathWithSuffix string
+	for _, op := range []string{"/info/refs", "/git-upload-pack", "/git-receive-pack"} {
+		if idx := strings.Index(pathValue, op); idx != -1 {
+			repoPathWithSuffix = pathValue[:idx]
+			gitOperation = pathValue[idx:]
+			break
+		}
+	}
+	repoPath := strings.TrimSuffix(repoPathWithSuffix, ".git")
+	return "/" + host + "/" + repoPath + gitOperation
+}
+
+// packThreadsEnv overrides pack.threads for the upload-pack http-backend runs
+// and the pack-objects it spawns, through command-line-scoped config that beats
+// the mirror's own setting. threads is 0 when the budget is disabled, leaving
+// the mirror's setting in force.
+func packThreadsEnv(threads int64) []string {
+	if threads <= 0 {
+		return nil
+	}
+	return []string{
+		"GIT_CONFIG_COUNT=1",
+		"GIT_CONFIG_KEY_0=pack.threads",
+		"GIT_CONFIG_VALUE_0=" + strconv.FormatInt(threads, 10),
+	}
 }
 
 // repairCommitGraphAsync rewrites the mirror's commit-graph in the background.
