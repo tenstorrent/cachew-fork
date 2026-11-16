@@ -74,6 +74,8 @@ type Config struct {
 	StorageLimitMB    int `hcl:"storage-limit-mb,optional" help:"Total on-disk budget in megabytes shared by the git mirrors and the object cache on the same volume. Mirrors take priority: the object cache gets what the mirrors are not using, down to storage-min-cache-mb, and its LRU eviction reclaims the difference. Mirrors are reclaimed, least recently served first, only when they alone do not fit. Enforced on the storage-scan-interval, so storage measurement must be enabled. 0 disables the shared budget and leaves each component its own limit." default:"0"`
 	StorageMinCacheMB int `hcl:"storage-min-cache-mb,optional" help:"Floor in megabytes on the object cache's share of storage-limit-mb, so growing mirrors cannot squeeze the cache to nothing and make every request a cold miss. Ignored when storage-limit-mb is 0." default:"5120"`
 
+	PackThreadBudget int `hcl:"pack-thread-budget,optional" help:"Total pack.threads shared by every upload-pack served from local mirrors at once. Each serve gets up to the clone manager's pack-threads, fewer when the budget is partly used, and waits when it is exhausted. Memory is then bounded by roughly budget x pack.windowMemory plus pack.deltaCacheSize per running pack-objects. 0 disables the budget, so each serve uses pack-threads and concurrency is unbounded." default:"0"`
+
 	DisableUpstreamAuthz bool `hcl:"disable-upstream-authz,optional" help:"Disable all upstream authorization probing: per-request client authorization and the skip of proactive background refresh for auth-required repos. Unsafe: any client that can reach cachew can then read any mirrored private repo." default:"false"`
 }
 
@@ -150,6 +152,7 @@ type Strategy struct {
 	wiredOnce                 sync.Once
 	ready                     atomic.Bool
 	authz                     *repoauthz.Authorizer
+	packThreads               *packThreadBudget // nil when pack-thread-budget is disabled
 }
 
 // validateAndDefaultConfig applies defaults and validates prerequisites (git,
@@ -175,6 +178,9 @@ func validateAndDefaultConfig(config Config) (Config, error) {
 	// runs on the storage scan.
 	if config.StorageLimitMB < 0 {
 		return config, errors.Errorf("storage-limit-mb must not be negative, got %d", config.StorageLimitMB)
+	}
+	if config.PackThreadBudget < 0 {
+		return config, errors.Errorf("pack-thread-budget must not be negative, got %d", config.PackThreadBudget)
 	}
 	if config.StorageMinCacheMB < 0 {
 		return config, errors.Errorf("storage-min-cache-mb must not be negative, got %d", config.StorageMinCacheMB)
@@ -266,6 +272,7 @@ func New(
 		spools:        make(map[string]*RepoSpools),
 		metrics:       m,
 		storage:       newStorageMetrics(),
+		packThreads:   registerPackThreadBudget(newPackThreadBudget(config.PackThreadBudget, cloneManager.Config().PackThreads)),
 		metadataWired: make(chan struct{}),
 		coldPreparationDelay: func() time.Duration {
 			return rand.N(coldPreparationSpread) //nolint:gosec // The delay does not protect sensitive data.
@@ -327,7 +334,7 @@ func New(
 
 	logger.InfoContext(ctx, "Git strategy initialized", "snapshot_interval", config.SnapshotInterval,
 		"incremental_pullthrough", config.IncrementalPullthrough,
-		"incremental_fetch_timeout", config.IncrementalFetchTimeout)
+		"incremental_fetch_timeout", config.IncrementalFetchTimeout, "pack_thread_budget", config.PackThreadBudget)
 
 	return s, nil
 }

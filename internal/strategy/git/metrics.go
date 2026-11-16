@@ -39,6 +39,7 @@ type gitMetrics struct {
 	authzCheckDuration       metric.Float64Histogram
 	backgroundFetchSkips     metric.Int64Counter
 	pruneReclaimedBytes      metric.Int64Counter
+	packThreadWait           metric.Float64Histogram
 }
 
 func newGitMetrics(ctx context.Context, config Config, logger *slog.Logger) *gitMetrics {
@@ -69,12 +70,36 @@ func newGitMetrics(ctx context.Context, config Config, logger *slog.Logger) *git
 		authzCheckDuration:       metrics.NewHistogram(meter, "cachew.git.authz_check_duration_seconds", "s", "Duration of per-request client authorization checks, including any upstream probe", metrics.FastLatencyBuckets()),
 		backgroundFetchSkips:     metrics.NewMetric[metric.Int64Counter](meter, "cachew.git.background_fetch_skips_total", "{skips}", "Background fetches skipped by reason (requires_auth, backoff, probe_error) and repository"),
 		pruneReclaimedBytes:      metrics.NewMetric[metric.Int64Counter](meter, "cachew.git.prune_reclaimed_bytes_total", "By", "Bytes returned to the volume by pruning objects no ref points at any more, by repository. A flat zero while prunes are running means mirror growth is reachable history, not orphaned objects"),
+		packThreadWait:           metrics.NewHistogram(meter, "cachew.git.pack_thread_wait_seconds", "s", "Time an upload-pack request waited for pack threads from pack-thread-budget, by acquired (false when the client went away while queued)", metrics.LatencyBuckets()),
 	}
 	registerAuthzDisabled(meter, "upstream", config.DisableUpstreamAuthz)
 	if config.DisableUpstreamAuthz {
 		logger.WarnContext(ctx, "Upstream authorization probing is disabled, any client reaching cachew can read any mirrored private repo")
 	}
 	return m
+}
+
+// registerPackThreadBudget publishes the pack-thread-budget's size and current
+// use, so saturation shows as in_use pinned at the budget with waiters queued.
+// It returns b, and registers nothing when the budget is disabled.
+func registerPackThreadBudget(b *packThreadBudget) *packThreadBudget {
+	if b == nil {
+		return nil
+	}
+	meter := otel.Meter("cachew.git")
+	metrics.NewConstGauge(meter, "cachew.git.pack_thread_budget", "{threads}",
+		"Configured pack-thread-budget: the pack.threads shared by every concurrent upload-pack serve", b.size)
+	metrics.NewObservableGauge(meter, "cachew.git.pack_threads_in_use", "{threads}",
+		"pack.threads currently granted to running upload-pack serves", b.inUse.Load)
+	metrics.NewObservableGauge(meter, "cachew.git.pack_thread_waiters", "{requests}",
+		"Upload-pack requests queued for pack threads", b.waiting.Load)
+	return b
+}
+
+// recordPackThreadWait records how long an upload-pack request waited for pack
+// threads.
+func (m *gitMetrics) recordPackThreadWait(ctx context.Context, acquired bool, wait time.Duration) {
+	m.packThreadWait.Record(ctx, wait.Seconds(), metric.WithAttributes(attribute.Bool("acquired", acquired)))
 }
 
 func registerAuthzDisabled(meter metric.Meter, check string, disabled bool) {
