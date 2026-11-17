@@ -162,10 +162,16 @@ func (f *infoRefsFixture) request(t *testing.T) *httptest.ResponseRecorder {
 	return w
 }
 
-func (f *infoRefsFixture) requestLsRefs(t *testing.T) *httptest.ResponseRecorder {
+func (f *infoRefsFixture) requestLsRefs(t *testing.T, refPrefixes ...string) *httptest.ResponseRecorder {
 	t.Helper()
+	var body strings.Builder
+	body.WriteString(pkt("command=ls-refs\n") + "0001")
+	for _, prefix := range refPrefixes {
+		body.WriteString(pkt("ref-prefix " + prefix + "\n"))
+	}
+	body.WriteString("0000")
 	req := httptest.NewRequestWithContext(f.ctx, http.MethodPost,
-		"/git/example.test/org/repo/git-upload-pack", strings.NewReader("0014command=ls-refs\n0000"))
+		"/git/example.test/org/repo/git-upload-pack", strings.NewReader(body.String()))
 	req.Header.Set("Git-Protocol", "version=2")
 	req.Header.Set("Content-Type", "application/x-git-upload-pack-request")
 	req.SetPathValue("host", "example.test")
@@ -253,6 +259,62 @@ func TestInfoRefsStaleForwardsAndFetches(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("mirror did not fetch %s", wantSHA)
+}
+
+func TestInfoRefsV2StaleServesCapabilitiesAndFetches(t *testing.T) {
+	fixture := newInfoRefsFixture(t, time.Nanosecond)
+	setInfoRefsLsRemote(t, fixture.upstreamPath, false)
+	wantSHA := fixture.commitUpstream(t)
+
+	req := httptest.NewRequestWithContext(fixture.ctx, http.MethodGet,
+		"/git/example.test/org/repo/info/refs?service=git-upload-pack", nil)
+	req.Header.Set("Git-Protocol", "version=2")
+	req.SetPathValue("host", "example.test")
+	req.SetPathValue("path", "org/repo/info/refs")
+	w := httptest.NewRecorder()
+	fixture.handler.ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	assert.Equal(t, int32(0), fixture.transport.hits.Load(), "a v2 capability advertisement names no refs, so it must not be forwarded")
+	assert.Contains(t, w.Body.String(), "version 2")
+	waitForMirrorRef(t, fixture.mirrorPath, "refs/heads/main", wantSHA)
+}
+
+func TestLsRefsStalenessScopedToRefPrefixes(t *testing.T) {
+	tests := []struct {
+		name      string
+		prefixes  []string
+		forwarded bool
+	}{
+		{name: "MovedBranchForwards", prefixes: []string{"refs/heads/main"}, forwarded: true},
+		{name: "NoPrefixesForwards", prefixes: nil, forwarded: true},
+		{name: "UnmovedBranchServesMirror", prefixes: []string{"refs/heads/release"}, forwarded: false},
+		{name: "TagsOnlyServesMirror", prefixes: []string{"refs/tags/"}, forwarded: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fixture := newInfoRefsFixture(t, time.Nanosecond)
+			setInfoRefsLsRemote(t, fixture.upstreamPath, false)
+			fixture.commitUpstream(t)
+
+			w := fixture.requestLsRefs(t, tt.prefixes...)
+
+			assert.Equal(t, http.StatusOK, w.Code)
+			assert.Equal(t, tt.forwarded, fixture.transport.hits.Load() == 1)
+		})
+	}
+}
+
+func waitForMirrorRef(t *testing.T, mirrorPath, ref, want string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if runInfoRefsGit(t, "-C", mirrorPath, "rev-parse", ref) == want {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("mirror did not fetch %s", want)
 }
 
 func TestInfoRefsFreshServesMirrorAndCachesCheck(t *testing.T) {

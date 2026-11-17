@@ -621,6 +621,36 @@ func TestRepository_EnsureRefsUpToDate_CachesStaleVerdict(t *testing.T) {
 	assert.Equal(t, runs, repo.lsRemoteRuns.Load(), "stale results must be cached within RefCheckInterval")
 }
 
+func TestRepository_EnsureRefsUpToDate_ScopedToPrefixes(t *testing.T) {
+	repo, upstreamPath := newClonedTestRepo(t, testRefCheckConfig())
+	ctx := context.Background()
+	advanceBareUpstream(t, upstreamPath)
+	// #nosec G204 - upstreamPath is a t.TempDir() path created by this test
+	headOut, err := exec.Command("git", "-C", upstreamPath, "symbolic-ref", "HEAD").Output()
+	assert.NoError(t, err)
+	moved := strings.TrimSpace(string(headOut))
+
+	tests := []struct {
+		name     string
+		prefixes []string
+		expected bool
+	}{
+		{name: "NoPrefixesChecksEveryBranch", prefixes: nil, expected: true},
+		{name: "MovedBranch", prefixes: []string{moved}, expected: true},
+		{name: "AllBranchesPrefix", prefixes: []string{"refs/heads/"}, expected: true},
+		{name: "UnmovedBranch", prefixes: []string{"refs/heads/unrelated"}, expected: false},
+		{name: "NonBranchPrefixes", prefixes: []string{"HEAD", "refs/tags/"}, expected: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			needsFetch, err := repo.EnsureRefsUpToDate(ctx, tt.prefixes...)
+			assert.NoError(t, err)
+			assert.Equal(t, tt.expected, needsFetch)
+		})
+	}
+	assert.Equal(t, int64(1), repo.lsRemoteRuns.Load(), "every prefix scope must be answered from one cached ls-remote")
+}
+
 func TestRepository_EnsureRefsUpToDate_FetchInvalidatesStaleCache(t *testing.T) {
 	repo, upstreamPath := newClonedTestRepo(t, testRefCheckConfig())
 	ctx := context.Background()
@@ -681,7 +711,7 @@ func TestRepository_EnsureRefsUpToDate_SingleflightWaiter(t *testing.T) {
 		config:           testRepoConfig(),
 		fetchSem:         make(chan struct{}, 1),
 		refCheckInFlight: make(chan struct{}),
-		refCheckStale:    true,
+		refCheckBehind:   []string{"refs/heads/main"},
 	}
 	repo.fetchSem <- struct{}{}
 
@@ -1380,7 +1410,7 @@ exec %q "$@"
 	repo.metaMu.Lock()
 	defer repo.metaMu.Unlock()
 	assert.True(t, repo.refCheckValid)
-	assert.True(t, repo.refCheckStale)
+	assert.NotZero(t, repo.refCheckBehind)
 }
 
 // TestMirrorConfigAllowsUnreachableSHA verifies that the mirror config lets

@@ -35,6 +35,9 @@ type UploadPackRequest struct {
 	HasHaves bool     // body contains at least one "have <oid>" line. Informational only: incremental pull-through does not gate on it, because a fetch with haves may still need objects the mirror lacks. RequestIsClone in repocounts.go is the path that does gate on haves.
 	LsRefs   bool     // protocol v2 command=ls-refs (ref discovery, not a fetch)
 	WantRefs bool     // body contains protocol v2 "want-ref <ref>" lines
+	// RefPrefixes holds an ls-refs request's ref-prefix arguments: the only refs
+	// the client asked to be listed. Empty means every ref.
+	RefPrefixes []string
 }
 
 // ParseUploadPackRequest parses a git-upload-pack request body (pkt-line format,
@@ -134,6 +137,9 @@ func handleLine(line []byte, r *UploadPackRequest, seen map[string]struct{}) err
 
 	case bytes.HasPrefix(line, []byte("want-ref ")):
 		r.WantRefs = true
+
+	case bytes.HasPrefix(line, []byte("ref-prefix ")):
+		r.RefPrefixes = append(r.RefPrefixes, string(line[len("ref-prefix "):]))
 	}
 
 	return nil
