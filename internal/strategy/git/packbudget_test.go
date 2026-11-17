@@ -54,7 +54,7 @@ func traceGitOnPath(t *testing.T) string {
 	script := fmt.Sprintf(`#!/bin/sh
 GIT_TRACE2_EVENT=%q GIT_TRACE2_CONFIG_PARAMS=pack.threads exec %q "$@"
 `, trace, realGit)
-	assert.NoError(t, os.WriteFile(filepath.Join(dir, "git"), []byte(script), 0o755)) //nolint:gosec // test wrapper must be executable
+	assert.NoError(t, os.WriteFile(filepath.Join(dir, "git"), []byte(script), 0o700)) //nolint:gosec // owner-only, but must be executable
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	return trace
 }
