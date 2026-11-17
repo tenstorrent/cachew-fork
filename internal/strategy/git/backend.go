@@ -305,11 +305,12 @@ func isStaleCommitGraphError(stderr string) bool {
 		strings.Contains(stderr, "possible repository corruption on the remote side")
 }
 
-// checkRefsStale checks whether the local mirror's refs are behind upstream.
-// Returns true if a fetch is needed. The caller decides whether to fetch
-// synchronously or fall back to upstream.
-func (s *Strategy) checkRefsStale(ctx context.Context, repo *gitclone.Repository) (bool, error) {
-	needsFetch, err := repo.EnsureRefsUpToDate(ctx)
+// checkRefsStale checks whether the local mirror's branches matching prefixes
+// (all branches when prefixes is empty) are behind upstream. Returns true if a
+// fetch is needed. The caller decides whether to fetch synchronously or fall
+// back to upstream.
+func (s *Strategy) checkRefsStale(ctx context.Context, repo *gitclone.Repository, prefixes []string) (bool, error) {
+	needsFetch, err := repo.EnsureRefsUpToDate(ctx, prefixes...)
 	if err != nil {
 		return false, errors.Wrap(err, "check refs up to date")
 	}

@@ -137,6 +137,7 @@ type Strategy struct {
 	coldSnapshotMu            sync.Map                                              // keyed by upstream URL, values are *coldSnapshotEntry
 	deferredRestoreOnce       sync.Map                                              // keyed by upstream URL, ensures at most one deferred restore per repo
 	forcedFetches             sync.Map                                              // keyed by upstream URL, ensures at most one cooldown-bypassing fetch is queued per repo
+	pendingFetches            sync.Map                                              // keyed by upstream URL, ensures at most one ordinary background fetch is queued per repo
 	pendingStartupMaintenance sync.Map                                              // keyed by upstream URL, present while a startup-maintenance pass is queued but not yet started
 	commitGraphRepairs        sync.Map                                              // keyed by upstream URL, ensures at most one inline commit-graph repair runs per repo
 	bundleBuilds              sync.Map
@@ -719,31 +720,60 @@ func (s *Strategy) handleGitRequest(w http.ResponseWriter, r *http.Request, host
 	}
 }
 
+// handleRefDiscovery forwards a request that resolves refs by name to upstream
+// when the refs it asks about are behind, and reports whether it did. Requests
+// that name no refs are left to the mirror: a protocol v2 info/refs only
+// advertises capabilities, and a fetch by object ID is checked against the
+// mirror's objects by the incremental path instead.
 func (s *Strategy) handleRefDiscovery(w http.ResponseWriter, r *http.Request, repo *gitclone.Repository, host, pathValue string, isInfoRefs bool) (bool, error) {
 	ctx := r.Context()
 	logger := logging.FromContext(ctx)
-	isDiscovery := isInfoRefs
-	if !isDiscovery {
-		var err error
-		isDiscovery, err = requestIsLsRefs(pathValue, r)
-		if err != nil {
-			return false, errors.Wrap(err, "inspect ls-refs request")
-		}
+	kind, prefixes, err := classifyRefDiscovery(r, pathValue, isInfoRefs)
+	if err != nil {
+		return false, errors.Wrap(err, "inspect ref discovery request")
 	}
-	if isDiscovery {
-		stale, err := s.checkRefsStale(ctx, repo)
-		if err != nil {
-			logger.DebugContext(ctx, "Ref staleness check failed, serving mirror",
-				"upstream", repo.UpstreamURL(), "error", err)
-		} else if stale {
-			logger.InfoContext(ctx, "Refs stale, forwarding to upstream and fetching in background", "upstream", repo.UpstreamURL())
-			s.submitFetch(repo)
-			s.forwardToUpstream(w, r, host, pathValue)
-			return true, nil
-		}
+	switch kind {
+	case refDiscoveryNone:
+		return false, nil
+	case refDiscoveryCapabilities:
+		s.refreshInBackground(ctx, repo)
+		return false, nil
+	case refDiscoveryRefs:
 	}
 
-	return false, nil
+	stale, err := s.checkRefsStale(ctx, repo, prefixes)
+	if err != nil {
+		logger.DebugContext(ctx, "Ref staleness check failed, serving mirror",
+			"upstream", repo.UpstreamURL(), "error", err)
+		return false, nil
+	}
+	if !stale {
+		return false, nil
+	}
+	logger.InfoContext(ctx, "Refs stale, forwarding to upstream and fetching in background", "upstream", repo.UpstreamURL(),
+		"ref_prefixes", prefixes)
+	s.submitFetch(repo)
+	s.forwardToUpstream(w, r, host, pathValue)
+	return true, nil
+}
+
+// refreshInBackground schedules a fetch if the mirror's branches are behind
+// upstream, without holding up the request. Requests that never resolve a ref
+// by name still signal that a repository is in use, and keeping its mirror
+// current is what lets later fetches by object ID be served locally.
+func (s *Strategy) refreshInBackground(ctx context.Context, repo *gitclone.Repository) {
+	ctx = context.WithoutCancel(ctx)
+	go func() {
+		stale, err := s.checkRefsStale(ctx, repo, nil)
+		if err != nil {
+			logging.FromContext(ctx).DebugContext(ctx, "Background ref staleness check failed", "upstream", repo.UpstreamURL(),
+				"error", err)
+			return
+		}
+		if stale {
+			s.submitFetch(repo)
+		}
+	}()
 }
 
 func (s *Strategy) serveReadyRepo(w http.ResponseWriter, r *http.Request, repo *gitclone.Repository, host, pathValue string, isInfoRefs bool) error {
@@ -1220,13 +1250,29 @@ func (s *Strategy) tryRestoreSnapshot(ctx context.Context, repo *gitclone.Reposi
 
 // submitFetch schedules a background fetch when the mirror may be behind
 // upstream and a fetch cooldown has expired.
+//
+// The scheduler neither dedupes queued jobs nor runs two jobs from one queue at
+// once, so pendingFetches keeps at most one fetch waiting per repository. The
+// marker is cleared when the job starts rather than when it ends, so a request
+// arriving during a fetch can still queue the one follow-up that picks up what
+// that fetch missed.
 func (s *Strategy) submitFetch(repo *gitclone.Repository) {
-	if !repo.NeedsFetch(s.cloneManager.Config().RefCheckInterval) {
+	interval := s.cloneManager.Config().RefCheckInterval
+	if !repo.NeedsFetch(interval) {
+		return
+	}
+	key := repo.UpstreamURL()
+	if _, pending := s.pendingFetches.LoadOrStore(key, struct{}{}); pending {
 		return
 	}
 	// Use a separate queue from snapshot/repack so fetches are not serialized
 	// behind long-running jobs on the same upstream URL queue.
-	s.scheduler.Submit(repo.UpstreamURL()+"/fetch", "fetch", func(ctx context.Context) error {
+	s.scheduler.Submit(key+"/fetch", "fetch", func(ctx context.Context) error {
+		s.pendingFetches.Delete(key)
+		// Another fetch may have finished while this one waited in the queue.
+		if !repo.NeedsFetch(interval) {
+			return nil
+		}
 		// Backoff applies even though the request that triggered this was
 		// authorized: while upstream is failing, clients are already being
 		// forwarded upstream for correctness, so retrying per request only

@@ -131,7 +131,7 @@ type Repository struct {
 	lastCruftExpireAt  time.Time // set when a prune expires objects rather than only combining cruft; gates cruftExpireDue
 	lastRefCheck       time.Time
 	refCheckValid      bool
-	refCheckStale      bool
+	refCheckBehind     []string // refs/heads/* names upstream has at a different SHA or the mirror lacks
 	refCheckErr        error
 	refCheckErrAt      time.Time // set when a ref check fails; gates the failure backoff
 	refCheckInFlight   chan struct{}
@@ -1446,10 +1446,16 @@ func (r *Repository) recordFetchOutcome(success bool) {
 // callers wait on refCheckInFlight and reuse its outcome. Without this, a burst
 // of requests landing in the same window would each issue their own ls-remote
 // against upstream.
-func (r *Repository) EnsureRefsUpToDate(ctx context.Context) (needsFetch bool, err error) {
+//
+// prefixes limits the verdict to branches whose names start with one of them,
+// as a protocol v2 ls-refs request does with its ref-prefix lines; with none,
+// any branch behind upstream makes the mirror stale. Scoping matters for repos
+// whose branches move faster than a fetch completes: one client's ref can be
+// current while some other branch is always behind.
+func (r *Repository) EnsureRefsUpToDate(ctx context.Context, prefixes ...string) (needsFetch bool, err error) {
 	r.metaMu.Lock()
 	if r.refCheckValid && time.Since(r.lastRefCheck) < r.config.RefCheckInterval {
-		stale, checkErr := r.refCheckStale, r.refCheckErr
+		stale, checkErr := anyRefMatches(r.refCheckBehind, prefixes), r.refCheckErr
 		r.metaMu.Unlock()
 		return stale, checkErr
 	}
@@ -1473,7 +1479,7 @@ func (r *Repository) EnsureRefsUpToDate(ctx context.Context) (needsFetch bool, e
 			return false, errors.Wrap(ctx.Err(), "context cancelled waiting for in-flight ref check")
 		}
 		r.metaMu.Lock()
-		stale, checkErr := r.refCheckStale, r.refCheckErr
+		stale, checkErr := anyRefMatches(r.refCheckBehind, prefixes), r.refCheckErr
 		r.metaMu.Unlock()
 		return stale, checkErr
 	}
@@ -1496,7 +1502,24 @@ func (r *Repository) EnsureRefsUpToDate(ctx context.Context) (needsFetch bool, e
 	// Detach from the caller's context so a disconnecting client cannot fail every
 	// waiter with a cancellation error. runRefCheck applies LsRemoteTimeout
 	// internally.
-	return r.runRefCheck(context.WithoutCancel(ctx))
+	behind, err := r.runRefCheck(context.WithoutCancel(ctx))
+	return anyRefMatches(behind, prefixes), err
+}
+
+// anyRefMatches reports whether any of refs starts with one of prefixes, or
+// whether refs is non-empty when there are no prefixes.
+func anyRefMatches(refs, prefixes []string) bool {
+	if len(prefixes) == 0 {
+		return len(refs) > 0
+	}
+	for _, ref := range refs {
+		for _, prefix := range prefixes {
+			if strings.HasPrefix(ref, prefix) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // refCheckFailureBackoff is how long a failed ref check is cached before another
@@ -1516,8 +1539,9 @@ func (r *Repository) invalidateRefCheckLocked() {
 }
 
 // runRefCheck performs the ls-remote comparison for the caller that started the
-// check and records the outcome for callers waiting on it.
-func (r *Repository) runRefCheck(ctx context.Context) (bool, error) {
+// check, records the outcome for callers waiting on it, and returns the branches
+// that are behind upstream.
+func (r *Repository) runRefCheck(ctx context.Context) ([]string, error) {
 	// Bound the whole check, not just the ls-remote: GetLocalRefs holds the
 	// repository read lock across a for-each-ref subprocess, so a hang there
 	// would otherwise wedge the refCheckInFlight singleflight slot forever.
@@ -1528,7 +1552,7 @@ func (r *Repository) runRefCheck(ctx context.Context) (bool, error) {
 	lastFetchBefore := r.lastFetch
 	r.metaMu.Unlock()
 
-	record := func(valid, stale bool, err error) {
+	record := func(valid bool, behind []string, err error) {
 		r.metaMu.Lock()
 		// A fetch that landed while this check was in flight already invalidated
 		// the cache; do not overwrite that with a pre-fetch verdict.
@@ -1537,7 +1561,7 @@ func (r *Repository) runRefCheck(ctx context.Context) (bool, error) {
 			return
 		}
 		r.refCheckValid = valid
-		r.refCheckStale = stale
+		r.refCheckBehind = behind
 		r.refCheckErr = err
 		if err != nil {
 			r.refCheckErrAt = time.Now()
@@ -1550,38 +1574,38 @@ func (r *Repository) runRefCheck(ctx context.Context) (bool, error) {
 	localRefs, err := r.GetLocalRefs(ctx)
 	if err != nil {
 		err = errors.Wrap(err, "get local refs")
-		record(false, false, err)
-		return false, err
+		record(false, nil, err)
+		return nil, err
 	}
 
 	upstreamRefs, err := r.GetUpstreamRefs(ctx)
 	if err != nil {
 		err = errors.Wrap(err, "get upstream refs")
-		record(false, false, err)
-		return false, err
+		record(false, nil, err)
+		return nil, err
 	}
 
+	// Cache the result under RefCheckInterval so serial requests skip the
+	// ls-remote round trip; a successful fetch clears it so the next check
+	// reopens.
+	behind := behindBranches(localRefs, upstreamRefs)
+	record(true, behind, nil)
+	return behind, nil
+}
+
+// behindBranches returns the refs/heads/* names upstream has at a SHA the
+// mirror does not, including branches the mirror lacks.
+func behindBranches(localRefs, upstreamRefs map[string]string) []string {
+	var behind []string
 	for ref, upstreamSHA := range upstreamRefs {
-		if strings.HasSuffix(ref, "^{}") {
+		if !strings.HasPrefix(ref, "refs/heads/") || strings.HasSuffix(ref, "^{}") {
 			continue
 		}
-		if !strings.HasPrefix(ref, "refs/heads/") {
-			continue
-		}
-		localSHA, exists := localRefs[ref]
-		if !exists || localSHA != upstreamSHA {
-			// Cache the stale verdict under RefCheckInterval so a behind
-			// mirror does not re-issue ls-remote on every serial request;
-			// a successful fetch clears the cache so the next check reopens.
-			record(true, true, nil)
-			return true, nil
+		if localSHA, exists := localRefs[ref]; !exists || localSHA != upstreamSHA {
+			behind = append(behind, ref)
 		}
 	}
-
-	// The check succeeded and refs match. Cache the result so subsequent calls
-	// within the interval skip the ls-remote round trip.
-	record(true, false, nil)
-	return false, nil
+	return behind
 }
 
 // EnsureRefs guarantees the local mirror satisfies the caller's freshness
